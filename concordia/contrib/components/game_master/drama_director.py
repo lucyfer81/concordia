@@ -813,6 +813,11 @@ class DramaDirector(
   ) -> bool:
     """Asks the model whether the current beat is complete.
 
+    The prompt is the P1 template (plan appendix B): the current beat
+    and its completion question head it, the event window follows, and
+    the criteria block closes it, anchoring the judgment to events that
+    actually happened rather than intentions or plans.
+
     Args:
       beat: The beat to evaluate.
       recent_events: Window of resolved events conditioning the question.
@@ -827,10 +832,20 @@ class DramaDirector(
         model error propagates uncaught.
     """
     prompt = interactive_document.InteractiveDocument(self._model)
-    prompt.statement('Recent events of the story, in order:\n')
+    prompt.statement('# Current story beat')
+    # The beat-id line is also the fingerprint the story enactment
+    # example's prompt stub routes completion answers by.
+    prompt.statement(f'Current beat "{beat.id}": {beat.description}\n')
+    prompt.statement(f'Completion question: {beat.done_question}\n')
+    prompt.statement('## Recent events (oldest first)')
     for event in recent_events:
       prompt.statement(f'- {event}')
-    prompt.statement(f'Current beat "{beat.id}": {beat.description}\n')
+    prompt.statement('## Completion criteria')
+    prompt.statement(
+        'Judging only by events that have actually happened (not'
+        " intentions or future plans), is the beat's completion"
+        ' question satisfied?'
+    )
     try:
       return prompt.yes_no_question(question=beat.done_question)
     except language_model.InvalidResponseError:

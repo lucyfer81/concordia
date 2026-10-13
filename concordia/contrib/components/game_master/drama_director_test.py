@@ -66,9 +66,11 @@ class _BeatModel(mock_model.MockModel):
     super().__init__('unused')
     self.completed = completed
     self.choice_calls = 0
+    self.choice_prompts: list[str] = []
 
   def sample_choice(self, prompt, responses, *, seed=None):
     self.choice_calls += 1
+    self.choice_prompts.append(prompt)
     choices = dict(
         re.findall(r'^  \(([^)]+)\) (Yes|No)$', prompt, re.MULTILINE)
     )
@@ -336,6 +338,36 @@ class LifecycleTest(unittest.TestCase):
     _complete_turn(gm, 'two')
     self.assertEqual(
         director.get_last_story_turn()['beat_id_after_event'], 'b2'
+    )
+
+  def test_completion_prompt_anchors_plan_p1_template(self):
+    model = _BeatModel(False)
+    director, gm = _make_director(model)
+    _complete_turn(gm, 'I hid the letter.')
+    self.assertEqual(director.get_last_story_turn()['turn_id'], 1)
+    prompt = model.choice_prompts[0]
+    # Plan appendix B, prompt P1: the beat block and its completion
+    # question come first, the event window follows, and the criteria
+    # block closes the prompt so the model judges only by events that
+    # actually happened, never by intentions or future plans.
+    self.assertIn('# Current story beat', prompt)
+    self.assertIn('Current beat "b1": setup', prompt)
+    self.assertIn('Completion question: Is the evidence revealed?', prompt)
+    self.assertIn('## Recent events (oldest first)', prompt)
+    self.assertIn('- Alice: I hid the letter.', prompt)
+    self.assertIn('## Completion criteria', prompt)
+    self.assertIn(
+        'Judging only by events that have actually happened'
+        ' (not intentions or future plans)',
+        prompt,
+    )
+    self.assertLess(
+        prompt.index('Completion question:'),
+        prompt.index('## Recent events'),
+    )
+    self.assertLess(
+        prompt.index('## Completion criteria'),
+        prompt.index('Question:'),
     )
 
   def test_max_turns_marks_timeout_without_advancing(self):

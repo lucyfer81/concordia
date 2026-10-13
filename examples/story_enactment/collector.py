@@ -34,12 +34,15 @@ import os
 import tempfile
 from typing import Any
 
+from concordia.contrib.prefabs.entity import story_character
 from concordia.environment import step_controller as step_controller_lib
 
 # The context-component key under which the EmotionalStance component is
 # registered on story characters. Entity logs are keyed by this component
 # name (not by the spaced-name "Key" field inside the published datum).
-EMOTIONAL_STANCE_COMPONENT_KEY = 'EmotionalStance'
+# The constant is owned by the prefab that registers the component, so
+# the two definitions can never drift apart.
+EMOTIONAL_STANCE_COMPONENT_KEY = story_character.EMOTIONAL_STANCE_COMPONENT_KEY
 
 # Schema version of the checkpoint envelope written by this module.
 CHECKPOINT_SCHEMA_VERSION = 1

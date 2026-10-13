@@ -317,6 +317,41 @@ def _public_model_identity(
   return identity
 
 
+def _merge_resume_model_config(
+    persisted: Mapping[str, Any],
+    passed: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+  """Merges this invocation's credentials into the checkpointed identity.
+
+  The checkpointed model identity is authoritative on resume, and it
+  never contains secrets, so the API key of a caller-provided config
+  merges over the persisted identity instead of being dropped with it.
+
+  Args:
+    persisted: the run config's secret-free model identity.
+    passed: the model config passed to this invocation, or None.
+
+  Returns:
+    The effective model config for building the language model.
+
+  Raises:
+    ValueError: if the passed config's identity contradicts the
+      checkpointed one.
+  """
+  effective = dict(persisted)
+  if passed is None:
+    return effective
+  passed_identity = _public_model_identity(passed)
+  if passed_identity != dict(persisted):
+    raise ValueError(
+        'model_config mismatch: checkpoint holds'
+        f' {dict(persisted)!r}, got {passed_identity!r}.'
+    )
+  if 'api_key' in passed:
+    effective['api_key'] = passed['api_key']
+  return effective
+
+
 def make_run_config(
     story: story_config.StoryConfig,
     *,
@@ -843,19 +878,21 @@ def run(
       RelationshipsToOthers view on every character, with the acting
       character's emotion collected into the story turns.
     model_config: identity of a live model (api_type, model_name,
-      api_key); a first run without it uses the prompt stub.
+      api_key); a first run without it uses the prompt stub. On resume
+      the identity must match the checkpoint and only the api_key
+      carries over.
     run_config: optional prebuilt run config for a first run (used by
       tests and higher-level drivers); when given, its limits and mode
       are authoritative and the limit/mode parameters are ignored.
 
   Returns:
     The run's result record; summary.json, script.fountain and
-    script.txt are written next to the state files.
+      script.txt are written next to the state files.
 
   Raises:
     ValueError: on resume validation failures (missing or mismatched
-      checkpoint, mismatched limits or mode, budget-exhausted summary)
-      or when starting over an existing run.
+      checkpoint, mismatched limits, mode or model identity,
+      budget-exhausted summary) or when starting over an existing run.
   """
   os.makedirs(state_dir, exist_ok=True)
   checkpoint_path = os.path.join(state_dir, 'checkpoint.json')
@@ -909,9 +946,17 @@ def run(
       # parameters of this call are ignored on a first run.
       config = run_config
 
-  effective_model_config = (
-      dict(model_config) if (model_config is not None and not resume) else None
-  ) or dict(config['model_config'])
+  if resume:
+    # The checkpointed identity is authoritative; only this invocation's
+    # credentials (the API key) merge over it, because the checkpoint
+    # never stores secrets.
+    effective_model_config = _merge_resume_model_config(
+        config['model_config'], model_config
+    )
+  else:
+    effective_model_config = (
+        dict(model_config) if model_config is not None else None
+    ) or dict(config['model_config'])
   provider, retryable = make_language_model(
       effective_model_config, disable_language_model=disable_language_model
   )

@@ -626,6 +626,60 @@ class ResumeContinuationTest(_StateDirTestCase):
     with self.assertRaises(ValueError):
       run_lib.run(self.state_dir, resume=True, mode='director')
 
+  def test_resume_merges_api_key_and_rejects_mismatched_identity(self):
+    config = _fixture_config(
+        total_turn_limit=4,
+        beats=(_beat('b1'), _beat('b2')),
+        completion_answers={'b1': 'Yes', 'b2': 'Yes'},
+    )
+    self._interrupt_after_turn_two(config)
+    # A live credential arrives with the checkpoint's own public
+    # identity; the effective model config must keep the identity and
+    # gain only the key, since the checkpoint never stores secrets.
+    with mock.patch.object(
+        run_lib, 'make_language_model', wraps=run_lib.make_language_model
+    ) as maker:
+      result = run_lib.run(
+          self.state_dir,
+          resume=True,
+          model_config={
+              'api_type': 'stub',
+              'model_name': 'prompt_stub',
+              'prompt_stub': config['model_config']['prompt_stub'],
+              'api_key': 'live-secret',
+          },
+      )
+    self.assertEqual(result.reason, 'beats_completed')
+    effective = maker.call_args_list[0].args[0]
+    self.assertEqual(effective['api_key'], 'live-secret')
+    self.assertEqual(effective['api_type'], 'stub')
+    self.assertEqual(
+        effective['prompt_stub'], config['model_config']['prompt_stub']
+    )
+    # The credential is per-invocation: it reaches the model but never
+    # the persisted checkpoint or the rewritten summary.
+    self.assertNotIn('live-secret', json.dumps(self.envelope()))
+    self.assertNotIn('live-secret', json.dumps(self.summary()))
+    self.assertNotIn('api_key', self.summary()['model_config'])
+    # An identity contradicting the checkpoint is rejected, whether the
+    # provider or just the model name differs.
+    with self.assertRaises(ValueError):
+      run_lib.run(
+          self.state_dir,
+          resume=True,
+          model_config={'api_type': 'gemini', 'model_name': 'm'},
+      )
+    with self.assertRaises(ValueError):
+      run_lib.run(
+          self.state_dir,
+          resume=True,
+          model_config={
+              'api_type': 'stub',
+              'model_name': 'other-model',
+              'prompt_stub': config['model_config']['prompt_stub'],
+          },
+      )
+
   def test_resume_stops_when_no_model_attempts_remain(self):
     config = _fixture_config(
         total_turn_limit=4,
