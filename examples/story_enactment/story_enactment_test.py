@@ -467,11 +467,50 @@ class EndToEndShortRunTest(_StateDirTestCase):
     self.assertEqual(result.committed_turn_id, 2)
     self.assertEqual(len(self.turn_log().load()), 2)
 
-  def test_stage2_modes_raise_not_implemented(self):
+  def test_stage3_mode_raises_not_implemented(self):
     config = _fixture_config(total_turn_limit=2)
-    config['mode'] = 'director'
+    config['mode'] = 'character_depth'
     with self.assertRaises(NotImplementedError):
       run_lib.run(self.state_dir, run_config=config)
+
+  def test_director_mode_runs_with_feedback_configuration(self):
+    story = story_config.make_example_config()
+    config = run_lib.make_run_config(
+        story,
+        total_turn_limit=2,
+        total_model_attempt_limit=100,
+        mode='director',
+        model_config={'api_type': 'stub'},
+    )
+    config['scene_dicts'][0]['num_rounds'] = 8
+    params = config['director_params']
+    self.assertTrue(params['feedback_enabled'])
+    self.assertEqual(params['cooldown_turns'], 3)
+    self.assertEqual(
+        params['allowed_environment_events'],
+        list(story.allowed_environment_events),
+    )
+    self.assertEqual(params['immutable_facts'], list(story.immutable_facts))
+    # The stub's scoring answers never parse as integers, so the run
+    # commits every step without generating directives.
+    result = run_lib.run(self.state_dir, run_config=config)
+    self.assertEqual(result.reason, 'step_limit')
+    self.assertEqual(result.committed_turn_id, 2)
+    self.assertEqual(self.summary()['mode'], 'director')
+
+  def test_tension_observe_mode_records_scores_without_feedback(self):
+    config = run_lib.make_run_config(
+        story_config.make_example_config(),
+        total_turn_limit=2,
+        total_model_attempt_limit=100,
+        mode='tension_observe',
+        model_config={'api_type': 'stub'},
+    )
+    config['scene_dicts'][0]['num_rounds'] = 8
+    self.assertFalse(config['director_params']['feedback_enabled'])
+    result = run_lib.run(self.state_dir, run_config=config)
+    self.assertEqual(result.reason, 'step_limit')
+    self.assertEqual(result.committed_turn_id, 2)
 
   def test_first_run_over_existing_checkpoint_refused(self):
     config = _fixture_config(total_turn_limit=2)
