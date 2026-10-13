@@ -14,6 +14,7 @@
 
 """Tests for the story-enactment game master and character prefabs."""
 
+import json
 from typing import Any, cast
 
 from absl.testing import absltest
@@ -115,6 +116,16 @@ def _build_character(name: str, secret: str = ''):
   )
 
 
+def _build_prefab(prefab):
+  """Builds the same prefab instance with a fresh model and bank."""
+  return prefab.build(
+      model=mock_model.MockModel(),
+      memory_bank=associative_memory.AssociativeMemoryBank(
+          sentence_embedder=_embedder
+      ),
+  )
+
+
 def _build_game_master(model, entities, **overrides):
   params = {
       'name': 'story rules',
@@ -160,8 +171,14 @@ class StoryCharacterPrefabTest(absltest.TestCase):
       entity.get_component('PrivateSecret')
 
   def test_rebuild_creates_new_extension_components(self):
-    first = _build_character('Alice', secret='kept secret')
-    second = _build_character('Alice', secret='kept secret')
+    # One prefab instance (one params dict) built twice must produce fresh
+    # components each time and must never cache them back into its params:
+    # the params stay JSON-safe across builds.
+    prefab = story_character.Entity(
+        params=_character_params('Alice', secret='kept secret')
+    )
+    first = _build_prefab(prefab)
+    second = _build_prefab(prefab)
     self.assertIsNot(
         first.get_component('CharacterBrief'),
         second.get_component('CharacterBrief'),
@@ -170,6 +187,7 @@ class StoryCharacterPrefabTest(absltest.TestCase):
         first.get_component('PrivateSecret'),
         second.get_component('PrivateSecret'),
     )
+    json.dumps(prefab.params)
 
   def test_supports_extra_components(self):
     note = agent_components.constant.Constant(
@@ -233,13 +251,30 @@ class StoryGameMasterPrefabTest(absltest.TestCase):
     self.assertIs(gm.get_component('user_note'), note)
 
   def test_rebuild_creates_new_components(self):
-    players = [_build_character(name) for name in _PLAYERS]
-    first = _build_game_master(mock_model.MockModel(), players)
-    second = _build_game_master(mock_model.MockModel(), players)
+    # One prefab instance (one params dict) built twice must produce fresh
+    # components each time and must never cache them back into its params:
+    # the params stay JSON-safe across builds.
+    prefab = story_dramaturgic.GameMaster(
+        params={
+            'name': 'story rules',
+            'scene_dicts': _SCENE_DICTS,
+            'beat_dicts': _BEAT_DICTS,
+            'world_constraints': _WORLD_CONSTRAINTS,
+            'immutable_facts': _IMMUTABLE_FACTS,
+        }
+    )
+    prefab.entities = [_build_character(name) for name in _PLAYERS]
+    first = _build_prefab(prefab)
+    second = _build_prefab(prefab)
     self.assertIsNot(
         first.get_component('__drama_director__'),
         second.get_component('__drama_director__'),
     )
+    self.assertIsNot(
+        first.get_component('world_constraints'),
+        second.get_component('world_constraints'),
+    )
+    json.dumps(prefab.params)
 
   def test_real_act_resolution_prompt_contains_beat_and_constraints(self):
     players = [_build_character(name) for name in _PLAYERS]
