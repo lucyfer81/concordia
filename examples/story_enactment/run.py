@@ -38,7 +38,7 @@ never swallowed.
 
 Example:
   python -m examples.story_enactment.run --state_dir /tmp/story-demo \
-      --disable_language_model --mode tension_observe
+      --disable_language_model --mode director
 """
 
 from collections.abc import Callable, Mapping, Sequence
@@ -72,9 +72,11 @@ from examples.story_enactment import testing_stubs
 # Schema version of the run config recorded inside the envelope.
 RUN_CONFIG_SCHEMA = 1
 
-# Stage switches of the plan; stage 2 adds the tension_observe mode.
+# Stage switches of the plan; stage 2 adds the tension_observe and
+# director modes.
 MODE_BEATS_ONLY = 'beats_only'
 MODE_TENSION_OBSERVE = 'tension_observe'
+MODE_DIRECTOR = 'director'
 MODES = ('beats_only', 'tension_observe', 'director', 'character_depth')
 
 # Appendix-C default scoring configuration of the drama director.
@@ -86,6 +88,20 @@ _DEFAULT_DIRECTOR_PARAMS = {
 # beats_only keeps the exact stage-1 model-call pattern: eval_interval=0
 # disables scoring, so no story turn falls on a scoring step.
 _BEATS_ONLY_DIRECTOR_PARAMS = {**_DEFAULT_DIRECTOR_PARAMS, 'eval_interval': 0}
+# tension_observe records scores only; feedback stays off so deviations
+# never generate directives.
+_TENSION_OBSERVE_DIRECTOR_PARAMS = {
+    **_DEFAULT_DIRECTOR_PARAMS,
+    'feedback_enabled': False,
+}
+# The director mode enables feedback: deviating scores generate
+# directives drawn from the story's allowed environment events, with
+# the appendix-C cooldown between executions.
+_DIRECTOR_MODE_DIRECTOR_PARAMS = {
+    **_DEFAULT_DIRECTOR_PARAMS,
+    'cooldown_turns': 3,
+    'feedback_enabled': True,
+}
 
 # Names of the two prefabs inside the run's Config.
 _CHARACTER_PREFAB = 'story_character'
@@ -327,6 +343,16 @@ def make_run_config(
   problems = story_config.validate(story)
   if problems:
     raise ValueError('invalid story configuration: ' + '; '.join(problems))
+  if mode == MODE_BEATS_ONLY:
+    director_params = dict(_BEATS_ONLY_DIRECTOR_PARAMS)
+  elif mode == MODE_TENSION_OBSERVE:
+    director_params = dict(_TENSION_OBSERVE_DIRECTOR_PARAMS)
+  else:
+    director_params = {
+        **_DIRECTOR_MODE_DIRECTOR_PARAMS,
+        'allowed_environment_events': list(story.allowed_environment_events),
+        'immutable_facts': list(story.immutable_facts),
+    }
   premise_lines = (story.conflict_start, *story.world_facts)
   scene = scene_lib.SceneSpec(
       scene_type=scene_lib.SceneTypeSpec(
@@ -349,11 +375,7 @@ def make_run_config(
       'total_turn_limit': total_turn_limit,
       'total_model_attempt_limit': total_model_attempt_limit,
       'mode': mode,
-      'director_params': dict(
-          _BEATS_ONLY_DIRECTOR_PARAMS
-          if mode == MODE_BEATS_ONLY
-          else _DEFAULT_DIRECTOR_PARAMS
-      ),
+      'director_params': director_params,
       'model_config': _public_model_identity(model_config),
   }
 
@@ -791,9 +813,13 @@ def run(
       original limit; an explicitly passed different value is rejected.
     total_model_attempt_limit: total model-attempt budget; None uses
       the 400-attempt default, and the same resume rule applies.
-    mode: stage switch; stage 2 implements beats_only (scoring disabled,
-      identical stage-1 call pattern) and tension_observe (default
-      scoring configuration: every 2nd turn, window of 8, tolerance 1).
+    mode: stage switch; stage 2 implements beats_only (scoring
+      disabled, identical stage-1 call pattern), tension_observe
+      (default scoring configuration, scores recorded only) and
+      director (default scoring configuration plus feedback: deviating
+      scores generate directives, fused into resolutions through the
+      story's allowed environment events with a cooldown between
+      executions).
     model_config: identity of a live model (api_type, model_name,
       api_key); a first run without it uses the prompt stub.
     run_config: optional prebuilt run config for a first run (used by
@@ -808,7 +834,7 @@ def run(
     ValueError: on resume validation failures (missing or mismatched
       checkpoint, mismatched limits or mode, budget-exhausted summary)
       or when starting over an existing run.
-    NotImplementedError: for modes beyond tension_observe (stage 3+).
+    NotImplementedError: for modes beyond director (stage 3+).
   """
   os.makedirs(state_dir, exist_ok=True)
   checkpoint_path = os.path.join(state_dir, 'checkpoint.json')
@@ -861,7 +887,11 @@ def run(
       # A supplied run config is authoritative; the limit and mode
       # parameters of this call are ignored on a first run.
       config = run_config
-  if config['mode'] not in (MODE_BEATS_ONLY, MODE_TENSION_OBSERVE):
+  if config['mode'] not in (
+      MODE_BEATS_ONLY,
+      MODE_TENSION_OBSERVE,
+      MODE_DIRECTOR,
+  ):
     raise NotImplementedError(
         f'mode {config["mode"]!r} is not enabled in stage 2.'
     )

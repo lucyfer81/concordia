@@ -20,11 +20,12 @@ components of `concordia.contrib.components.game_master`: a
 `DramaDirector` advances the story through its beats and periodically
 scores the dramatic tension of the recent events, event resolution
 produces the dual-track output that separates player speech (agency)
-from stage directions (narrator authority), and a
-`SceneOrStoryTerminator` stops the run when either the scene schedule or
-the story itself ends. Every resolution is conditioned on the current
-beat, the world constraints, and the immutable facts, so the narration
-never violates them.
+from stage directions (narrator authority), a director-note step weaves
+pending directives into resolutions through whitelisted NPC and
+environmental means only, and a `SceneOrStoryTerminator` stops the run
+when either the scene schedule or the story itself ends. Every
+resolution is conditioned on the current beat, the world constraints,
+and the immutable facts, so the narration never violates them.
 """
 
 from collections.abc import Mapping, Sequence
@@ -36,6 +37,7 @@ from concordia.associative_memory import basic_associative_memory as associative
 from concordia.components import agent as actor_components
 from concordia.components import game_master as gm_components
 from concordia.components.game_master import event_resolution as thought_chains_lib
+from concordia.contrib.components.game_master import director_note
 from concordia.contrib.components.game_master import drama_director
 from concordia.contrib.components.game_master import story_resolution
 from concordia.contrib.components.game_master import story_terminator
@@ -77,6 +79,14 @@ class GameMaster(prefab_lib.Prefab):
           'eval_interval': 2,
           'scoring_window': 8,
           'tolerance': 1,
+          # Director feedback configuration (plan appendix C): with
+          # feedback enabled, deviating scores generate directives that
+          # the director-note resolution step weaves into events using
+          # only the whitelisted NPC/environmental means, never
+          # contradicting the immutable facts. JSON-safe values.
+          'cooldown_turns': 3,
+          'feedback_enabled': False,
+          'allowed_environment_events': (),
           # World constraints shown to the game master in every resolution.
           'world_constraints': (),
           # Facts no resolved event may contradict.
@@ -210,7 +220,8 @@ class GameMaster(prefab_lib.Prefab):
 
     # The drama director advances the story through its beats; its pre-act
     # value exposes the current beat to every resolution prompt. The
-    # scoring configuration comes from the JSON-safe prefab params.
+    # scoring and feedback configuration comes from the JSON-safe prefab
+    # params.
     drama_director_key = drama_director.DEFAULT_DRAMA_DIRECTOR_COMPONENT_KEY
     director = drama_director.DramaDirector(
         model=model,
@@ -218,6 +229,13 @@ class GameMaster(prefab_lib.Prefab):
         eval_interval=self.params.get('eval_interval', 2),
         scoring_window=self.params.get('scoring_window', 8),
         tolerance=self.params.get('tolerance', 1),
+        cooldown_turns=self.params.get('cooldown_turns', 3),
+        feedback_enabled=self.params.get('feedback_enabled', False),
+        allowed_environment_events=self.params.get(
+            'allowed_environment_events', ()
+        ),
+        immutable_facts=self.params.get('immutable_facts', ()),
+        player_names=player_names,
     )
 
     world_constraints = actor_components.constant.Constant(
@@ -225,13 +243,15 @@ class GameMaster(prefab_lib.Prefab):
         pre_act_label=WORLD_CONSTRAINTS_PRE_ACT_LABEL,
     )
 
-    # Stage-1 resolution chain: strip the putative-event prefix, then ask
-    # for the dual-track output (verbatim speech plus stage directions)
+    # Stage-1 resolution chain: strip the putative-event prefix, weave in
+    # any pending director directive (identity when none is pending), then
+    # ask for the dual-track output (verbatim speech plus stage directions)
     # that respects the immutable facts. Non-verbal intent is not modeled
     # in this first version.
     remove_prefix = thought_chains_lib.RemoveSpecificText(
         substring_to_remove='Putative event to resolve: '
     )
+    director_note_step = director_note.make_director_note_step(director)
     final_output_step = story_resolution.make_final_output_step(
         director,
         immutable_facts=self.params.get('immutable_facts', ()),
@@ -242,7 +262,11 @@ class GameMaster(prefab_lib.Prefab):
     )
     event_resolution = gm_components.event_resolution.EventResolution(
         model=model,
-        event_resolution_steps=(remove_prefix, final_output_step),
+        event_resolution_steps=(
+            remove_prefix,
+            director_note_step,
+            final_output_step,
+        ),
         components=[
             display_events_key,
             drama_director_key,

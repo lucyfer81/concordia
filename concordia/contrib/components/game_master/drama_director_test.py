@@ -135,6 +135,67 @@ class _ApiErrorTextModel(_BeatModel):
     raise RuntimeError('API unavailable')
 
 
+# Fingerprints of the director prompts (plan appendix B, P2 and P3),
+# matched against the last question block of each prompt.
+_SCORING_MARK = 'Respond with a single integer from 1 to 10'
+_DIRECTIVE_MARK = 'Write one short director instruction'
+_LAST_BLOCK_OPENER = re.compile(r'^(?:Question|Exercise): ', re.M)
+
+_DIRECTIVE_INSTRUCTION = 'Interrupt the scene with a sudden storm.'
+
+# Director feedback configuration shared by the directive tests.
+_DIRECTOR_FEEDBACK_PARAMS = dict(
+    eval_interval=1,
+    feedback_enabled=True,
+    allowed_environment_events=('a storm cuts the power', 'a courier arrives'),
+    immutable_facts=('the house is old', 'the will is sealed'),
+    player_names=('Alice', 'Bob'),
+)
+
+
+def _last_question_block(prompt: str) -> str:
+  """Returns the prompt from its last Question/Exercise block on."""
+  matches = list(_LAST_BLOCK_OPENER.finditer(prompt))
+  if not matches:
+    return ''
+  return prompt[matches[-1].start() :]
+
+
+class _DirectiveModel(_BeatModel):
+  """Adds director-pipeline text routing to the beat-choice stub.
+
+  The scoring question returns a configured integer answer and the
+  directive-generation question a configured instruction, optionally
+  raising a configured error instead.
+  """
+
+  def __init__(
+      self,
+      completed,
+      *,
+      score: str = '7',
+      instruction: str = _DIRECTIVE_INSTRUCTION,
+      generation_error: Exception | None = None,
+  ):
+    super().__init__(completed)
+    self._score = score
+    self._instruction = instruction
+    self._generation_error = generation_error
+    self.text_prompts: list[str] = []
+
+  def sample_text(self, prompt, **kwargs):
+    del kwargs
+    self.text_prompts.append(prompt)
+    block = _last_question_block(prompt)
+    if _DIRECTIVE_MARK in block:
+      if self._generation_error is not None:
+        raise self._generation_error
+      return self._instruction
+    if _SCORING_MARK in block:
+      return self._score
+    return 'unused'
+
+
 class _MemoryProbe(entity_component.ContextComponent):
   """Spy standing in for the game master's memory component.
 
@@ -474,6 +535,207 @@ class TensionScoringTest(unittest.TestCase):
     fresh.set_state(state)
     self.assertEqual(fresh.get_state(), state)
     self.assertEqual(len(fresh.get_state()['tension_history']), 2)
+
+
+class DirectiveGenerationTest(unittest.TestCase):
+  """Stage-2 director directives (spec sections 4.4 step 4, 4.5, 11.1)."""
+
+  def test_deviation_generates_pending_directive_bound_to_beat(self):
+    # A score of 7 against beat b1's range (1, 3) with tolerance 1
+    # deviates, so the pipeline's fourth step creates a pending
+    # directive bound to the beat that was current when the player
+    # acted.
+    model = _DirectiveModel(False)
+    director, gm = _make_director(model, **_DIRECTOR_FEEDBACK_PARAMS)
+    _complete_turn(gm, 'one')
+    state = director.get_state()
+    self.assertEqual(
+        state['directive'],
+        {
+            'beat_id': 'b1',
+            'generated_at_turn': 1,
+            'content': _DIRECTIVE_INSTRUCTION,
+            'status': 'pending',
+        },
+    )
+    self.assertIsNone(state['last_directive_executed_turn'])
+    # The P3 generation prompt carries the deviation, the direction,
+    # the allowed means and the immutable facts (plan appendix B).
+    prompt = next(p for p in model.text_prompts if _DIRECTIVE_MARK in p)
+    self.assertIn(
+        'Current tension (7) is outside the target range (1, 3)', prompt
+    )
+    self.assertIn('The story needs lower dramatic pressure.', prompt)
+    self.assertIn(
+        "You may ONLY use these means, never player characters' "
+        'voluntary actions: a storm cuts the power; a courier arrives',
+        prompt,
+    )
+    self.assertIn('moves tension lower', prompt)
+    self.assertIn(
+        'Never contradict immutable facts: the house is old; '
+        'the will is sealed',
+        prompt,
+    )
+
+  def test_low_score_directive_asks_to_raise_tension(self):
+    beat = dataclasses.replace(BEATS[0], tension_range=(6, 8))
+    model = _DirectiveModel(False, score='2')
+    director, gm = _make_director(
+        model, beats=(beat,), **_DIRECTOR_FEEDBACK_PARAMS
+    )
+    _complete_turn(gm, 'one')
+    self.assertEqual(director.get_state()['directive']['status'], 'pending')
+    prompt = next(p for p in model.text_prompts if _DIRECTIVE_MARK in p)
+    self.assertIn('The story needs raise dramatic pressure.', prompt)
+    self.assertIn('moves tension raise', prompt)
+
+  def test_beat_transition_step_generates_no_directive(self):
+    # The completion step records the score but never generates a
+    # directive: the score belongs to the old beat (spec 4.4 step 4).
+    model = _DirectiveModel(True)
+    director, gm = _make_director(model, **_DIRECTOR_FEEDBACK_PARAMS)
+    _complete_turn(gm, 'one')
+    turn = director.get_last_story_turn()
+    self.assertEqual(turn['beat_id_after_event'], 'b2')
+    self.assertEqual(turn['tension'], 7)
+    self.assertEqual(
+        director.get_state()['tension_history'][0]['deviated'], True
+    )
+    self.assertIsNone(director.get_state()['directive'])
+    self.assertFalse(any(_DIRECTIVE_MARK in p for p in model.text_prompts))
+
+  def test_final_completion_step_generates_no_directive(self):
+    model = _DirectiveModel(True)
+    director, gm = _make_director(
+        model, beats=(BEATS[0],), **_DIRECTOR_FEEDBACK_PARAMS
+    )
+    _complete_turn(gm, 'one')
+    self.assertTrue(director.is_beats_done())
+    self.assertEqual(director.get_last_story_turn()['tension'], 7)
+    self.assertIsNone(director.get_state()['directive'])
+
+  def test_timeout_step_generates_no_directive(self):
+    beat = dataclasses.replace(BEATS[0], max_turns=1)
+    model = _DirectiveModel(False)
+    director, gm = _make_director(
+        model, beats=(beat,), **_DIRECTOR_FEEDBACK_PARAMS
+    )
+    _complete_turn(gm, 'one')
+    self.assertTrue(director.beat_timeout())
+    # The score is still recorded on the timeout step (spec 13.1-4).
+    self.assertEqual(director.get_last_story_turn()['tension'], 7)
+    self.assertIsNone(director.get_state()['directive'])
+
+  def test_generation_follows_eval_interval(self):
+    model = _DirectiveModel(False)
+    director, gm = _make_director(model, eval_interval=2, feedback_enabled=True)
+    _complete_turn(gm, 'one')
+    self.assertIsNone(director.get_state()['directive'])
+    _complete_turn(gm, 'two')
+    self.assertEqual(director.get_state()['directive']['generated_at_turn'], 2)
+
+  def test_invalid_score_generates_no_directive(self):
+    model = _DirectiveModel(False, score='quite tense')
+    director, gm = _make_director(model, **_DIRECTOR_FEEDBACK_PARAMS)
+    _complete_turn(gm, 'one')
+    self.assertIsNone(director.get_last_story_turn()['tension'])
+    self.assertIsNone(director.get_state()['directive'])
+
+  def test_feedback_disabled_never_generates_directives(self):
+    # The tension_observe mode only records scores: deviations never
+    # produce directives (plan stage 2).
+    model = _DirectiveModel(False)
+    director, gm = _make_director(
+        model, eval_interval=1, feedback_enabled=False
+    )
+    for speech in ('one', 'two', 'three'):
+      _complete_turn(gm, speech)
+    self.assertEqual(len(director.get_state()['tension_history']), 3)
+    self.assertTrue(
+        all(
+            entry['deviated']
+            for entry in director.get_state()['tension_history']
+        )
+    )
+    self.assertIsNone(director.get_state()['directive'])
+    self.assertFalse(any(_DIRECTIVE_MARK in p for p in model.text_prompts))
+
+  def test_budget_exhausted_at_generation_creates_no_directive(self):
+    # Budget path B at the directive-generation position (spec 13.1-9):
+    # no directive is created, the stop flag is set, and the step still
+    # commits with its valid score kept.
+    model = _DirectiveModel(
+        False,
+        generation_error=budget_wrapper.BudgetExhaustedError('spent'),
+    )
+    director, gm = _make_director(model, **_DIRECTOR_FEEDBACK_PARAMS)
+    _complete_turn(gm, 'one')
+    turn = director.get_last_story_turn()
+    self.assertEqual(turn['turn_id'], 1)
+    self.assertEqual(turn['tension'], 7)
+    self.assertTrue(turn['budget_stopped'])
+    self.assertIsNone(director.get_state()['directive'])
+    self.assertTrue(director.is_story_stopped())
+
+  def test_api_error_at_generation_propagates(self):
+    # An API error must never silently become "no directive" (spec
+    # 11.1): it propagates and the step does not commit.
+    model = _DirectiveModel(
+        False, generation_error=RuntimeError('API unavailable')
+    )
+    director, gm = _make_director(model, **_DIRECTOR_FEEDBACK_PARAMS)
+    gm.observe('[putative_event] Alice: I show the letter.')
+    result = gm.act(_RESOLVE_SPEC)
+    with self.assertRaises(RuntimeError):
+      gm.observe(f'[event] {result}')
+    self.assertIsNone(director.get_last_story_turn())
+    self.assertIsNone(director.get_state()['directive'])
+
+  def test_beat_transition_invalidates_pending_directive(self):
+    # A pending directive restored from a checkpoint is invalidated by
+    # the next beat transition (spec 4.3, 4.5). The plain harness
+    # resolves without the director-note step, so the pending directive
+    # survives until the transition.
+    model = _DirectiveModel(False)
+    director, gm = _make_director(model, **_DIRECTOR_FEEDBACK_PARAMS)
+    _complete_turn(gm, 'one')
+    state = director.get_state()
+    self.assertEqual(state['directive']['status'], 'pending')
+    completing = _DirectiveModel(True)
+    fresh, fresh_gm = _make_director(completing, **_DIRECTOR_FEEDBACK_PARAMS)
+    fresh.set_state(state)
+    _complete_turn(fresh_gm, 'two')
+    directive = fresh.get_state()['directive']
+    self.assertEqual(directive['status'], 'invalidated')
+    self.assertEqual(directive['beat_id'], 'b1')
+    self.assertEqual(directive['generated_at_turn'], 1)
+    # The transition step also generated no replacement directive.
+    self.assertEqual(fresh.get_last_story_turn()['beat_id_after_event'], 'b2')
+    self.assertFalse(any(_DIRECTIVE_MARK in p for p in completing.text_prompts))
+
+  def test_state_roundtrip_preserves_pending_directive(self):
+    model = _DirectiveModel(False)
+    director, gm = _make_director(model, **_DIRECTOR_FEEDBACK_PARAMS)
+    _complete_turn(gm, 'one')
+    state = director.get_state()
+    fresh, _ = _make_director(
+        _DirectiveModel(False), **_DIRECTOR_FEEDBACK_PARAMS
+    )
+    fresh.set_state(state)
+    self.assertEqual(fresh.get_state(), state)
+    pending = fresh.get_pending_directive()
+    self.assertEqual(pending['content'], _DIRECTIVE_INSTRUCTION)
+    self.assertEqual(pending['beat_id'], 'b1')
+
+  def test_invalid_directive_config_rejected(self):
+    with self.assertRaises(ValueError):
+      drama_director.DramaDirector(
+          model=mock_model.MockModel(),
+          beats=BEATS,
+          feedback_enabled=True,
+          cooldown_turns=-1,
+      )
 
 
 if __name__ == '__main__':

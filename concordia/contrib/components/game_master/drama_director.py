@@ -37,8 +37,14 @@ every `eval_interval` story turns the model rates the dramatic tension of
 the most recent `scoring_window` resolved events on an anchored 1-10
 scale, the score is compared in program code against the target range of
 the beat that was current when the player acted, and the deviation is
-recorded. In the tension-observation mode the score is only recorded;
-director directives that act on deviations arrive in a later stage.
+recorded. Stage 2 also adds director directives (spec sections 4.4 step 4
+and 4.5): when feedback is enabled and a valid score deviates while no
+beat transitioned and the story keeps running outside any cooldown, the
+model is asked for a one-sentence instruction moving the tension back
+toward the range, constrained to NPC/environmental means only. The
+directive is stored as pending, bound to its beat, executed at most once
+by the `director_note` resolution step, and only marked consumed after
+the dual-track final output validates successfully.
 """
 
 from collections.abc import Sequence
@@ -86,6 +92,18 @@ _TENSION_ANCHORS = (
 _TENSION_OUTPUT_INSTRUCTION = (
     'Respond with a single integer from 1 to 10 and nothing else.'
 )
+
+# Status values of the director directive lifecycle (spec section 4.5).
+_DIRECTIVE_PENDING = 'pending'
+_DIRECTIVE_INTEGRATING = 'integrating'
+_DIRECTIVE_CONSUMED = 'consumed'
+_DIRECTIVE_INVALIDATED = 'invalidated'
+_DIRECTIVE_FAILED = 'failed'
+_ACTIVE_DIRECTIVE_STATUSES = (_DIRECTIVE_PENDING, _DIRECTIVE_INTEGRATING)
+
+# Default cooldown, in story turns, after a directive executes before
+# the next one may be generated (plan appendix C).
+_DEFAULT_COOLDOWN_TURNS = 3
 
 
 def _parse_tension_score(answer: str) -> int | None:
@@ -248,12 +266,18 @@ class DramaDirector(
       eval_interval: int = 2,
       scoring_window: int = 8,
       tolerance: int = 1,
+      cooldown_turns: int = _DEFAULT_COOLDOWN_TURNS,
+      feedback_enabled: bool = False,
+      allowed_environment_events: Sequence[str] = (),
+      immutable_facts: Sequence[str] = (),
+      player_names: Sequence[str] = (),
   ):
     """Initializes the director.
 
     Args:
-      model: The language model used for the beat-completion questions
-        and the tension-scoring questions.
+      model: The language model used for the beat-completion questions,
+        the tension-scoring questions, the directive-generation
+        questions and (via the `director_note` step) directive fusion.
       beats: The beats of the story, in narrative order.
       next_acting_component_key: Key of the component that reports the
         currently active player, e.g. `NextActing`.
@@ -266,10 +290,21 @@ class DramaDirector(
       tolerance: Slack around a beat's target tension range; scores
         within `lower - tolerance` and `upper + tolerance` (inclusive)
         do not deviate.
+      cooldown_turns: Number of story turns after a directive executes
+        during which no new directive may be generated.
+      feedback_enabled: Whether tension deviations generate director
+        directives; the tension-observation mode records scores only.
+      allowed_environment_events: Whitelist of NPC/environmental means
+        the director's instructions may draw on.
+      immutable_facts: Facts the director's instructions must never
+        contradict.
+      player_names: Names of the player characters, whose voluntary
+        actions no directive may decide.
 
     Raises:
       ValueError: If the beat configuration is invalid or the scoring
-        configuration is out of range. The model is not called.
+        or feedback configuration is out of range. The model is not
+        called.
     """
     super().__init__(pre_act_label=pre_act_label)
     _validate_beats(beats)
@@ -279,12 +314,19 @@ class DramaDirector(
       raise ValueError(f'scoring_window must be >= 1, got {scoring_window}.')
     if tolerance < 0:
       raise ValueError(f'tolerance must be >= 0, got {tolerance}.')
+    if cooldown_turns < 0:
+      raise ValueError(f'cooldown_turns must be >= 0, got {cooldown_turns}.')
     self._model = model
     self._beats = tuple(beats)
     self._next_acting_component_key = next_acting_component_key
     self._eval_interval = eval_interval
     self._scoring_window = scoring_window
     self._tolerance = tolerance
+    self._cooldown_turns = cooldown_turns
+    self._feedback_enabled = feedback_enabled
+    self._allowed_environment_events = tuple(allowed_environment_events)
+    self._immutable_facts = tuple(immutable_facts)
+    self._player_names = tuple(player_names)
     # One stored window serves both the completion question (up to
     # `_COMPLETION_QUERY_EVENTS` events) and the scoring question (the
     # last `scoring_window` events), so it keeps the larger need.
@@ -300,10 +342,12 @@ class DramaDirector(
     self._last_story_turn: dict[str, Any] | None = None
     self._tension_eval_count = 0
     self._tension_history: list[dict[str, Any]] = []
+    self._directive: dict[str, Any] | None = None
+    self._last_directive_executed_turn: int | None = None
 
     # Per-turn state machine (pending until committed by update).
     self._turn_context: dict[str, Any] | None = None
-    self._validated: dict[str, str] | None = None
+    self._validated: dict[str, Any] | None = None
     self._awaiting_event = False
     self._awaited_act_result: str | None = None
     self._snapshot: dict[str, Any] | None = None
@@ -446,6 +490,47 @@ class DramaDirector(
           'deviated': deviated,
       }
 
+    # Pipeline step 4: director directives (spec sections 4.4 step 4
+    # and 4.5). A beat transition invalidates any still-active
+    # directive of the old beat; a new directive is generated only when
+    # every precondition holds: no transition this step, the story
+    # still running, this step's score valid and deviating, feedback
+    # enabled, no active directive awaiting execution, and outside the
+    # cooldown since the last execution.
+    directive = dict(self._directive) if self._directive is not None else None
+    if (
+        completed
+        and directive is not None
+        and (directive['status'] in _ACTIVE_DIRECTIVE_STATUSES)
+    ):
+      directive = {**directive, 'status': _DIRECTIVE_INVALIDATED}
+    generate = (
+        not budget_stopped
+        and self._feedback_enabled
+        and tension is not None
+        and deviated
+        and not completed
+        and beat_index < len(self._beats)
+        and not beat_timeout
+        and not self._in_cooldown(turn_id)
+        and (
+            directive is None
+            or directive['status'] not in _ACTIVE_DIRECTIVE_STATUSES
+        )
+    )
+    if generate:
+      try:
+        directive = self._generate_directive(
+            score=tension,
+            beat_id=snapshot['beat_id_at_action'],
+            turn_id=turn_id,
+        )
+      except budget_wrapper.BudgetExhaustedError:
+        # Budget path B at the directive-generation position (spec
+        # 13.1-9): no directive is created and no further model calls
+        # happen, but the step still commits once via update.
+        budget_stopped = True
+
     story_turn = {
         'turn_id': turn_id,
         'actor': snapshot['actor'],
@@ -470,6 +555,7 @@ class DramaDirector(
         'story_turn': story_turn,
         'tension_eval_count': tension_eval_count,
         'tension_history_entry': tension_entry,
+        'directive': directive,
     }
     return ''
 
@@ -489,6 +575,10 @@ class DramaDirector(
       tension_entry = commit['tension_history_entry']
       if tension_entry is not None:
         self._tension_history.append(tension_entry)
+      directive = commit['directive']
+      if directive != self._directive:
+        self._logging_channel({'DirectorDirective': directive})
+      self._directive = directive
       self._pending_commit = None
       # Clear the per-turn state machine; the turn is fully committed.
       self._turn_context = None
@@ -508,14 +598,111 @@ class DramaDirector(
   ) -> None:
     """Supplies the validated resolution of the current turn.
 
+    A directive being integrated into this resolution is committed as
+    consumed here, because only the validated final output proves the
+    directive reached the story (spec 4.5). An invalid final output
+    raises before this method is reached, leaving the directive
+    unconsumed.
+
     Args:
       resolved_event: The resolved event to publish for the current turn.
       stage_directions: Stage directions accompanying the event.
     """
+    integrating = (
+        self._directive is not None
+        and self._directive['status'] == _DIRECTIVE_INTEGRATING
+    )
+    if integrating:
+      self.commit_directive()
     self._validated = {
         'resolved_event': resolved_event,
         'stage_directions': stage_directions,
+        'directive_integrating': integrating,
     }
+
+  def get_pending_directive(self) -> dict[str, Any] | None:
+    """Returns a copy of the pending directive, if any.
+
+    Returns:
+      A copy of the directive dictionary (beat_id, generated_at_turn,
+      content, status) while it awaits execution, or None when no
+      directive is pending (including integrating, consumed,
+      invalidated and failed ones).
+    """
+    if (
+        self._directive is not None
+        and self._directive['status'] == _DIRECTIVE_PENDING
+    ):
+      return dict(self._directive)
+    return None
+
+  def mark_directive_integrating(self) -> None:
+    """Moves the pending directive to the integrating status.
+
+    Called by the director-note step when it starts fusing the
+    directive into a candidate event. A directive that is not pending
+    is left untouched, so a repeated call cannot resurrect one.
+    """
+    if (
+        self._directive is not None
+        and self._directive['status'] == _DIRECTIVE_PENDING
+    ):
+      self._directive = {
+          **self._directive,
+          'status': _DIRECTIVE_INTEGRATING,
+      }
+
+  def commit_directive(self) -> None:
+    """Commits the integrating directive as consumed, once.
+
+    Records the story turn being resolved as the execution turn for
+    the cooldown computation. A directive that is not integrating is
+    left untouched, so a second resolution never re-consumes one.
+    """
+    if (
+        self._directive is None
+        or self._directive['status'] != _DIRECTIVE_INTEGRATING
+    ):
+      return
+    self._directive = {**self._directive, 'status': _DIRECTIVE_CONSUMED}
+    # The turn in progress is one past the last committed story turn.
+    self._last_directive_executed_turn = self._story_turn + 1
+    self._logging_channel({'DirectorDirective': self._directive})
+
+  def mark_directive_failed(self, reason: str) -> None:
+    """Records an active directive as failed, with its reason.
+
+    Failure degrades to no directive and never interrupts the
+    simulation (spec 11.1).
+
+    Args:
+      reason: Why the directive could not be executed.
+    """
+    if (
+        self._directive is not None
+        and self._directive['status'] in _ACTIVE_DIRECTIVE_STATUSES
+    ):
+      self._directive = {
+          **self._directive,
+          'status': _DIRECTIVE_FAILED,
+          'reason': reason,
+      }
+      self._logging_channel({'DirectorDirective': self._directive})
+
+  @property
+  def allowed_environment_events(self) -> tuple[str, ...]:
+    """Whitelist of NPC/environmental means directives may draw on."""
+    return self._allowed_environment_events
+
+  @property
+  def immutable_facts(self) -> tuple[str, ...]:
+    """Facts directives must never contradict."""
+    return self._immutable_facts
+
+  @property
+  def player_names(self) -> tuple[str, ...]:
+    """Player characters whose voluntary actions directives may not decide."""
+    return self._player_names
 
   def get_last_story_turn(self) -> dict[str, Any] | None:
     """Returns a copy of the most recently committed story turn, if any."""
@@ -559,6 +746,10 @@ class DramaDirector(
         ),
         'tension_eval_count': self._tension_eval_count,
         'tension_history': [dict(entry) for entry in self._tension_history],
+        'directive': (
+            dict(self._directive) if self._directive is not None else None
+        ),
+        'last_directive_executed_turn': self._last_directive_executed_turn,
     }
 
   @override
@@ -593,6 +784,13 @@ class DramaDirector(
         state.get('tension_history', ()),
     )
     self._tension_history = [dict(entry) for entry in tension_history]
+    # The directive fields postdate the stage-1 state schema; older
+    # checkpoints resume with no directive and no execution recorded.
+    directive = cast('dict[str, Any] | None', state.get('directive', None))
+    self._directive = dict(directive) if directive is not None else None
+    self._last_directive_executed_turn = state.get(  # pyrefly: ignore[bad-assignment]
+        'last_directive_executed_turn', None
+    )
 
   def _current_beat(self) -> Beat | None:
     """Returns the beat currently in progress, or None if all are done."""
@@ -698,3 +896,88 @@ class DramaDirector(
           document.open_question(_TENSION_OUTPUT_INSTRUCTION)
       )
     return score
+
+  def _in_cooldown(self, turn_id: int) -> bool:
+    """Decides whether the given story turn falls in the cooldown.
+
+    Args:
+      turn_id: The story turn being processed.
+
+    Returns:
+      Whether fewer than `cooldown_turns` + 1 turns have passed since
+      the last directive execution (the executing turn itself counts
+      as the first cooldown turn).
+    """
+    last = self._last_directive_executed_turn
+    return last is not None and turn_id - last <= self._cooldown_turns
+
+  def _generate_directive(
+      self,
+      *,
+      score: int,
+      beat_id: str,
+      turn_id: int,
+  ) -> dict[str, Any]:
+    """Asks the model for a directive moving the tension toward range.
+
+    The prompt is the P3 template (plan appendix B): it carries the
+    deviation, the direction of correction and the constraints that
+    only whitelisted NPC/environmental means may be used and immutable
+    facts must hold, so directives can never decide player characters'
+    voluntary actions.
+
+    Args:
+      score: This step's valid, deviating tension score.
+      beat_id: The beat the directive binds to, the one current when
+        the player acted.
+      turn_id: The story turn generating the directive.
+
+    Returns:
+      The new directive dictionary. An empty model answer is recorded
+      as a generation failure with its reason (spec 11.1).
+
+    Raises:
+      budget_wrapper.BudgetExhaustedError: If the attempt budget is
+        spent; propagated to the caller for budget path B handling.
+        Any other model error propagates uncaught.
+    """
+    lower, upper = self._target_range_of(beat_id) or (0, 0)
+    raise_or_lower = 'raise' if score < lower - self._tolerance else 'lower'
+    events = (
+        '; '.join(self._allowed_environment_events)
+        if self._allowed_environment_events
+        else '(none)'
+    )
+    facts = (
+        '; '.join(self._immutable_facts) if self._immutable_facts else '(none)'
+    )
+    document = interactive_document.InteractiveDocument(self._model)
+    document.statement(
+        f'Current tension ({score}) is outside the target range '
+        f'({lower}, {upper}) for the current beat. The story needs '
+        f'{raise_or_lower} dramatic pressure.\n'
+    )
+    document.statement('## Constraints')
+    document.statement(
+        "You may ONLY use these means, never player characters' "
+        f'voluntary actions: {events}'
+    )
+    content = document.open_question(
+        'Write one short director instruction (one sentence) describing '
+        f'an event or NPC action that moves tension {raise_or_lower}. '
+        f'Never contradict immutable facts: {facts}'
+    ).strip()
+    if not content:
+      return {
+          'beat_id': beat_id,
+          'generated_at_turn': turn_id,
+          'content': '',
+          'status': _DIRECTIVE_FAILED,
+          'reason': 'empty directive instruction',
+      }
+    return {
+        'beat_id': beat_id,
+        'generated_at_turn': turn_id,
+        'content': content,
+        'status': _DIRECTIVE_PENDING,
+    }
