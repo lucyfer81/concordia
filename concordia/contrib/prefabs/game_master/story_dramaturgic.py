@@ -17,7 +17,8 @@
 The game master follows the scene-based assembly of the
 `dialogic_and_dramaturgic` prefab and swaps in the story-enactment
 components of `concordia.contrib.components.game_master`: a
-`DramaDirector` advances the story through its beats, event resolution
+`DramaDirector` advances the story through its beats and periodically
+scores the dramatic tension of the recent events, event resolution
 produces the dual-track output that separates player speech (agency)
 from stage directions (narrator authority), and a
 `SceneOrStoryTerminator` stops the run when either the scene schedule or
@@ -69,6 +70,13 @@ class GameMaster(prefab_lib.Prefab):
           'scene_dicts': (),
           # Story beats, as dictionaries encoded by `Beat.to_dict`.
           'beat_dicts': (),
+          # Drama director scoring configuration (plan appendix C):
+          # score every eval_interval-th story turn against the last
+          # scoring_window resolved events, with the given tolerance
+          # around each beat's target tension range. JSON-safe ints.
+          'eval_interval': 2,
+          'scoring_window': 8,
+          'tolerance': 1,
           # World constraints shown to the game master in every resolution.
           'world_constraints': (),
           # Facts no resolved event may contradict.
@@ -201,11 +209,15 @@ class GameMaster(prefab_lib.Prefab):
     )
 
     # The drama director advances the story through its beats; its pre-act
-    # value exposes the current beat to every resolution prompt.
+    # value exposes the current beat to every resolution prompt. The
+    # scoring configuration comes from the JSON-safe prefab params.
     drama_director_key = drama_director.DEFAULT_DRAMA_DIRECTOR_COMPONENT_KEY
     director = drama_director.DramaDirector(
         model=model,
         beats=beats,
+        eval_interval=self.params.get('eval_interval', 2),
+        scoring_window=self.params.get('scoring_window', 8),
+        tolerance=self.params.get('tolerance', 1),
     )
 
     world_constraints = actor_components.constant.Constant(

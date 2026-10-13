@@ -30,14 +30,15 @@ Budget paths follow spec section 11.3. Exhaustion BEFORE a resolution
 commits propagates out of ``play`` and is recorded here as
 ``budget_limit``: the current step is not saved and the previous full
 checkpoint stays in place. Exhaustion AFTER the resolution (the
-completion-judgment position) is converted by the ``DramaDirector``
-into a budget-stop flag; the step still commits exactly once and this
-module only summarizes. Any other exception is recorded as ``error``;
-``BaseException`` (e.g. a simulated crash) is never swallowed.
+completion-judgment or tension-scoring position) is converted by the
+``DramaDirector`` into a budget-stop flag; the step still commits
+exactly once and this module only summarizes. Any other exception is
+recorded as ``error``; ``BaseException`` (e.g. a simulated crash) is
+never swallowed.
 
 Example:
   python -m examples.story_enactment.run --state_dir /tmp/story-demo \
-      --disable_language_model --mode beats_only
+      --disable_language_model --mode tension_observe
 """
 
 from collections.abc import Callable, Mapping, Sequence
@@ -71,9 +72,20 @@ from examples.story_enactment import testing_stubs
 # Schema version of the run config recorded inside the envelope.
 RUN_CONFIG_SCHEMA = 1
 
-# Stage switches of the plan; stage 1 implements beats_only only.
+# Stage switches of the plan; stage 2 adds the tension_observe mode.
 MODE_BEATS_ONLY = 'beats_only'
+MODE_TENSION_OBSERVE = 'tension_observe'
 MODES = ('beats_only', 'tension_observe', 'director', 'character_depth')
+
+# Appendix-C default scoring configuration of the drama director.
+_DEFAULT_DIRECTOR_PARAMS = {
+    'eval_interval': 2,
+    'scoring_window': 8,
+    'tolerance': 1,
+}
+# beats_only keeps the exact stage-1 model-call pattern: eval_interval=0
+# disables scoring, so no story turn falls on a scoring step.
+_BEATS_ONLY_DIRECTOR_PARAMS = {**_DEFAULT_DIRECTOR_PARAMS, 'eval_interval': 0}
 
 # Names of the two prefabs inside the run's Config.
 _CHARACTER_PREFAB = 'story_character'
@@ -302,13 +314,13 @@ def make_run_config(
       before the config is recorded.
 
   Returns:
-    The run-config dictionary with the schema version, the full story
-    data, scene and beat dictionaries, character and game-master prefab
-    params, both total limits, the mode, the director parameters and
-    the model identity.
+      The run-config dictionary with the schema version, the full story
+      data, scene and beat dictionaries, character and game-master prefab
+      params, both total limits, the mode, the director parameters
+      (scoring configuration) and the model identity.
 
   Raises:
-    ValueError: if the mode is unknown or the story is invalid.
+      ValueError: if the mode is unknown or the story is invalid.
   """
   if mode not in MODES:
     raise ValueError(f'unknown mode {mode!r}; expected one of {MODES}.')
@@ -337,7 +349,11 @@ def make_run_config(
       'total_turn_limit': total_turn_limit,
       'total_model_attempt_limit': total_model_attempt_limit,
       'mode': mode,
-      'director_params': {},
+      'director_params': dict(
+          _BEATS_ONLY_DIRECTOR_PARAMS
+          if mode == MODE_BEATS_ONLY
+          else _DEFAULT_DIRECTOR_PARAMS
+      ),
       'model_config': _public_model_identity(model_config),
   }
 
@@ -522,6 +538,10 @@ def build_simulation(
       **run_config['gm_params'],
       'scene_dicts': run_config['scene_dicts'],
       'beat_dicts': run_config['beat_dicts'],
+      # The drama director's scoring configuration travels inside the
+      # game master prefab params (eval_interval/scoring_window/
+      # tolerance); the prefab reads the keys it knows.
+      **run_config.get('director_params', {}),
   }
   instances.append(
       prefab_lib.InstanceConfig(
@@ -771,7 +791,9 @@ def run(
       original limit; an explicitly passed different value is rejected.
     total_model_attempt_limit: total model-attempt budget; None uses
       the 400-attempt default, and the same resume rule applies.
-    mode: stage switch; stage 1 implements beats_only only.
+    mode: stage switch; stage 2 implements beats_only (scoring disabled,
+      identical stage-1 call pattern) and tension_observe (default
+      scoring configuration: every 2nd turn, window of 8, tolerance 1).
     model_config: identity of a live model (api_type, model_name,
       api_key); a first run without it uses the prompt stub.
     run_config: optional prebuilt run config for a first run (used by
@@ -786,7 +808,7 @@ def run(
     ValueError: on resume validation failures (missing or mismatched
       checkpoint, mismatched limits or mode, budget-exhausted summary)
       or when starting over an existing run.
-    NotImplementedError: for modes beyond beats_only (stage 2+).
+    NotImplementedError: for modes beyond tension_observe (stage 3+).
   """
   os.makedirs(state_dir, exist_ok=True)
   checkpoint_path = os.path.join(state_dir, 'checkpoint.json')
@@ -839,9 +861,9 @@ def run(
       # A supplied run config is authoritative; the limit and mode
       # parameters of this call are ignored on a first run.
       config = run_config
-  if config['mode'] != MODE_BEATS_ONLY:
+  if config['mode'] not in (MODE_BEATS_ONLY, MODE_TENSION_OBSERVE):
     raise NotImplementedError(
-        f'mode {config["mode"]!r} is not enabled in stage 1.'
+        f'mode {config["mode"]!r} is not enabled in stage 2.'
     )
 
   effective_model_config = (

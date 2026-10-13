@@ -31,12 +31,19 @@ steps, the director uses a pending-commit state machine: per-turn results
 are computed in `post_observe` into `_pending_commit` and only promoted to
 committed state by `update`, so exactly one commit happens per story turn.
 
-Stage 1 scope: lifecycle, story-turn bookkeeping and beat advancement.
-Tension scoring and director directives are added in later stages.
+Stage 1 covered the lifecycle, story-turn bookkeeping and beat
+advancement. Stage 2 adds tension evaluation (spec section 4.4, step 3):
+every `eval_interval` story turns the model rates the dramatic tension of
+the most recent `scoring_window` resolved events on an anchored 1-10
+scale, the score is compared in program code against the target range of
+the beat that was current when the player acted, and the deviation is
+recorded. In the tension-observation mode the score is only recorded;
+director directives that act on deviations arrive in a later stage.
 """
 
 from collections.abc import Sequence
 import dataclasses
+import re
 from typing import Any, cast, override
 
 from concordia.components.agent import action_spec_ignored
@@ -58,9 +65,69 @@ _EVENT_PREFIX = f'{event_resolution_lib.EVENT_TAG} '
 _MIN_TENSION = 1
 _MAX_TENSION = 10
 
-# Number of resolved events kept in the local window that conditions the
-# beat-completion question.
-_MAX_RECENT_EVENTS = 20
+# Number of resolved events the beat-completion question needs in its
+# window. The stored event window keeps the larger of this need and
+# `scoring_window`, so it serves both pipeline steps 2 and 3.
+_COMPLETION_QUERY_EVENTS = 20
+
+# A scoring answer must be exactly one integer in the scale bounds.
+_TENSION_ANSWER = re.compile(r'\s*(\d{1,2})\s*')
+
+# Fixed wording of the tension-scale anchors and the output instruction
+# of the scoring prompt (plan appendix B, prompt P2).
+_TENSION_QUESTION = (
+    'Rate the current dramatic tension of the story on a scale from 1 to 10.'
+)
+_TENSION_ANCHORS = (
+    '1 = calm routine, no conflict or stakes in motion.',
+    '5 = clear conflict or stakes present, but pressure is steady.',
+    '10 = open confrontation or crisis, the outcome hangs on this moment.',
+)
+_TENSION_OUTPUT_INSTRUCTION = (
+    'Respond with a single integer from 1 to 10 and nothing else.'
+)
+
+
+def _parse_tension_score(answer: str) -> int | None:
+  """Parses a model answer into a tension score on the 1-10 scale.
+
+  Args:
+    answer: The raw model response to the scoring question.
+
+  Returns:
+    The score, or None if the answer is not a single integer within the
+    scale bounds.
+  """
+  match = _TENSION_ANSWER.fullmatch(answer)
+  if match is None:
+    return None
+  score = int(match.group(1))
+  if _MIN_TENSION <= score <= _MAX_TENSION:
+    return score
+  return None
+
+
+def _is_deviation(
+    score: int,
+    tension_range: tuple[int, int],
+    tolerance: int,
+) -> bool:
+  """Decides whether a score deviates from a beat's target range.
+
+  Only scores strictly below `lower - tolerance` or strictly above
+  `upper + tolerance` deviate; scores equal to a threshold do not
+  (spec section 4.4, step 3).
+
+  Args:
+    score: The observed tension score.
+    tension_range: Inclusive (lower, upper) target bounds of the beat.
+    tolerance: Allowed slack on both sides of the range.
+
+  Returns:
+    Whether the score deviates from the target range.
+  """
+  lower, upper = tension_range
+  return score < lower - tolerance or score > upper + tolerance
 
 
 @dataclasses.dataclass(frozen=True)
@@ -178,26 +245,50 @@ class DramaDirector(
           next_acting_lib.DEFAULT_NEXT_ACTING_COMPONENT_KEY
       ),
       pre_act_label: str = DEFAULT_DRAMA_DIRECTOR_PRE_ACT_LABEL,
+      eval_interval: int = 2,
+      scoring_window: int = 8,
+      tolerance: int = 1,
   ):
     """Initializes the director.
 
     Args:
-      model: The language model used for the beat-completion questions.
+      model: The language model used for the beat-completion questions
+        and the tension-scoring questions.
       beats: The beats of the story, in narrative order.
       next_acting_component_key: Key of the component that reports the
         currently active player, e.g. `NextActing`.
       pre_act_label: Prefix for this component's section of the pre-act
         context.
+      eval_interval: The story is scored every `eval_interval`-th story
+        turn; other turns keep `tension` unset. Zero disables scoring.
+      scoring_window: Number of most recent resolved events conditioning
+        the scoring question.
+      tolerance: Slack around a beat's target tension range; scores
+        within `lower - tolerance` and `upper + tolerance` (inclusive)
+        do not deviate.
 
     Raises:
-      ValueError: If the beat configuration is invalid. The model is not
-        called.
+      ValueError: If the beat configuration is invalid or the scoring
+        configuration is out of range. The model is not called.
     """
     super().__init__(pre_act_label=pre_act_label)
     _validate_beats(beats)
+    if eval_interval < 0:
+      raise ValueError(f'eval_interval must be >= 0, got {eval_interval}.')
+    if scoring_window < 1:
+      raise ValueError(f'scoring_window must be >= 1, got {scoring_window}.')
+    if tolerance < 0:
+      raise ValueError(f'tolerance must be >= 0, got {tolerance}.')
     self._model = model
     self._beats = tuple(beats)
     self._next_acting_component_key = next_acting_component_key
+    self._eval_interval = eval_interval
+    self._scoring_window = scoring_window
+    self._tolerance = tolerance
+    # One stored window serves both the completion question (up to
+    # `_COMPLETION_QUERY_EVENTS` events) and the scoring question (the
+    # last `scoring_window` events), so it keeps the larger need.
+    self._window_size = max(scoring_window, _COMPLETION_QUERY_EVENTS)
 
     # Committed state, restored by set_state.
     self._beat_index = 0
@@ -207,6 +298,8 @@ class DramaDirector(
     self._beat_timeout = False
     self._budget_stopped = False
     self._last_story_turn: dict[str, Any] | None = None
+    self._tension_eval_count = 0
+    self._tension_history: list[dict[str, Any]] = []
 
     # Per-turn state machine (pending until committed by update).
     self._turn_context: dict[str, Any] | None = None
@@ -289,10 +382,11 @@ class DramaDirector(
     turns_in_beat = self._turns_in_beat + 1
     beat_timeout = self._beat_timeout
     budget_stopped = self._budget_stopped
+    turn_id = self._story_turn + 1
     recent_events = [
         *self._recent_events,
         snapshot['resolved_event'],
-    ][-_MAX_RECENT_EVENTS:]
+    ][-self._window_size :]
 
     completed = False
     # The completion question runs only after the beat's minimum turn
@@ -317,8 +411,43 @@ class DramaDirector(
     elif beat is not None and turns_in_beat >= beat.max_turns:
       beat_timeout = True
 
+    # Pipeline step 3: tension evaluation (spec section 4.4). Scheduled
+    # every eval_interval-th story turn and skipped entirely once the
+    # budget is spent. The score is compared in program code against the
+    # target range of the beat that was current when the player acted;
+    # the scoring prompt never sees the target range. Deviations are
+    # only recorded here; acting on them is a later pipeline step.
+    tension = None
+    deviated = False
+    tension_eval_count = self._tension_eval_count
+    tension_entry = None
+    if (
+        not budget_stopped
+        and self._eval_interval > 0
+        and turn_id % self._eval_interval == 0
+    ):
+      tension_eval_count += 1
+      try:
+        tension = self._score_tension(recent_events)
+      except budget_wrapper.BudgetExhaustedError:
+        # Budget path B at the scoring position (spec 11.3-2): the
+        # score stays unset, no further model calls happen this step,
+        # and the step still commits once via update.
+        budget_stopped = True
+      if tension is not None:
+        target = self._target_range_of(snapshot['beat_id_at_action'])
+        deviated = target is not None and _is_deviation(
+            tension, target, self._tolerance
+        )
+      tension_entry = {
+          'turn_id': turn_id,
+          'beat_id': snapshot['beat_id_at_action'],
+          'tension': tension,
+          'deviated': deviated,
+      }
+
     story_turn = {
-        'turn_id': self._story_turn + 1,
+        'turn_id': turn_id,
         'actor': snapshot['actor'],
         'speech': snapshot['original_speech'],
         'beat_id_at_action': snapshot['beat_id_at_action'],
@@ -329,7 +458,7 @@ class DramaDirector(
         ),
         'resolved_event': snapshot['resolved_event'],
         'stage_directions': snapshot['stage_directions'],
-        'tension': None,  # Placeholder; scored in a later stage.
+        'tension': tension,
         'budget_stopped': budget_stopped,
     }
     self._pending_commit = {
@@ -339,6 +468,8 @@ class DramaDirector(
         'beat_timeout': beat_timeout,
         'budget_stopped': budget_stopped,
         'story_turn': story_turn,
+        'tension_eval_count': tension_eval_count,
+        'tension_history_entry': tension_entry,
     }
     return ''
 
@@ -354,6 +485,10 @@ class DramaDirector(
       self._beat_timeout = commit['beat_timeout']
       self._budget_stopped = commit['budget_stopped']
       self._last_story_turn = story_turn
+      self._tension_eval_count = commit['tension_eval_count']
+      tension_entry = commit['tension_history_entry']
+      if tension_entry is not None:
+        self._tension_history.append(tension_entry)
       self._pending_commit = None
       # Clear the per-turn state machine; the turn is fully committed.
       self._turn_context = None
@@ -422,6 +557,8 @@ class DramaDirector(
             if self._last_story_turn is not None
             else None
         ),
+        'tension_eval_count': self._tension_eval_count,
+        'tension_history': [dict(entry) for entry in self._tension_history],
     }
 
   @override
@@ -445,6 +582,17 @@ class DramaDirector(
     self._last_story_turn = (
         dict(last_story_turn) if last_story_turn is not None else None
     )
+    # The tension fields postdate the stage-1 state schema; older
+    # checkpoints (and fixtures built against them) resume with an
+    # empty evaluation history.
+    self._tension_eval_count = state.get(  # pyrefly: ignore[bad-assignment]
+        'tension_eval_count', 0
+    )
+    tension_history = cast(
+        'Sequence[dict[str, Any]]',
+        state.get('tension_history', ()),
+    )
+    self._tension_history = [dict(entry) for entry in tension_history]
 
   def _current_beat(self) -> Beat | None:
     """Returns the beat currently in progress, or None if all are done."""
@@ -491,3 +639,62 @@ class DramaDirector(
       # The model failed to pick one of the offered choices; treat the
       # beat as not completed rather than guessing.
       return False
+
+  def _target_range_of(self, beat_id: str | None) -> tuple[int, int] | None:
+    """Returns the target tension range of the beat with the given id.
+
+    Args:
+      beat_id: The beat that was current when the player acted.
+
+    Returns:
+      The beat's inclusive (lower, upper) tension bounds, or None if no
+      beat matches (e.g. the story was already complete).
+    """
+    if beat_id is None:
+      return None
+    for beat in self._beats:
+      if beat.id == beat_id:
+        return beat.tension_range
+    return None
+
+  def _score_tension(self, recent_events: Sequence[str]) -> int | None:
+    """Asks the model to rate the story's dramatic tension on 1-10.
+
+    The prompt carries only the anchored scale and the most recent
+    `scoring_window` resolved events of the director's own window; the
+    target range of the beat is deliberately absent, because the
+    deviation judgment is made in program code. An unparseable answer is
+    retried exactly once (spec section 11.1).
+
+    Args:
+      recent_events: The step's updated event window; the last
+        `scoring_window` events condition the question.
+
+    Returns:
+      The parsed score, or None if both answers were invalid.
+
+    Raises:
+      budget_wrapper.BudgetExhaustedError: If the attempt budget is spent;
+        propagated to the caller for budget path B handling. Any other
+        model error propagates uncaught.
+    """
+    window = list(recent_events[-self._scoring_window :])
+    document = interactive_document.InteractiveDocument(self._model)
+    document.statement(f'{_TENSION_QUESTION}\n')
+    document.statement('## Scale anchors')
+    for anchor in _TENSION_ANCHORS:
+      document.statement(anchor)
+    document.statement('## Recent events (oldest first)')
+    for event in window:
+      document.statement(f'- {event}')
+    document.statement('## Output')
+    score = _parse_tension_score(
+        document.open_question(_TENSION_OUTPUT_INSTRUCTION)
+    )
+    if score is None:
+      # Retry once on an unparseable answer only; API and budget errors
+      # are never treated as parse failures.
+      score = _parse_tension_score(
+          document.open_question(_TENSION_OUTPUT_INSTRUCTION)
+      )
+    return score
