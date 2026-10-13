@@ -29,6 +29,31 @@ By contributing to this effort, you can:
 
 --------------------------------------------------------------------------------
 
+## The Budget Guard Wrapper
+
+`budget_wrapper.py` provides `BudgetGuardLanguageModel`, a wrapper that
+enforces a hard budget on model usage for long or costly runs (for example,
+the story-enactment example).
+
+-   **Budget unit:** one unit is one attempt of `sample_text` or
+    `sample_choice` on the wrapped model — not a vendor HTTP request and not
+    a token count. Attempts that fail (the underlying model raises) still
+    consume budget; raising `BudgetExhaustedError` itself does not.
+
+-   **Composition with retries:** wrap the guard inside the core retry
+    wrapper, `RetryLanguageModel(BudgetGuardLanguageModel(provider_model))`,
+    so that every retry passes the budget check. `BudgetExhaustedError` is
+    raised *before* the underlying model is called, is not a transient API
+    error, and must never appear in a retry whitelist (the story-enactment
+    run loop validates its whitelist accordingly).
+
+-   **Checkpoint resume:** the guard exposes `used_attempts` and
+    `total_attempt_limit` properties, and a `restore(used_attempts,
+    total_attempt_limit)` method for resuming a run from a checkpoint
+    without resetting the original budget.
+
+--------------------------------------------------------------------------------
+
 ## How to Contribute
 
 We welcome and encourage pull requests that add new language model wrappers or
