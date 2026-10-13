@@ -23,6 +23,8 @@ from concordia.associative_memory import basic_associative_memory as associative
 from concordia.components import agent as agent_components
 from concordia.components import game_master as gm_components
 from concordia.components.game_master import event_resolution as event_resolution_lib
+from concordia.contrib.components.agent import emotional_stance
+from concordia.contrib.components.agent import relationships as relationships_lib
 from concordia.contrib.components.game_master import drama_director as drama_director_lib
 from concordia.contrib.components.game_master import story_terminator as story_terminator_lib
 from concordia.contrib.prefabs.entity import story_character
@@ -206,6 +208,86 @@ class StoryCharacterPrefabTest(absltest.TestCase):
         entity.get_component('CharacterBrief'),
         agent_components.constant.Constant,
     )
+
+
+class StoryCharacterDepthWiringTest(absltest.TestCase):
+  """Stage-3 params wire emotion and relationship components per build."""
+
+  def _build(self, **extra):
+    params = _character_params('Alice')
+    params.update(extra)
+    return story_character.Entity(params=params).build(
+        model=mock_model.MockModel(),
+        memory_bank=associative_memory.AssociativeMemoryBank(
+            sentence_embedder=_embedder
+        ),
+    )
+
+  def test_emotion_options_wire_emotional_stance(self):
+    entity = self._build(emotion_options=('calm', 'anxious'))
+    stance = entity.get_component(
+        story_character.EMOTIONAL_STANCE_COMPONENT_KEY,
+        type_=emotional_stance.EmotionalStance,
+    )
+    self.assertIsInstance(stance, emotional_stance.EmotionalStance)
+    # The component carries the character's name and the palette verbatim
+    # (protected access is the only way to inspect the wiring).
+    self.assertEqual(stance._name, 'Alice')  # pylint: disable=protected-access
+    self.assertEqual(  # pylint: disable=protected-access
+        stance._emotion_options,
+        ['calm', 'anxious'],
+    )
+
+  def test_no_emotional_stance_without_emotion_options(self):
+    entity = self._build()
+    with self.assertRaises(KeyError):
+      entity.get_component(story_character.EMOTIONAL_STANCE_COMPONENT_KEY)
+
+  def test_relationships_wire_public_participant_names(self):
+    entity = self._build(
+        relationships_refresh_interval=3, other_player_names=('Bob', 'Carol')
+    )
+    component = entity.get_component(
+        story_character.RELATIONSHIPS_COMPONENT_KEY,
+        type_=relationships_lib.RelationshipsToOthers,
+    )
+    self.assertIsInstance(component, relationships_lib.RelationshipsToOthers)
+    # The relationship view names exactly the other public participants.
+    self.assertEqual(  # pylint: disable=protected-access
+        component._other_player_names,
+        ('Bob', 'Carol'),
+    )
+    self.assertEqual(component.get_state()['refresh_interval'], 3)
+
+  def test_no_relationships_without_refresh_interval(self):
+    # Participant names alone must not create the component: only a
+    # positive refresh interval turns relationship perception on.
+    entity = self._build(other_player_names=('Bob',))
+    with self.assertRaises(KeyError):
+      entity.get_component(story_character.RELATIONSHIPS_COMPONENT_KEY)
+
+  def test_rebuild_creates_new_depth_components(self):
+    # One prefab instance (one params dict) built twice must produce fresh
+    # depth components each time and keep its params JSON-safe.
+    prefab = story_character.Entity(
+        params={
+            **_character_params('Alice'),
+            'emotion_options': ('calm',),
+            'relationships_refresh_interval': 2,
+            'other_player_names': ('Bob',),
+        }
+    )
+    first = _build_prefab(prefab)
+    second = _build_prefab(prefab)
+    self.assertIsNot(
+        first.get_component(story_character.EMOTIONAL_STANCE_COMPONENT_KEY),
+        second.get_component(story_character.EMOTIONAL_STANCE_COMPONENT_KEY),
+    )
+    self.assertIsNot(
+        first.get_component(story_character.RELATIONSHIPS_COMPONENT_KEY),
+        second.get_component(story_character.RELATIONSHIPS_COMPONENT_KEY),
+    )
+    json.dumps(prefab.params)
 
 
 class StoryGameMasterPrefabTest(absltest.TestCase):

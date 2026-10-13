@@ -73,11 +73,17 @@ from examples.story_enactment import testing_stubs
 RUN_CONFIG_SCHEMA = 1
 
 # Stage switches of the plan; stage 2 adds the tension_observe and
-# director modes.
+# director modes, stage 3 adds character_depth.
 MODE_BEATS_ONLY = 'beats_only'
 MODE_TENSION_OBSERVE = 'tension_observe'
 MODE_DIRECTOR = 'director'
+MODE_CHARACTER_DEPTH = 'character_depth'
 MODES = ('beats_only', 'tension_observe', 'director', 'character_depth')
+
+# Appendix-C character-depth parameters: the emotion palette offered to
+# the characters' EmotionalStance and the relationship refresh cadence.
+_EMOTION_OPTIONS = ('平静', '焦虑', '愤怒', '悲伤', '希望', '羞愧')
+_RELATIONSHIPS_REFRESH_INTERVAL = 3
 
 # Appendix-C default scoring configuration of the drama director.
 _DEFAULT_DIRECTOR_PARAMS = {
@@ -363,14 +369,27 @@ def make_run_config(
       num_rounds=total_turn_limit,
       premise={character.name: premise_lines for character in story.characters},
   )
+  entity_params = []
+  for character in story.characters:
+    params = make_character_params(character)
+    if mode == MODE_CHARACTER_DEPTH:
+      # Character depth layers emotion and relationship perception on
+      # every character; each character perceives exactly the other
+      # public participants (appendix C).
+      params['emotion_options'] = list(_EMOTION_OPTIONS)
+      params['relationships_refresh_interval'] = _RELATIONSHIPS_REFRESH_INTERVAL
+      params['other_player_names'] = [
+          other.name
+          for other in story.characters
+          if other.name != character.name
+      ]
+    entity_params.append(params)
   return {
       'schema_version': RUN_CONFIG_SCHEMA,
       'story': story.to_dict(),
       'scene_dicts': [story_scene.scene_to_dict(scene)],
       'beat_dicts': [beat.to_dict() for beat in make_example_beats()],
-      'entity_params': [
-          make_character_params(character) for character in story.characters
-      ],
+      'entity_params': entity_params,
       'gm_params': make_gm_params(story),
       'total_turn_limit': total_turn_limit,
       'total_model_attempt_limit': total_model_attempt_limit,
@@ -819,7 +838,10 @@ def run(
       director (default scoring configuration plus feedback: deviating
       scores generate directives, fused into resolutions through the
       story's allowed environment events with a cooldown between
-      executions).
+      executions). Stage 3 adds character_depth: the director
+      configuration plus an EmotionalStance commitment and a cached
+      RelationshipsToOthers view on every character, with the acting
+      character's emotion collected into the story turns.
     model_config: identity of a live model (api_type, model_name,
       api_key); a first run without it uses the prompt stub.
     run_config: optional prebuilt run config for a first run (used by
@@ -834,7 +856,6 @@ def run(
     ValueError: on resume validation failures (missing or mismatched
       checkpoint, mismatched limits or mode, budget-exhausted summary)
       or when starting over an existing run.
-    NotImplementedError: for modes beyond director (stage 3+).
   """
   os.makedirs(state_dir, exist_ok=True)
   checkpoint_path = os.path.join(state_dir, 'checkpoint.json')
@@ -887,14 +908,6 @@ def run(
       # A supplied run config is authoritative; the limit and mode
       # parameters of this call are ignored on a first run.
       config = run_config
-  if config['mode'] not in (
-      MODE_BEATS_ONLY,
-      MODE_TENSION_OBSERVE,
-      MODE_DIRECTOR,
-  ):
-    raise NotImplementedError(
-        f'mode {config["mode"]!r} is not enabled in stage 2.'
-    )
 
   effective_model_config = (
       dict(model_config) if (model_config is not None and not resume) else None
@@ -985,7 +998,9 @@ def run(
       run_config=config,
       total_turn_limit=turn_limit,
       total_model_attempt_limit=attempt_limit,
-      emotion_enabled=False,
+      # Only character_depth registers EmotionalStance on the entities,
+      # so only that mode collects the acting character's emotion.
+      emotion_enabled=config['mode'] == MODE_CHARACTER_DEPTH,
   )
   step_marks: list[float] = []
 

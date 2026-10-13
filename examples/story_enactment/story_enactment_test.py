@@ -271,6 +271,30 @@ class MakeRunConfigTest(unittest.TestCase):
     with self.assertRaises(ValueError):
       run_lib.make_run_config(self.story, mode='unknown_mode')
 
+  def test_character_depth_wires_appendix_c_emotion_and_relationships(self):
+    config = run_lib.make_run_config(self.story, mode='character_depth')
+    names = [character.name for character in self.story.characters]
+    for name, params in zip(names, config['entity_params']):
+      self.assertEqual(
+          params['emotion_options'],
+          ['平静', '焦虑', '愤怒', '悲伤', '希望', '羞愧'],
+      )
+      self.assertEqual(params['relationships_refresh_interval'], 3)
+      # Each character perceives exactly the other public participants.
+      self.assertEqual(
+          params['other_player_names'], [n for n in names if n != name]
+      )
+
+  def test_other_modes_gain_no_character_depth(self):
+    # Mode switches stay independent: only character_depth wires the
+    # emotion and relationship components into the entity params.
+    for mode in ('beats_only', 'tension_observe', 'director'):
+      with self.subTest(mode=mode):
+        config = run_lib.make_run_config(self.story, mode=mode)
+        for params in config['entity_params']:
+          self.assertEqual(params.get('emotion_options', ()), ())
+          self.assertEqual(params.get('relationships_refresh_interval', 0), 0)
+
   def test_scene_premises_carry_public_background_only(self):
     config = run_lib.make_run_config(self.story)
     premise = config['scene_dicts'][0]['premise']
@@ -467,11 +491,37 @@ class EndToEndShortRunTest(_StateDirTestCase):
     self.assertEqual(result.committed_turn_id, 2)
     self.assertEqual(len(self.turn_log().load()), 2)
 
-  def test_stage3_mode_raises_not_implemented(self):
-    config = _fixture_config(total_turn_limit=2)
-    config['mode'] = 'character_depth'
-    with self.assertRaises(NotImplementedError):
-      run_lib.run(self.state_dir, run_config=config)
+  def test_character_depth_mode_records_and_renders_emotion(self):
+    config = run_lib.make_run_config(
+        story_config.make_example_config(),
+        total_turn_limit=2,
+        total_model_attempt_limit=100,
+        mode='character_depth',
+        model_config={'api_type': 'stub'},
+    )
+    config['scene_dicts'][0]['num_rounds'] = 8
+    # The emotion multiple choice falls back to the stub's first parsed
+    # option (the palette is shuffled by the interactive document), so the
+    # assertion is membership in the appendix-C palette, not one label.
+    result = run_lib.run(self.state_dir, run_config=config)
+    self.assertEqual(result.reason, 'step_limit')
+    self.assertEqual(result.committed_turn_id, 2)
+    records = self.turn_log().load()
+    self.assertEqual([r['turn_id'] for r in records], [1, 2])
+    palette = {'平静', '焦虑', '愤怒', '悲伤', '希望', '羞愧'}
+    for record in records:
+      self.assertIn(record['emotion'], palette)
+    # The screenplay export shows the acting character's emotion as a
+    # parenthetical cue, mirrored by the plain-text speaker line.
+    elements = renderer.parse_fountain(self.read_script('script.fountain'))
+    self.assertEqual(
+        [c for kind, c in elements if kind == 'parenthetical'],
+        [record['emotion'] for record in records],
+    )
+    plain = self.read_script('script.txt')
+    for record in records:
+      self.assertIn(f'{record["actor"]}（{record["emotion"]}）：', plain)
+    self.assertEqual(self.summary()['mode'], 'character_depth')
 
   def test_director_mode_runs_with_feedback_configuration(self):
     story = story_config.make_example_config()

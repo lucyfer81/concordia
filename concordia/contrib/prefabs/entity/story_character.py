@@ -20,7 +20,12 @@ do in a situation like this?") by delegating to
 `concordia.prefabs.entity.basic.Entity`. On top of that chain it adds a
 `CharacterBrief` constant summarizing the character's public data, and,
 when the character has one, a `PrivateSecret` constant that belongs only
-to this character. All components are created fresh inside `build`, so
+to this character. Character-depth params layer the stage-3 components
+on the same chain: a non-empty `emotion_options` adds an
+`EmotionalStance` commitment before action, and a positive
+`relationships_refresh_interval` adds a `RelationshipsToOthers` view of
+the other public participants, refreshed from the events this character
+actually observes. All components are created fresh inside `build`, so
 the prefab's params only ever hold JSON-safe values.
 """
 
@@ -31,6 +36,8 @@ from typing import Any
 from concordia.agents import entity_agent_with_logging
 from concordia.associative_memory import basic_associative_memory as associative_memory
 from concordia.components import agent as agent_components
+from concordia.contrib.components.agent import emotional_stance
+from concordia.contrib.components.agent import relationships
 from concordia.language_model import language_model
 from concordia.prefabs.entity import basic
 from concordia.typing import prefab as prefab_lib
@@ -43,6 +50,13 @@ _CHARACTER_BRIEF_KEY = 'CharacterBrief'
 _CHARACTER_BRIEF_INDEX = 1  # Right after the Instructions component.
 _PRIVATE_SECRET_KEY = 'PrivateSecret'
 _PRIVATE_SECRET_INDEX = 2  # Right after the character brief.
+
+# Context keys of the stage-3 character-depth components. The story
+# enactment example's collector reads the acting entity's log under the
+# same 'EmotionalStance' key, so the two definitions must stay in sync
+# (the example should import this constant rather than redefine it).
+EMOTIONAL_STANCE_COMPONENT_KEY = 'EmotionalStance'
+RELATIONSHIPS_COMPONENT_KEY = 'RelationshipsToOthers'
 
 # The basic prefab requires one index per extra component; user-provided
 # components without an index are appended at the end of the order.
@@ -112,10 +126,12 @@ class Entity(prefab_lib.Prefab):
           'prefix_entity_name': False,
           'extra_components': {},
           'extra_components_index': {},
-          # Reserved for a later stage (emotional stance and relationship
-          # refresh); stored but not used yet.
+          # Character-depth params: a non-empty palette adds an
+          # EmotionalStance component, a positive interval adds a
+          # RelationshipsToOthers view of the other public participants.
           'emotion_options': (),
           'relationships_refresh_interval': 0,
+          'other_player_names': (),
       }
   )
 
@@ -166,8 +182,37 @@ class Entity(prefab_lib.Prefab):
       )
       extra_components_index[_PRIVATE_SECRET_KEY] = _PRIVATE_SECRET_INDEX
 
+    entity_name = self.params.get('name', _DEFAULT_NAME)
+
+    # Character depth (plan stage 3): the emotion commitment reads the
+    # basic chain's PersonBySituation reasoning and the entity's own
+    # observations, so both default component keys fit the delegate.
+    emotion_options = self.params.get('emotion_options', ())
+    if emotion_options:
+      extra_components[EMOTIONAL_STANCE_COMPONENT_KEY] = (
+          emotional_stance.EmotionalStance(
+              model=model,
+              name=entity_name,
+              emotion_options=list(emotion_options),
+          )
+      )
+      extra_components_index[EMOTIONAL_STANCE_COMPONENT_KEY] = (
+          _APPEND_AT_END_INDEX
+      )
+
+    refresh_interval = self.params.get('relationships_refresh_interval', 0)
+    if refresh_interval > 0:
+      extra_components[RELATIONSHIPS_COMPONENT_KEY] = (
+          relationships.RelationshipsToOthers(
+              model=model,
+              other_player_names=self.params.get('other_player_names', ()),
+              refresh_interval=refresh_interval,
+          )
+      )
+      extra_components_index[RELATIONSHIPS_COMPONENT_KEY] = _APPEND_AT_END_INDEX
+
     basic_params: dict[str, Any] = {
-        'name': self.params.get('name', _DEFAULT_NAME),
+        'name': entity_name,
         'goal': self.params.get('goal', ''),
         'randomize_choices': self.params.get('randomize_choices', True),
         'prefix_entity_name': self.params.get('prefix_entity_name', False),
