@@ -15,10 +15,12 @@
 """Deterministic screenplay rendering of saved story turns.
 
 This module renders spec §7 story turn records (the JSONL records saved by
-``collector.py``) into a Fountain screenplay or a plain-text transcript.
-Both renderers are deterministic pure functions of their inputs: they make
-no language model calls, perform no file IO, and read only the turn
-dictionaries and the scene display dictionary.
+``collector.py``) into a Fountain screenplay, a plain-text transcript, or a
+per-turn tension curve plot. The two text renderers are deterministic pure
+functions of their inputs: they make no language model calls, perform no
+file IO, and read only the turn dictionaries and the scene display
+dictionary. ``render_tension_curve`` is likewise deterministic and free of
+model calls, but writes its plot image to a file.
 
 Element mapping (spec §10):
 
@@ -39,8 +41,8 @@ lines.
 
 Steps whose ``beat_id_after_event`` is None (the beat completed) render
 exactly like any other turn; no extra Fountain element is emitted for
-beat completion. The diagnostic fields ``budget_stopped`` and ``tension``
-are not rendered (tension visualization is a later task).
+beat completion. The diagnostic field ``budget_stopped`` is not rendered;
+``tension`` is visualized separately by ``render_tension_curve``.
 """
 
 from collections.abc import Mapping, Sequence
@@ -145,6 +147,77 @@ def render_plain_text(
     if turn['stage_directions']:
       elements.append(turn['stage_directions'])
   return '\n\n'.join(elements) + '\n'
+
+
+def _tension_segments(
+    turns: Sequence[Mapping[str, Any]],
+) -> list[list[tuple[int, float]]]:
+  """Splits turn tensions into contiguous scored segments.
+
+  Turns whose ``tension`` is None end the current segment instead of
+  contributing a zero point, so the plotted curve shows a break.
+
+  Args:
+    turns: story turn records in enactment order.
+
+  Returns:
+    Non-empty lists of ``(turn_id, tension)`` points, one per run of
+    consecutive scored turns; empty when no turn is scored.
+  """
+  segments: list[list[tuple[int, float]]] = []
+  current: list[tuple[int, float]] = []
+  for index, turn in enumerate(turns):
+    tension = turn.get('tension')
+    if tension is None:
+      if current:
+        segments.append(current)
+      current = []
+      continue
+    current.append((int(turn.get('turn_id', index + 1)), float(tension)))
+  if current:
+    segments.append(current)
+  return segments
+
+
+def render_tension_curve(
+    turns: Sequence[dict[str, Any]],
+    path: str,
+) -> None:
+  """Plots the per-turn tension curve and saves it as an image.
+
+  Each scored turn contributes one point at ``(turn_id, tension)`` and
+  consecutive scored turns are joined by a line. Turns without a score
+  (``tension`` is None, e.g. unscored steps or budget-stopped scoring)
+  create a break in the curve rather than being plotted as zero. Turns
+  whose ``turn_id`` is missing fall back to their position in the
+  sequence. Empty input or input without any score still produces a
+  valid empty plot.
+
+  Unlike the text renderers this function performs file IO: it writes
+  the plot to ``path``. It forces the non-interactive 'Agg' matplotlib
+  backend (imported lazily inside the function so the module stays
+  stdlib-only to import), performs no language model calls, and never
+  opens a GUI window.
+
+  Args:
+    turns: story turn records in enactment order (spec §7 fields).
+    path: destination file path for the plot image (format inferred
+      from the extension, e.g. ``.png``).
+  """
+  import matplotlib
+
+  matplotlib.use('Agg')
+  from matplotlib import pyplot as plt
+
+  fig, ax = plt.subplots()
+  for segment in _tension_segments(turns):
+    xs, ys = zip(*segment)
+    ax.plot(xs, ys, marker='o')
+  ax.set_xlabel('Turn')
+  ax.set_ylabel('Tension (1-10)')
+  ax.set_ylim(0, 11)
+  fig.savefig(path)
+  plt.close(fig)
 
 
 def parse_fountain(text: str) -> list[tuple[str, str]]:
