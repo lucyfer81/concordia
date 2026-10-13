@@ -12,20 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""A minimal semantic prompt stub for story enactment tests.
+"""A semantic prompt stub for story enactment tests and demos.
 
 Unlike `concordia.testing.mock_model.MockModel`, which always returns
 one fixed string and always the first choice, this stub routes by
 prompt semantics: the shared speech call to action returns a
 per-character dialogue line, the dual-track resolution request returns
 valid JSON that preserves the authored speech verbatim, and the basic
-entity's perception questions receive short fixed answers. Choice
-prompts are answered by matching option text rather than option
-letter, so the interactive document's letter shuffling cannot break
-determinism. Every prompt is recorded for later assertions.
-
-Task 10 extends this class into the full runner-facing stub; keep it
-minimal and semantically routed here.
+entity's perception questions receive short fixed answers. Text
+routing keys on the LAST `Question:`/`Exercise:` block of the prompt,
+so earlier question blocks embedded in a component's context (e.g. the
+perception questions quoted inside the action prompt) never hijack the
+route. Choice prompts are answered by matching option text rather than
+option letter, so the interactive document's letter shuffling cannot
+break determinism, and beat-completion answers are configured per beat
+id so no beat is completed by default. Every prompt is recorded for
+later assertions.
 """
 
 from collections.abc import Collection, Mapping, Sequence
@@ -46,7 +48,13 @@ _DUAL_TRACK_MARK = 'Output a JSON object with exactly two string fields'
 _CURRENT_SPEAKER = re.compile(r'## Current speaker\n(.+)')
 _ORIGINAL_SPEECH = re.compile(r'## Original speech \(verbatim\)\n(.*)')
 
-# One '(letter) option' pair per line of a choice prompt.
+# The last `Question:`/`Exercise:` block opener; task routing always
+# reads this final block only.
+_LAST_BLOCK_OPENER = re.compile(r'^(?:Question|Exercise): ', re.M)
+
+# Statement fingerprint of the drama director's beat-completion prompt,
+# and one '(letter) option' pair per line of the final block.
+_CURRENT_BEAT = re.compile(r'Current beat "([^"]+)"')
 _CHOICE_LINE = re.compile(r'^  \(([^)]+)\) (.+)$', re.M)
 
 # Fixed answers for the basic entity's perception questions, keyed by a
@@ -56,6 +64,23 @@ _PERCEPTION_ANSWERS = (
     ('What kind of person is', '一个被卷入遗产争执、各怀心事的人。'),
     ('What would a person like', '把心里的疑问说出来。'),
 )
+
+
+class TransientAPIError(Exception):
+  """A transient API failure injected by test stubs.
+
+  The stub provider's retry whitelist contains exactly this exception,
+  so tests can exercise retry exhaustion deterministically without
+  contacting a real service.
+  """
+
+
+def _last_question_block(prompt: str) -> str:
+  """Returns the prompt from its last Question/Exercise block on."""
+  matches = list(_LAST_BLOCK_OPENER.finditer(prompt))
+  if not matches:
+    return ''
+  return prompt[matches[-1].start() :]
 
 
 class PromptStubModel(language_model.LanguageModel):
@@ -74,6 +99,8 @@ class PromptStubModel(language_model.LanguageModel):
       default_line: str = '这宅子的事，急不得。',
       stage_directions: str = '窗外的雷声滚过，烛火摇曳。',
       choice_answer: str = 'No',
+      completion_answers: Mapping[str, str] | None = None,
+      fail_choice_calls_from: int | None = None,
   ) -> None:
     """Initializes the stub.
 
@@ -82,12 +109,23 @@ class PromptStubModel(language_model.LanguageModel):
         when the speech call to action addresses that character.
       default_line: line spoken for characters not in the mapping.
       stage_directions: fixed stage-directions track of resolutions.
-      choice_answer: option text chosen for every choice prompt.
+      choice_answer: option text chosen for choice prompts without a
+        configured beat-completion answer.
+      completion_answers: mapping from beat id to the yes/no option
+        text answered for that beat's completion question; beats left
+        out are answered with `choice_answer`, so no beat completes by
+        default.
+      fail_choice_calls_from: 0-based index from which every
+        `sample_choice` call raises `TransientAPIError`, letting tests
+        exercise API retry exhaustion.
     """
     self._dialogue_lines = dict(dialogue_lines or {})
     self._default_line = default_line
     self._stage_directions = stage_directions
     self._choice_answer = choice_answer
+    self._completion_answers = dict(completion_answers or {})
+    self._fail_choice_calls_from = fail_choice_calls_from
+    self._choice_calls = 0
     self.text_prompts: list[str] = []
     self.choice_prompts: list[str] = []
 
@@ -126,21 +164,49 @@ class PromptStubModel(language_model.LanguageModel):
   ) -> tuple[int, str, dict[str, float]]:
     del seed
     self.choice_prompts.append(prompt)
-    for letter, option in _CHOICE_LINE.findall(prompt):
-      if option.strip() == self._choice_answer:
+    call_index = self._choice_calls
+    self._choice_calls += 1
+    if (
+        self._fail_choice_calls_from is not None
+        and call_index >= self._fail_choice_calls_from
+    ):
+      raise TransientAPIError(
+          f'injected transient failure on choice call {call_index}'
+      )
+    wanted = self._wanted_option(prompt)
+    block = _last_question_block(prompt)
+    pairs = _CHOICE_LINE.findall(block)
+    for letter, option in pairs:
+      if option.strip() == wanted:
         return responses.index(letter), letter, {}
+    if pairs:
+      # The wanted text is absent; fall back to the first parsed
+      # option, still mapped through its letter rather than a fixed
+      # index.
+      letter = pairs[0][0]
+      return responses.index(letter), letter, {}
     return 0, responses[0], {}
+
+  def _wanted_option(self, prompt: str) -> str:
+    """Returns the option text semantically wanted for this choice."""
+    beat = _CURRENT_BEAT.search(prompt)
+    if beat:
+      return self._completion_answers.get(beat.group(1), self._choice_answer)
+    return self._choice_answer
 
   def _route_text(self, prompt: str) -> str:
     """Routes one text prompt to its canned output."""
-    if _DUAL_TRACK_MARK in prompt:
-      return self._dual_track_output(prompt)
-    if _SPEECH_CALL_MARK in prompt:
-      match = _SPEAKER_IN_CALL.search(prompt)
+    block = _last_question_block(prompt)
+    if not block:
+      return self._default_line
+    if _DUAL_TRACK_MARK in block:
+      return self._dual_track_output(block)
+    if _SPEECH_CALL_MARK in block:
+      match = _SPEAKER_IN_CALL.search(block)
       name = match.group(1) if match else ''
       return self._dialogue_lines.get(name, self._default_line)
     for fingerprint, answer in _PERCEPTION_ANSWERS:
-      if fingerprint in prompt:
+      if fingerprint in block:
         return answer
     return self._default_line
 
