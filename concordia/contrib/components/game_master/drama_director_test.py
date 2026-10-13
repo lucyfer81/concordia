@@ -213,6 +213,20 @@ class LifecycleTest(unittest.TestCase):
     self.assertEqual(turn['turn_id'], 1)
     self.assertTrue(turn['budget_stopped'])
 
+  def test_last_story_turn_is_returned_as_a_copy(self):
+    director, gm = _make_director(_BeatModel(False))
+    _complete_turn(gm, 'hi')
+    turn = director.get_last_story_turn()
+    turn['speech'] = 'tampered'
+    self.assertEqual(
+        director.get_last_story_turn()['speech'], 'hi')
+    self.assertEqual(
+        director.get_state()['last_story_turn']['speech'], 'hi')
+    state = director.get_state()
+    state['last_story_turn']['speech'] = 'tampered'
+    self.assertEqual(
+        director.get_state()['last_story_turn']['speech'], 'hi')
+
 
 if __name__ == '__main__':
   unittest.main()

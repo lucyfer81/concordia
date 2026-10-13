@@ -383,8 +383,10 @@ class DramaDirector(
     }
 
   def get_last_story_turn(self) -> dict[str, Any] | None:
-    """Returns the most recently committed story turn, if any."""
-    return self._last_story_turn
+    """Returns a copy of the most recently committed story turn, if any."""
+    if self._last_story_turn is None:
+      return None
+    return dict(self._last_story_turn)
 
   def get_current_original_speech(self) -> str | None:
     """Returns the original speech of the turn in progress, if any."""
@@ -415,7 +417,11 @@ class DramaDirector(
         'recent_events': list(self._recent_events),
         'beat_timeout': self._beat_timeout,
         'budget_stopped': self._budget_stopped,
-        'last_story_turn': self._last_story_turn,
+        'last_story_turn': (
+            dict(self._last_story_turn)
+            if self._last_story_turn is not None
+            else None
+        ),
     }
 
   @override
@@ -435,7 +441,10 @@ class DramaDirector(
     )
     self._beat_timeout = state['beat_timeout']  # pyrefly: ignore[bad-assignment]
     self._budget_stopped = state['budget_stopped']  # pyrefly: ignore[bad-assignment]
-    self._last_story_turn = state['last_story_turn']  # pyrefly: ignore[bad-assignment]
+    last_story_turn = cast('dict[str, Any] | None', state['last_story_turn'])
+    self._last_story_turn = (
+        dict(last_story_turn) if last_story_turn is not None else None
+    )
 
   def _current_beat(self) -> Beat | None:
     """Returns the beat currently in progress, or None if all are done."""
