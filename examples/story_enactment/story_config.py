@@ -217,67 +217,135 @@ def validate(config: StoryConfig) -> list[str]:
 
 
 def make_example_config() -> StoryConfig:
-  """Returns a minimal four-character skeleton configuration.
+  """Returns the appendix-C scenario one: a dispute over an old estate.
 
-  The content is placeholder material; a later task replaces it with a
-  complete story.
+  On the seventh night after the old master's death, his lawyer reads
+  the sealed will aloud in the rain-soaked old house: the estate goes
+  to the son, 陈默. The game master alone knows the will was swapped;
+  林雪 secretly witnessed 陈母 burning a letter that night; and each
+  member of the five-character cast carries a private goal into the
+  quarrel. 周律师 is the player character.
 
   Returns:
-    A valid example configuration.
+    A valid five-character example configuration.
   """
   return StoryConfig(
-      title='排练室',
-      location='一间闭门排练的排练室',
+      title='老宅遗嘱',
+      location='江南小镇上一栋百年木结构老宅的堂屋',
       interior=True,
-      time_label='傍晚',
-      world_facts=('四个戏剧同好约定今晚完成一次剧本围读。',),
-      gm_only_facts=('（占位）导演掌握的隐藏信息，待后续任务补充。',),
-      allowed_environment_events=('门外传来敲门声', '有人打来电话'),
-      immutable_facts=('故事只发生在排练室内。',),
+      time_label='雷雨深夜',
+      world_facts=(
+          '陈老先生（陈望山）一周前病逝，今晚是头七，众人聚在老宅守灵。',
+          '窗外雷雨大作，老宅电路老化，堂灯时明时暗。',
+          '周律师今晚受托当众启封并宣读遗嘱。',
+      ),
+      gm_only_facts=(
+          '真相：遗嘱已被调包——头七前夜，有人从保险柜里换走了老人临终新立的遗嘱。',
+          '真相：被焚毁的新遗嘱其实把老宅留给了照顾老人两年的林雪。',
+          '真相：周律师如今保管的是被换上的旧遗嘱，封印从未被核验。',
+      ),
+      allowed_environment_events=(
+          '雷雨骤紧，老宅骤然断电，堂内只剩烛光',
+          '周律师的手机响起，来电显示是遗产登记处',
+          '邮差冒雨敲门，送来一封老人生前寄出的旧信',
+          '供桌旁的青瓷花瓶被袖口带倒，应声碎裂',
+          '隔壁邻居被争执声惊动，前来敲门探问',
+          '堂屋的旧收音机自己响了起来，播报暴雨红色预警',
+          '一阵穿堂风扫过，吹灭了供桌上的两支白烛',
+      ),
+      immutable_facts=(
+          '陈望山已于一周前病逝，无法再立遗嘱或亲口作证。',
+          '老宅是一栋百年木结构建筑，今晚众人都在它的堂屋里。',
+          '陈母是陈望山的遗孀，也是陈默的母亲。',
+          '陈默是陈望山的独子。',
+          '林雪是陈望山生前聘请的住家看护，王婶是相交三十年的老邻居。',
+      ),
       characters=(
           CharacterInfo(
-              name='王兰',
-              identity='编剧（占位）',
-              goal='让围读顺利进行（占位）',
-              hard_constraint='绝不透露剧本结局（占位）',
-              secret='',
-              public_facts=('王兰是本次围读的发起人。',),
-              style='言简意赅（占位）',
-              initial_relationship_notes='',
+              name='林雪',
+              identity='陈老先生生前聘请的住家看护，陪老人走完最后两年',
+              goal='查明遗嘱的真相，为自己两年的付出讨一个公道',
+              hard_constraint='绝不伪造证据，也绝不作伪证',
+              secret='头七前夜她起夜时，亲眼看见陈母蹲在后院烧纸，纸灰里还残着半枚火漆印。',
+              public_facts=(
+                  '受老人生前嘱托，掌着保险柜的两把钥匙之一。',
+                  '老人最后半年只肯让她一人喂药。',
+              ),
+              style='语速慢而克制，惯用细节和反问，被逼急了才提高声音',
+              initial_relationship_notes='感激老人生前待她如亲；对陈默的敌意保持警惕；暗中怀疑陈母动了什么手脚。',
           ),
           CharacterInfo(
-              name='李强',
-              identity='导演（占位）',
-              goal='说服大家采纳自己的处理方式（占位）',
-              hard_constraint='不动怒（占位）',
-              secret='',
-              public_facts=('李强与王兰对结局有分歧。',),
-              style='语气强硬（占位）',
-              initial_relationship_notes='',
+              name='陈默',
+              identity='陈老先生独子，常年在外经商，近年鲜少回家',
+              goal='尽快确认遗嘱效力并把老宅过户出售，拿钱填补亏空',
+              hard_constraint='绝不当众承认自己的债务问题',
+              secret='他欠下巨额赌债，三个月内必须还清，否则后果不堪设想。',
+              public_facts=(
+                  '遗嘱指定的老宅继承人。',
+                  '老人生前最后两年几乎未曾回家探望。',
+              ),
+              style='嗓门大，爱打断别人，动辄把"我们陈家"挂在嘴边',
+              initial_relationship_notes=(
+                  '视林雪为觊觎家产的外人；对母亲言听计从却心存愧疚；对律师表面客气、暗自提防。'
+              ),
           ),
           CharacterInfo(
-              name='张伟',
-              identity='演员（占位）',
-              goal='争取主演位置（占位）',
-              hard_constraint='不撒谎（占位）',
-              secret='',
-              public_facts=('张伟是最后到场的人。',),
-              style='热情外露（占位）',
-              initial_relationship_notes='',
+              name='周律师',
+              identity='陈老先生的老友兼私人律师，遗嘱的保管与执行人（玩家角色）',
+              goal='按程序公正地完成遗嘱执行，同时保住自己三十年的职业声誉',
+              hard_constraint='绝不泄露客户生前的保密事项',
+              secret='他私藏着老人口述新遗嘱时的一段录音残片，但音质模糊，真伪难辨。',
+              public_facts=(
+                  '遗嘱由他密封保管至今。',
+                  '与陈家相交三十年，是看着陈默长大的人。',
+              ),
+              style='措辞严谨，爱引程序和条款，表态前必先说"于程序而言"',
+              initial_relationship_notes='敬重陈母；对陈默的急躁不以为然；无法完全排除林雪所言的可能性。',
           ),
           CharacterInfo(
-              name='赵敏',
-              identity='舞台监督（占位）',
-              goal='按计划完成围读（占位）',
-              hard_constraint='不站队（占位）',
+              name='王婶',
+              identity='老宅隔壁三十年的老邻居，也是陈家的钟点帮佣',
+              goal='弄清楚老先生到底留了什么话，顺便护住老宅不被拆卖',
+              hard_constraint='绝不撒谎害人',
               secret='',
-              public_facts=('赵敏负责记录围读进程。',),
-              style='冷静克制（占位）',
-              initial_relationship_notes='',
+              public_facts=(
+                  '老人生前常与她念叨心事。',
+                  '知道老宅每个房间的钥匙挂在哪。',
+              ),
+              style='大嗓门，满口俗语和老辈规矩，说到激动处拍大腿',
+              initial_relationship_notes=(
+                  '心疼林雪两年的辛苦；看着陈默长大却不满他多年不归；与陈母是无话不谈的老姐妹。'
+              ),
+          ),
+          CharacterInfo(
+              name='陈母',
+              identity='陈老先生遗孀，陈默之母，老宅如今的女主人',
+              goal='保住儿子的继承权和陈家的体面，让这场风波尽快平息',
+              hard_constraint='绝不承认自己碰过遗嘱',
+              secret=(
+                  '头七前夜，她从保险柜取出老人新立的那份遗嘱烧掉了，又把最早的旧遗嘱放了回去。'
+              ),
+              public_facts=(
+                  '老人临终前半年由她主持家务。',
+                  '坚持要办一场体面的头七。',
+              ),
+              style='声音低柔，绵里藏针，惯用眼泪和旧年恩情施压',
+              initial_relationship_notes=(
+                  '认定林雪图谋陈家财产；对儿子又气又护；与王婶相交三十年，最近却有心事瞒她。'
+              ),
           ),
       ),
-      conflict_start='围读开始前，剧本最后一页不翼而飞。',
-      allowed_endings=('最后一页被找回。', '大家决定重写结局。'),
+      conflict_start=(
+          '周律师当众启封遗嘱并宣读：老宅由独子陈默继承。'
+          '林雪当场脸色煞白，追问遗嘱是何时立的、封印由谁核验；'
+          '陈默拍案而起，斥她"一个外人也配过问"，争执就此爆发。'
+      ),
+      allowed_endings=(
+          '真相大白：调包之事败露，众人同意重新鉴定遗嘱，承认林雪的权益。',
+          '秘密永埋：林雪带着疑问离开，陈默卖宅还债，老宅易主。',
+          '坦白和解：陈母主动说出真相，一家人在老宅的存废间达成新的安排。',
+          '僵局散场：争执无解，众人不欢而散，遗嘱交由法庭裁决。',
+      ),
   )
 
 
