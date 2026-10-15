@@ -102,13 +102,26 @@ class BaseGPTModel(language_model.LanguageModel):
         verbosity=verbosity,
     )
 
-    if self._measurements is not None:
-      self._measurements.publish_datum(
-          self._channel,
-          {'raw_text_length': len(response.choices[0].message.content)},
+    # Reasoning models can spend the whole completion budget on an invisible
+    # reasoning trace, so OpenAI-compatible providers may deliver a response
+    # whose `content` is None or whitespace-only. Enforce the visible-text
+    # contract instead of returning None (same policy as
+    # together_ai_model._visible_text): re-asking the identical request is
+    # unlikely to help and would only spend more paid attempts.
+    content = response.choices[0].message.content
+    if not isinstance(content, str) or not content.strip():
+      raise language_model.InvalidResponseError(
+          'OpenAI-compatible endpoint returned no visible text:'
+          ' message.content must be a nonempty string. Request not retried;'
+          ' check model reasoning support and response budget.'
       )
 
-    return response.choices[0].message.content
+    if self._measurements is not None:
+      self._measurements.publish_datum(
+          self._channel, {'raw_text_length': len(content)}
+      )
+
+    return content
 
   @override
   def sample_text(
@@ -126,7 +139,10 @@ class BaseGPTModel(language_model.LanguageModel):
     del top_k  # Unused
     return self._sample_text(
         prompt=prompt,
-        reasoning_effort='minimal',
+        # 'low' is the lowest reasoning effort that is widely supported
+        # across OpenAI-compatible endpoints ('minimal' is rejected by
+        # several of them, e.g. proxies listing low/medium/high/...).
+        reasoning_effort='low',
         verbosity=self._verbosity,
         max_tokens=max_tokens,
         terminators=terminators,

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """Tests for BudgetGuardLanguageModel."""
+
 import unittest
 from unittest import mock
 
@@ -33,14 +34,16 @@ class BudgetGuardTest(unittest.TestCase):
   def test_under_limit_passes_and_counts(self):
     inner = _inner()
     guard = budget_wrapper.BudgetGuardLanguageModel(
-        inner, total_attempt_limit=2)
+        inner, total_attempt_limit=2
+    )
     self.assertEqual(guard.sample_text('p'), 'ok')
     self.assertEqual(guard.used_attempts, 1)
 
   def test_over_limit_raises_before_calling_model(self):
     inner = _inner()
     guard = budget_wrapper.BudgetGuardLanguageModel(
-        inner, total_attempt_limit=1)
+        inner, total_attempt_limit=1
+    )
     guard.sample_text('p')
     with self.assertRaises(budget_wrapper.BudgetExhaustedError):
       guard.sample_text('p2')
@@ -50,7 +53,8 @@ class BudgetGuardTest(unittest.TestCase):
   def test_choice_and_text_share_budget(self):
     inner = _inner()
     guard = budget_wrapper.BudgetGuardLanguageModel(
-        inner, total_attempt_limit=2)
+        inner, total_attempt_limit=2
+    )
     self.assertEqual(guard.sample_choice('p', ['a'])[1], 'a')
     guard.sample_text('p')
     with self.assertRaises(budget_wrapper.BudgetExhaustedError):
@@ -62,7 +66,8 @@ class BudgetGuardTest(unittest.TestCase):
     inner = _inner()
     inner.sample_text.side_effect = RuntimeError('api down')
     guard = budget_wrapper.BudgetGuardLanguageModel(
-        inner, total_attempt_limit=1)
+        inner, total_attempt_limit=1
+    )
     with self.assertRaises(RuntimeError):
       guard.sample_text('p')
     with self.assertRaises(budget_wrapper.BudgetExhaustedError):
@@ -71,17 +76,21 @@ class BudgetGuardTest(unittest.TestCase):
   def test_thread_safe_no_oversubscribe(self):
     from concurrent import futures
     import threading
+
     calls = []
     lock = threading.Lock()
 
     class Counting(mock_model.MockModel):
+
       def sample_text(self, prompt, **kwargs):
         with lock:
           calls.append(1)
         return 'ok'
 
     guard = budget_wrapper.BudgetGuardLanguageModel(
-        Counting(), total_attempt_limit=5)
+        Counting(), total_attempt_limit=5
+    )
+
     def attempt(_):
       try:
         guard.sample_text('p')
@@ -98,7 +107,8 @@ class BudgetGuardTest(unittest.TestCase):
 
   def test_restore(self):
     guard = budget_wrapper.BudgetGuardLanguageModel(
-        _inner(), total_attempt_limit=10, used_attempts=9)
+        _inner(), total_attempt_limit=10, used_attempts=9
+    )
     guard.sample_text('p')  # 10th
     with self.assertRaises(budget_wrapper.BudgetExhaustedError):
       guard.sample_text('p')

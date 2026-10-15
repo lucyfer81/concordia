@@ -118,6 +118,7 @@ class _DirectorFlowModel(mock_model.MockModel):
       fused_event: str = _FUSED_EVENT,
       complication_error: Exception | None = None,
       invalid_dual_track_from: int | None = None,
+      semantic_review_response: str = '{"valid": true, "reason": ""}',
   ):
     super().__init__('unused')
     self._completed = completed
@@ -127,6 +128,7 @@ class _DirectorFlowModel(mock_model.MockModel):
     self._fused_event = fused_event
     self._complication_error = complication_error
     self._invalid_dual_track_from = invalid_dual_track_from
+    self.semantic_review_response = semantic_review_response
     self._dual_track_calls = 0
     self.text_prompts: list[str] = []
     self.choice_calls = 0
@@ -135,6 +137,8 @@ class _DirectorFlowModel(mock_model.MockModel):
     del kwargs
     self.text_prompts.append(prompt)
     block = _last_question_block(prompt)
+    if '# Story resolution semantic review' in prompt:
+      return self.semantic_review_response
     if _COMPLICATION_MARK in block:
       if self._complication_error is not None:
         raise self._complication_error
@@ -272,6 +276,11 @@ class NoPendingDirectiveTest(unittest.TestCase):
     _complete_turn(gm, 'I hid the letter.')
     self.assertEqual(director.get_last_story_turn()['tension'], 7)
     self.assertIsNone(director.get_state()['directive'])
+    self.assertIsNone(
+        director.get_last_story_turn()['director_diagnostics'][
+            'directive_after_turn'
+        ]
+    )
     text_calls = len(model.text_prompts)
     choice_calls = model.choice_calls
     self.assertEqual(_step_call(model, director), 'Alice: I hid the letter.')
@@ -281,6 +290,24 @@ class NoPendingDirectiveTest(unittest.TestCase):
 
 class FusionStepTest(unittest.TestCase):
   """With a pending directive the step runs the two-stage fusion (P4)."""
+
+  def test_history_and_private_boundaries_are_separately_labeled(self):
+    model = _DirectorFlowModel()
+    director, gm = _make_director(
+        model,
+        character_constraints={'Alice': 'Never confess touching the will.'},
+        world_constraints=('Bob secretly holds a recording.',),
+    )
+    _complete_turn(gm, 'A courier arrives at the door.')
+    before = len(model.text_prompts)
+    _step_call(model, director, 'Alice: A storm is coming.')
+    for prompt in model.text_prompts[before:]:
+      self.assertIn('GM-only boundaries (never disclose these)', prompt)
+      self.assertIn('Alice: Never confess touching the will.', prompt)
+      self.assertIn('Bob secretly holds a recording.', prompt)
+      self.assertIn(
+          '## Committed public history\nAlice: A courier arrives', prompt
+      )
 
   def test_fuses_first_candidate_with_constrained_prompts(self):
     model = _DirectorFlowModel()
@@ -298,6 +325,19 @@ class FusionStepTest(unittest.TestCase):
     self.assertIn('the will is sealed', complication_prompt)
     self.assertIn('never assume any player character', complication_prompt)
     self.assertIn('Alice, Bob', complication_prompt)
+    for prompt in (complication_prompt, merge_prompt):
+      self.assertIn(
+          '## Committed public history\nAlice: I hid the letter.', prompt
+      )
+      self.assertIn(
+          'Never make players agree, confess, disclose secrets', prompt
+      )
+      self.assertIn(
+          'Never change their goals or positions to lower tension', prompt
+      )
+      self.assertIn(
+          'do not repeat an environmental event already established', prompt
+      )
     # The merge question keeps the same constraints, weaves in the
     # candidate event and uses the FIRST complication only (no
     # unsaved random choice): the chosen-complication section holds
@@ -372,11 +412,22 @@ class ConsumptionTest(unittest.TestCase):
     state = director.get_state()
     self.assertEqual(state['directive']['status'], 'consumed')
     self.assertEqual(state['last_directive_executed_turn'], 2)
+    self.assertEqual(state['directive']['executed_at_turn'], 2)
+    diagnostics = director.get_last_story_turn()['director_diagnostics']
+    self.assertEqual(diagnostics['directive_at_start']['status'], 'pending')
+    self.assertEqual(
+        diagnostics['directive_after_resolution']['status'], 'consumed'
+    )
+    self.assertEqual(diagnostics['directive_after_turn']['executed_at_turn'], 2)
+    self.assertTrue(diagnostics['cooldown_active'])
+    self.assertNotIn(
+        'director_diagnostics', director.get_committed_events()[-1]
+    )
     # A repeated RESOLVE makes no directive calls and consumes nothing.
     before = len(model.text_prompts)
     gm.act(_RESOLVE_SPEC)
     new_prompts = model.text_prompts[before:]
-    self.assertEqual(len(new_prompts), 1)  # only the final-output question
+    self.assertEqual(len(new_prompts), 2)  # final output and semantic review
     self.assertNotIn(_COMPLICATION_MARK, new_prompts[0])
     state = director.get_state()
     self.assertEqual(state['directive']['status'], 'consumed')
@@ -405,10 +456,31 @@ class ConsumptionTest(unittest.TestCase):
     fresh_model = _DirectorFlowModel()
     fresh, _ = _make_director(fresh_model)
     fresh.set_state(state)
+    self.assertEqual(fresh.get_state(), state)
     self.assertIsNone(fresh.get_pending_directive())
     text_calls = len(fresh_model.text_prompts)
     self.assertEqual(_step_call(fresh_model, fresh), 'Alice: I hid the letter.')
     self.assertEqual(len(fresh_model.text_prompts), text_calls)
+
+  def test_semantic_rejection_does_not_consume_or_commit(self):
+    for response in (
+        '{"valid": false, "reason": "forced confession"}',
+        'invalid',
+    ):
+      with self.subTest(response=response):
+        model = _DirectorFlowModel()
+        director, gm = _make_director(model)
+        _complete_turn(gm, 'I hid the letter.')
+        committed = director.get_last_story_turn()
+        model.semantic_review_response = response
+        gm.observe('[putative_event] Alice: What was that noise?')
+        with self.assertRaises(story_resolution.StoryOutputError):
+          gm.act(_RESOLVE_SPEC)
+        self.assertEqual(director.get_last_story_turn(), committed)
+        self.assertEqual(
+            director.get_state()['directive']['status'], 'integrating'
+        )
+        self.assertIsNone(director.get_state()['last_directive_executed_turn'])
 
 
 class CooldownTest(unittest.TestCase):
@@ -431,6 +503,9 @@ class CooldownTest(unittest.TestCase):
       self.assertEqual(state['last_directive_executed_turn'], 2)
       self.assertEqual(state['directive']['status'], 'consumed')
       self.assertEqual(state['directive']['generated_at_turn'], 1)
+      diagnostics = director.get_last_story_turn()['director_diagnostics']
+      self.assertTrue(diagnostics['cooldown_active'])
+      self.assertEqual(diagnostics['last_executed_turn'], 2)
     # The turns inside the cooldown window still deviate (scores of 7)
     # and the story keeps running, so only the cooldown blocks.
     self.assertTrue(
@@ -442,6 +517,11 @@ class CooldownTest(unittest.TestCase):
     self.assertEqual(state['directive']['status'], 'pending')
     self.assertEqual(state['directive']['generated_at_turn'], 5)
     self.assertEqual(state['last_directive_executed_turn'], 2)
+    self.assertFalse(
+        director.get_last_story_turn()['director_diagnostics'][
+            'cooldown_active'
+        ]
+    )
 
 
 if __name__ == '__main__':

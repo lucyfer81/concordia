@@ -29,6 +29,12 @@ preserving player agency. They are wired together by the prefabs in
   pending-commit state machine guarantees exactly one commit per story turn
   even when `update` calls interleave. Exposes `get_state`/`set_state` for
   checkpointing and `set_validated_resolution` for the resolution chain.
+  `get_committed_events()` exposes a read-only public event window for the
+  resolution review. Per-turn `director_diagnostics` records directive
+  generation, execution, invalidation and cooldown in checkpoints and exports
+  without adding them to player observations. Tension anchors distinguish
+  repeated arguments from consequential new risk; completion must be supported
+  by established public events, rather than proposals or assumed consent.
 - `director_note.py` — a thought step of the event-resolution chain that
   fuses a pending directive into the candidate event in two model questions:
   first propose plausible in-story complications (NPC or environmental means
@@ -38,8 +44,14 @@ preserving player agency. They are wired together by the prefabs in
 - `story_resolution.py` — the final dual-track output step: the model returns
   a JSON object with `resolved_event` (preserving the active player's speech
   verbatim) and `stage_directions` (environment changes, NPC behavior,
-  outcomes). The validated pair is stored in the `DramaDirector`; only the
-  resolved event is returned to the caller.
+  outcomes). A separate structured semantic review checks both tracks against
+  player agency, every character's constraint, private and public knowledge,
+  immutable facts and the environment whitelist. Rejected or malformed reviews
+  raise `StoryOutputError` before broadcast or directive consumption; API and
+  budget errors propagate. The review adds one wrapped model call and is a
+  fallible judgment, not a proof of narrative validity. After approval, the
+  canonical event is assembled from original speech and the exact narrator
+  track used by screenplay export, then stored in `DramaDirector`.
 - `story_terminator.py` — `SceneOrStoryTerminator` centralizes termination:
   scene schedule exhausted, all beats completed, a beat timed out, or the
   model-attempt budget spent. The module-level `resolve_final_reason`
@@ -47,6 +59,17 @@ preserving player agency. They are wired together by the prefabs in
   priority (`error > beats_completed > beat_timeout > scene_limit >
   step_limit > budget_limit`), using the committed story-turn count that
   survives resumes rather than engine step numbers.
+- `observation_queue.py` — a boundary-preserving encoding for the game
+  master's observation queue. The core `MakeObservation` joins queued items
+  with a triple-newline separator, which makes an event that itself contains
+  a triple newline indistinguishable from two items. `BoundaryEncodingMakeObservation`
+  (a `MakeObservation` subclass used by the story prefabs) encodes every
+  queued item so it contains no triple newline — runs of three or more
+  newlines become a paragraph-separator escape plus their length and a
+  colon terminator (so digits opening the next paragraph can never merge
+  into the length), literal escapes are doubled — and `decode_observation`
+  restores the exact items and content on the agent side. Ordinary items
+  pass through unchanged.
 
 Dependencies: `director_note` and `story_resolution` read the pending
 directive and store the validated pair through `DramaDirector`'s public
@@ -62,7 +85,9 @@ them imports from `examples/`.
   and refreshed with a single model call once `refresh_interval` new
   adjudicated events have been observed, mirroring the bounded updating of
   social attitudes. Recognizes adjudicated events by the reserved `Event: `
-  prefix, so premises and ordinary observations never inflate the cursor.
+  prefix after decoding the observation with
+  `game_master/observation_queue.py`, so multi-paragraph events are stored
+  whole and premises and ordinary observations never inflate the cursor.
 
 ## Catalog
 

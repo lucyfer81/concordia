@@ -25,7 +25,7 @@ pending directives into resolutions through whitelisted NPC and
 environmental means only, and a `SceneOrStoryTerminator` stops the run
 when either the scene schedule or the story itself ends. Every
 resolution is conditioned on the current beat, the world constraints,
-and the immutable facts, so the narration never violates them.
+and all character constraints, with a separate model review before publication.
 """
 
 from collections.abc import Mapping, Sequence
@@ -39,6 +39,7 @@ from concordia.components import game_master as gm_components
 from concordia.components.game_master import event_resolution as thought_chains_lib
 from concordia.contrib.components.game_master import director_note
 from concordia.contrib.components.game_master import drama_director
+from concordia.contrib.components.game_master import observation_queue
 from concordia.contrib.components.game_master import story_resolution
 from concordia.contrib.components.game_master import story_terminator
 from concordia.contrib.prefabs.game_master import story_scene
@@ -89,6 +90,11 @@ class GameMaster(prefab_lib.Prefab):
           'allowed_environment_events': (),
           # World constraints shown to the game master in every resolution.
           'world_constraints': (),
+          # All player names and their hard constraints (GM-only).
+          'player_names': (),
+          'character_constraints': {},
+          # Initial public background is evidence, unlike GM-only secrets.
+          'public_facts': (),
           # Facts no resolved event may contradict.
           'immutable_facts': (),
           'extra_components': {},
@@ -127,7 +133,10 @@ class GameMaster(prefab_lib.Prefab):
             ' extra_components.'
         )
 
-    player_names = [entity.name for entity in self.entities]
+    player_names = list(
+        self.params.get('player_names')
+        or [entity.name for entity in self.entities]
+    )
 
     scenes = [
         story_scene.scene_from_dict(encoded)
@@ -170,8 +179,10 @@ class GameMaster(prefab_lib.Prefab):
     )
     # Only explicitly queued information reaches the players: no shared
     # external queue and no LLM fallback, so observations are limited to
-    # scene premises and resolved events sent to the participants.
-    make_observation = gm_components.make_observation.MakeObservation(
+    # scene premises and resolved events sent to the participants. The
+    # boundary-encoding subclass keeps multi-paragraph events from being
+    # confused with the queue's triple-newline item separator.
+    make_observation = observation_queue.BoundaryEncodingMakeObservation(
         model=model,
         player_names=player_names,
         components=[
@@ -236,6 +247,8 @@ class GameMaster(prefab_lib.Prefab):
         ),
         immutable_facts=self.params.get('immutable_facts', ()),
         player_names=player_names,
+        character_constraints=self.params.get('character_constraints', {}),
+        world_constraints=self.params.get('world_constraints', ()),
     )
 
     world_constraints = actor_components.constant.Constant(
@@ -255,6 +268,13 @@ class GameMaster(prefab_lib.Prefab):
     final_output_step = story_resolution.make_final_output_step(
         director,
         immutable_facts=self.params.get('immutable_facts', ()),
+        character_constraints=self.params.get('character_constraints', {}),
+        player_names=player_names,
+        world_constraints=self.params.get('world_constraints', ()),
+        allowed_environment_events=self.params.get(
+            'allowed_environment_events', ()
+        ),
+        public_facts=self.params.get('public_facts', ()),
     )
 
     event_resolution_key = (

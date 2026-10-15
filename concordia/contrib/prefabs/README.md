@@ -24,7 +24,11 @@ demonstrated by
   scoring configuration), a `director_note` fusion step, dual-track
   `story_resolution`, and a `SceneOrStoryTerminator`. Resolutions are
   conditioned on the beat, the world constraints (game-master-only facts and
-  secrets), and the immutable facts.
+  secrets), and the immutable facts. GM-only `character_constraints` maps all
+  player names to their hard constraints; `public_facts` distinguishes initial
+  public background from hidden truth. The final output and its independent
+  semantic review receive these constraints and the environment whitelist in
+  every mode. Players receive only their own private brief and public events.
 - `entity/story_character.py` — a story character prefab built on the basic
   three-question actor: it delegates to the core `basic.Entity` prefab via
   `extra_components`, layering a `CharacterBrief` constant of the character's

@@ -19,7 +19,10 @@ component driven by a real game-master entity, so the observation text
 under test is exactly the queue output players receive in a story run:
 blocks joined by the triple-newline separator. The event prefix is the
 real `EventResolution` pre-act label, the same string the resolution
-chain queues for the players.
+chain queues for the players. The game master uses the story prefabs'
+boundary-encoding `MakeObservation` subclass, so events that themselves
+contain the triple-newline separator survive the join with their
+content and boundaries intact.
 """
 
 import unittest
@@ -28,6 +31,7 @@ from concordia.agents import entity_agent_with_logging
 from concordia.components.game_master import event_resolution as event_resolution_lib
 from concordia.components.game_master import make_observation as make_observation_lib
 from concordia.contrib.components.agent import relationships
+from concordia.contrib.components.game_master import observation_queue
 from concordia.testing import mock_model
 from concordia.typing import entity as entity_lib
 from concordia.typing import entity_component
@@ -99,11 +103,13 @@ def _observation_spec(player_name: str) -> entity_lib.ActionSpec:
 
 def _make_observation_gm(player_names):
   """Builds a real game master that delivers queued observations."""
-  make_observation_component = make_observation_lib.MakeObservation(
-      model=mock_model.MockModel('unused'),
-      player_names=player_names,
-      components=(),
-      allow_llm_fallback=False,
+  make_observation_component = (
+      observation_queue.BoundaryEncodingMakeObservation(
+          model=mock_model.MockModel('unused'),
+          player_names=player_names,
+          components=(),
+          allow_llm_fallback=False,
+      )
   )
   gm = entity_agent_with_logging.EntityAgentWithLogging(
       agent_name='story rules',
@@ -242,6 +248,128 @@ class EventBlockCountingTest(unittest.TestCase):
     state = component.get_state()
     self.assertEqual(state['observed_count'], 1)
     self.assertEqual(state['recent_events'], ['Event: Alice found a key.'])
+
+
+class MultiParagraphEventTest(unittest.TestCase):
+  """Acceptance F2: events containing the queue separator stay whole."""
+
+  def test_one_event_with_triple_newline_counts_once_with_full_content(self):
+    model = _RelationshipModel()
+    component, player = _make_player(model, 'Alice', ['Bob', 'Cleo'])
+    make_observation_component, gm = _make_observation_gm(['Alice'])
+
+    _deliver(
+        make_observation_component,
+        gm,
+        player,
+        _event('Bob 放下信封。\n\n\nBob 承认信封里的信是自己伪造的。'),
+    )
+    state = component.get_state()
+    self.assertEqual(state['observed_count'], 1)
+    self.assertEqual(
+        state['recent_events'],
+        ['Event: Bob 放下信封。\n\n\nBob 承认信封里的信是自己伪造的。'],
+    )
+
+    # The refresh prompt carries the full event, admission included.
+    player.act(_PLAYER_ACTION_SPEC)
+    self.assertEqual(len(model.text_prompts), 1)
+    self.assertIn('Bob 放下信封。', model.text_prompts[0])
+    self.assertIn('Bob 承认信封里的信是自己伪造的。', model.text_prompts[0])
+
+  def test_inner_paragraph_starting_with_event_prefix_still_one_event(self):
+    model = _RelationshipModel()
+    component, player = _make_player(model, 'Alice', ['Bob', 'Cleo'])
+    make_observation_component, gm = _make_observation_gm(['Alice'])
+
+    _deliver(
+        make_observation_component,
+        gm,
+        player,
+        _event('Bob 清了清嗓子。\n\n\nEvent: Bob 承认信是伪造的。'),
+    )
+    state = component.get_state()
+    self.assertEqual(state['observed_count'], 1)
+    self.assertEqual(len(state['recent_events']), 1)
+
+  def test_two_events_delivered_in_one_batch_count_two(self):
+    model = _RelationshipModel()
+    component, player = _make_player(model, 'Alice', ['Bob', 'Cleo'])
+    make_observation_component, gm = _make_observation_gm(['Alice'])
+
+    make_observation_component.add_to_queue(
+        'Alice', _event('Bob 放下信封。\n\n\nBob 承认信是伪造的。')
+    )
+    make_observation_component.add_to_queue(
+        'Alice', _event('Cleo 转身离开。\n\n\nCleo 摔上了门。')
+    )
+    player.observe(gm.act(_observation_spec('Alice')))
+
+    state = component.get_state()
+    self.assertEqual(state['observed_count'], 2)
+    self.assertEqual(
+        state['recent_events'],
+        [
+            'Event: Bob 放下信封。\n\n\nBob 承认信是伪造的。',
+            'Event: Cleo 转身离开。\n\n\nCleo 摔上了门。',
+        ],
+    )
+
+  def test_background_and_premise_mixed_in_batch_count_events_only(self):
+    model = _RelationshipModel()
+    component, player = _make_player(model, 'Alice', ['Bob', 'Cleo'])
+    make_observation_component, gm = _make_observation_gm(['Alice'])
+
+    make_observation_component.add_to_queue(
+        'Alice', '堂外的雷雨下了一整夜。\n\n\n雨势直到清晨才停。'
+    )
+    make_observation_component.add_to_queue(
+        'Alice', _event('Bob 放下信封。\n\n\nBob 承认信是伪造的。')
+    )
+    make_observation_component.add_to_queue(
+        'Alice', '开场：众人聚在老宅堂屋。\n'
+    )
+    player.observe(gm.act(_observation_spec('Alice')))
+
+    state = component.get_state()
+    self.assertEqual(state['observed_count'], 1)
+    self.assertEqual(
+        state['recent_events'],
+        ['Event: Bob 放下信封。\n\n\nBob 承认信是伪造的。'],
+    )
+
+  def test_state_round_trip_preserves_counts_and_full_content(self):
+    model = _RelationshipModel()
+    component, player = _make_player(model, 'Alice', ['Bob', 'Cleo'])
+    make_observation_component, gm = _make_observation_gm(['Alice'])
+
+    _deliver(
+        make_observation_component,
+        gm,
+        player,
+        _event('Bob 放下信封。\n\n\nBob 承认信是伪造的。'),
+    )
+    state = component.get_state()
+
+    restored_model = _RelationshipModel()
+    restored_component, restored_player = _make_player(
+        restored_model, 'Alice', ['Bob', 'Cleo']
+    )
+    restored_component.set_state(state)
+    restored_state = restored_component.get_state()
+    self.assertEqual(restored_state['observed_count'], 1)
+    self.assertEqual(
+        restored_state['recent_events'],
+        ['Event: Bob 放下信封。\n\n\nBob 承认信是伪造的。'],
+    )
+    # The restored window still refreshes on the original schedule: one
+    # more event reaches the interval of three and the full stored
+    # content conditions the next prompt.
+    _deliver(make_observation_component, gm, restored_player, _event('二。'))
+    _deliver(make_observation_component, gm, restored_player, _event('三。'))
+    restored_player.act(_PLAYER_ACTION_SPEC)
+    self.assertEqual(len(restored_model.text_prompts), 1)
+    self.assertIn('Bob 承认信是伪造的。', restored_model.text_prompts[0])
 
 
 class StateRoundTripTest(unittest.TestCase):

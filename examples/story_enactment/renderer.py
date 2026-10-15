@@ -8,15 +8,15 @@
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR ANY KIND, either express or implied.
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
 """Deterministic screenplay rendering of saved story turns.
 
 This module renders spec §7 story turn records (the JSONL records saved by
-``collector.py``) into a Fountain screenplay, a plain-text transcript, or a
-per-turn tension curve plot. The two text renderers are deterministic pure
+``collector.py``) into an FDX screenplay, a Fountain screenplay, a plain-text
+transcript, or a per-turn tension curve plot. The text renderers are pure
 functions of their inputs: they make no language model calls, perform no
 file IO, and read only the turn dictionaries and the scene display
 dictionary. ``render_tension_curve`` is likewise deterministic and free of
@@ -37,7 +37,25 @@ carry the uppercase ``INT.``/``EXT.`` prefix; CJK character names are not
 valid native character cues, so every character cue is forced with a
 leading ``@`` (e.g. ``@林雪``); a parenthetical line sits between the
 character cue and its dialogue, and elements are separated by blank
-lines.
+lines. FDX instead declares each paragraph's type explicitly and preserves
+the original dialogue, including literal markup and whitespace.
+
+Element-boundary encoding for raw content (acceptance F4): a blank line
+ends a Fountain dialogue block, so paragraph breaks inside one speech are
+rendered as single line breaks — every paragraph of the speech stays in
+the same speaker's dialogue block (whitespace is normalized, wording is
+never altered). A dialogue line that itself starts with a Fountain
+forcing or block marker — ``!`` (action), ``@`` (character), a single
+``.`` before an alphanumeric character (scene heading), ``(``
+(parenthetical), ``>`` (transition or centered text), ``~`` (lyric),
+``#`` (section), ``=`` (synopsis) or ``[[`` (note) — would be read as
+that other element by some Fountain parsers, so such lines carry a
+backslash before the literal marker. ``parse_fountain`` strips it again,
+but external tools such as Screenplain may display it. Use FDX for exact
+text interchange. Stage-direction lines whose first characters would
+define another element type are each forced to action with a leading
+``!``, which Fountain parsers strip from the content. Only the scene
+display ever yields a true scene heading.
 
 Steps whose ``beat_id_after_event`` is None (the beat completed) render
 exactly like any other turn; no extra Fountain element is emitted for
@@ -47,6 +65,7 @@ beat completion. The diagnostic field ``budget_stopped`` is not rendered;
 
 from collections.abc import Mapping, Sequence
 from typing import Any
+import xml.etree.ElementTree as ET
 
 # Fountain element type labels returned by parse_fountain.
 ELEMENT_TYPES = (
@@ -56,6 +75,116 @@ ELEMENT_TYPES = (
     'parenthetical',
     'action',
 )
+
+# Line-starting markers that would force a Fountain element other than
+# dialogue; a stage-directions line starting with any of them is forced to
+# action with a leading `!`.
+_SPECIAL_ACTION_PREFIXES = ('.', '!', '@', '(', '>', '~', '#', '=')
+
+# Line-starting markers that Fountain reads as another element type even
+# inside a dialogue block (forced action `!`, forced character `@`,
+# forced scene heading `.` before an alphanumeric character,
+# parenthetical `(`, forced transition or centered text `>`, lyric `~`,
+# section `#`, synopsis `=`, note `[[`). A dialogue line starting with
+# one of them is escaped with a backslash.
+_DIALOGUE_MARKERS = ('!', '@', '(', '>', '~', '#', '=', '[[')
+
+# The Fountain escape character: the Markdown-style convention the
+# syntax reserves for verbatim content (its documented use is emphasis
+# characters, and it keeps the escaped line from starting with a
+# forcing marker at all).
+_DIALOGUE_ESCAPE = '\\'
+
+# Scene-heading prefixes recognized by Fountain parsers, matched
+# case-insensitively.
+_SCENE_HEADING_PREFIXES = ('INT.', 'EXT.', 'EST.', 'I/E', 'INT/')
+
+
+def _needs_action_forcing(line: str) -> bool:
+  """Decides whether one stage-directions line must be forced to action.
+
+  Args:
+    line: the line without leading/trailing whitespace.
+
+  Returns:
+    Whether the line's first characters would define a scene heading,
+    character cue, parenthetical or other non-action element, so the
+    renderer must prefix it with the Fountain action-forcing marker.
+  """
+  if line.startswith(_SPECIAL_ACTION_PREFIXES):
+    return True
+  if line.upper().startswith(_SCENE_HEADING_PREFIXES):
+    return True
+  # A fully uppercase line containing ASCII letters reads as a character
+  # cue; forcing keeps it in the action block.
+  return line.upper() == line and any(
+      character.isascii() and character.isalpha() for character in line
+  )
+
+
+def _encode_action(stage_directions: str) -> str:
+  """Encodes a stage-directions block as unambiguous Fountain action.
+
+  Args:
+    stage_directions: the raw stage-directions text of one turn.
+
+  Returns:
+    The block with every element-ambiguous line forced to action.
+  """
+  forced_lines = []
+  for line in stage_directions.split('\n'):
+    stripped = line.strip()
+    if _needs_action_forcing(stripped):
+      forced_lines.append('!' + stripped)
+    else:
+      forced_lines.append(stripped)
+  return '\n'.join(forced_lines)
+
+
+def _needs_dialogue_escape(line: str) -> bool:
+  """Decides whether one dialogue line must carry the escape character.
+
+  Args:
+    line: the line without leading/trailing whitespace.
+
+  Returns:
+    Whether the line's first characters would force a Fountain element
+    other than dialogue (or are the escape character itself, which must
+    be doubled to stay reversible), so the renderer must prefix it with
+    the escape character.
+  """
+  if line.startswith(_DIALOGUE_MARKERS) or line.startswith(_DIALOGUE_ESCAPE):
+    return True
+  # A single leading period before an alphanumeric character forces a
+  # scene heading; ellipses and other punctuation are safe as-is.
+  return line.startswith('.') and len(line) > 1 and line[1].isalnum()
+
+
+def _encode_dialogue(speech: str) -> str:
+  """Encodes one speech as a single Fountain dialogue block body.
+
+  Blank lines inside the speech would end the dialogue block, so
+  paragraph breaks are normalized to single line breaks; each line is
+  stripped of outer whitespace and empty lines are dropped. A line whose
+  first characters would force another Fountain element is escaped with
+  a backslash, keeping it dialogue; the wording of every line is
+  otherwise preserved verbatim.
+
+  Args:
+    speech: the raw speech text of one turn.
+
+  Returns:
+    The dialogue body, one or more non-blank escaped lines.
+  """
+  escaped_lines = []
+  for line in speech.split('\n'):
+    line = line.strip()
+    if not line:
+      continue
+    escaped_lines.append(
+        _DIALOGUE_ESCAPE + line if _needs_dialogue_escape(line) else line
+    )
+  return '\n'.join(escaped_lines)
 
 
 def _scene_heading(scene_display: Mapping[str, Any]) -> str:
@@ -79,6 +208,50 @@ def _emotion(turn: Mapping[str, Any], show_emotion: bool) -> str | None:
   return turn.get('emotion') or None
 
 
+def render_fdx(
+    turns: Sequence[dict[str, Any]],
+    scene_display: Mapping[str, Any],
+    *,
+    show_emotion: bool = True,
+) -> str:
+  """Renders story turns as a Final Draft XML screenplay.
+
+  Each speech occupies one explicitly typed Dialogue paragraph, so literal
+  parentheses, backslashes, markup, spaces and line breaks remain text.
+  Only an enabled emotion produces a Parenthetical paragraph. Narration
+  comes from stage_directions, never resolved_event, to avoid repeating
+  dialogue. This function performs no file IO or model calls.
+
+  Args:
+    turns: story turn records in enactment order.
+    scene_display: the scene's interior, location and time_label fields.
+    show_emotion: whether to emit parenthetical emotion paragraphs.
+
+  Returns:
+    A UTF-8-declared FDX document, newline-terminated.
+  """
+  elements = [('Scene Heading', _scene_heading(scene_display))]
+  for turn in turns:
+    elements.append(('Character', turn['actor']))
+    emotion = _emotion(turn, show_emotion)
+    if emotion is not None:
+      elements.append(('Parenthetical', f'({emotion})'))
+    elements.append(('Dialogue', turn['speech']))
+    if turn['stage_directions']:
+      elements.append(('Action', turn['stage_directions']))
+
+  root = ET.Element(
+      'FinalDraft', DocumentType='Script', Template='No', Version='1'
+  )
+  content = ET.SubElement(root, 'Content')
+  for element_type, text in elements:
+    paragraph = ET.SubElement(content, 'Paragraph', Type=element_type)
+    ET.SubElement(paragraph, 'Text').text = text
+  document = ET.tostring(root, encoding='utf-8', xml_declaration=True)
+  # XML parsers normalize literal carriage returns; references preserve them.
+  return document.decode('utf-8').replace('\r', '&#13;') + '\n'
+
+
 def render_fountain(
     turns: Sequence[dict[str, Any]],
     scene_display: Mapping[str, Any],
@@ -89,7 +262,8 @@ def render_fountain(
 
   The scene heading is emitted once at the top, then each turn in order
   as one dialogue block (forced ``@`` character cue, optional
-  parenthetical emotion line, dialogue) followed by an action line when
+  parenthetical emotion line, dialogue body with paragraph breaks
+  normalized to line breaks) followed by an action block when
   ``stage_directions`` is non-empty.
 
   Args:
@@ -107,10 +281,10 @@ def render_fountain(
     emotion = _emotion(turn, show_emotion)
     if emotion is not None:
       lines.append(f'({emotion})')
-    lines.append(turn['speech'])
+    lines.append(_encode_dialogue(turn['speech']))
     elements.append('\n'.join(lines))
     if turn['stage_directions']:
-      elements.append(turn['stage_directions'])
+      elements.append(_encode_action(turn['stage_directions']))
   return '\n\n'.join(elements) + '\n'
 
 
@@ -224,11 +398,18 @@ def parse_fountain(text: str) -> list[tuple[str, str]]:
   """Parses Fountain text emitted by ``render_fountain``.
 
   This test helper understands exactly the element forms the renderer
-  emits: scene headings start with ``INT.`` or ``EXT.``; character cues
-  start with ``@`` (content excludes the marker); parentheticals start
-  with ``(`` (content excludes the parentheses); the first line of a
-  dialogue block after a character cue or parenthetical is dialogue, any
-  other non-empty line is action.
+  emits, following the fountain.io element rules: scene headings start
+  with ``INT.`` or ``EXT.`` and require a blank line above; character
+  cues start with ``@`` (content excludes the marker) and also require a
+  blank line above; a line starting with ``(`` between the character cue
+  and the dialogue is a parenthetical (content excludes the
+  parentheses); every other line of a dialogue block — including
+  continuation lines after the first — is dialogue of the same speaker
+  with one leading escape character stripped (the renderer's encoding of
+  literal markers, see ``_encode_dialogue``), and the block only ends at
+  a blank line; a line forced with a leading ``!`` is action with the
+  marker stripped, as is any other non-empty line outside a dialogue
+  block.
 
   Args:
     text: Fountain text, e.g. the output of ``render_fountain``.
@@ -243,17 +424,20 @@ def parse_fountain(text: str) -> list[tuple[str, str]]:
     line = raw_line.strip()
     if not line:
       in_dialogue_block = False
-    elif line.startswith(('INT.', 'EXT.')):
-      elements.append(('scene_heading', line))
+    elif line.startswith('!'):
+      elements.append(('action', line[1:]))
       in_dialogue_block = False
-    elif line.startswith('@'):
+    elif not in_dialogue_block and line.startswith(('INT.', 'EXT.')):
+      elements.append(('scene_heading', line))
+    elif not in_dialogue_block and line.startswith('@'):
       elements.append(('character', line[1:]))
       in_dialogue_block = True
     elif line.startswith('('):
       elements.append(('parenthetical', line[1:-1]))
     elif in_dialogue_block:
+      if line.startswith(_DIALOGUE_ESCAPE):
+        line = line[1:]
       elements.append(('dialogue', line))
-      in_dialogue_block = False
     else:
       elements.append(('action', line))
   return elements

@@ -35,6 +35,7 @@ All model calls go through the deterministic semantic stub in
 `testing_stubs`; no real API is contacted.
 """
 
+import dataclasses
 from typing import Any
 import unittest
 
@@ -47,6 +48,7 @@ from concordia.typing import prefab as prefab_lib
 from concordia.typing import scene as scene_lib
 import numpy as np
 
+from examples.story_enactment import run as run_lib
 from examples.story_enactment import story_config
 from examples.story_enactment import testing_stubs
 
@@ -114,22 +116,10 @@ def _gm_params(
       min_turns=5,
       max_turns=24,
   )
-  by_name = {character.name: character for character in config.characters}
-  constraints = tuple(f'仅裁决者可知：{fact}' for fact in config.gm_only_facts)
-  constraints += tuple(
-      f'仅裁决者可知：{name}的私隐：{by_name[name].secret}'
-      for name in participants
-      if by_name[name].secret
-  )
-  constraints += (
-      f'环境事件只能从以下选项中选择：{"；".join(config.allowed_environment_events)}',
-  )
   return {
-      'name': 'story rules',
+      **run_lib.make_gm_params(config),
       'scene_dicts': (story_scene.scene_to_dict(scene),),
       'beat_dicts': (beat.to_dict(),),
-      'world_constraints': constraints,
-      'immutable_facts': tuple(config.immutable_facts),
   }
 
 
@@ -290,6 +280,35 @@ class InformationIsolationTest(unittest.TestCase):
     # B's whole memory is clean of S as well.
     self.assertNotIn(_SECRET_MARK, _memories_text(sim, '王婶'))
 
+  def test_all_cast_constraints_reach_gm_without_entering_other_players(self):
+    config = story_config.make_example_config()
+    config = dataclasses.replace(
+        config,
+        characters=tuple(
+            dataclasses.replace(c, hard_constraint=f'CONSTRAINT_{index}_ONLY')
+            for index, c in enumerate(config.characters)
+        ),
+    )
+    sim, agent_model, gm_model = _build_simulation(config, ('林雪', '王婶'))
+    sim.play(max_steps=2)
+    reviews = [
+        prompt
+        for prompt in gm_model.text_prompts
+        if '# Story resolution semantic review' in prompt
+    ]
+    self.assertEqual(len(reviews), 2)
+    for review in reviews:
+      for character in config.characters:
+        self.assertIn(character.hard_constraint, review)
+    for name in ('林雪', '王婶'):
+      prompt = _speech_prompts(agent_model, name)[0]
+      for character in config.characters:
+        if character.name == name:
+          self.assertIn(character.hard_constraint, prompt)
+        else:
+          self.assertNotIn(character.hard_constraint, prompt)
+          self.assertNotIn(character.hard_constraint, _memories_text(sim, name))
+
   def test_gm_truth_conditions_resolutions_only(self):
     config = story_config.make_example_config()
     sim, agent_model, gm_model = _build_simulation(config, ('林雪', '王婶'))
@@ -338,6 +357,8 @@ class DialoguePropagationTest(unittest.TestCase):
     b_prompts = _speech_prompts(agent_model, '王婶')
     self.assertEqual(len(b_prompts), 1)
     self.assertIn(_MARKER, b_prompts[0])
+    self.assertIn('窗外的雷声滚过，烛火摇曳。', b_prompts[0])
+    self.assertIn('窗外的雷声滚过，烛火摇曳。', _memories_text(sim, '王婶'))
 
     # The narrator track never restates the spoken line, and B's own
     # authored speech is preserved verbatim in the committed turn.
@@ -350,7 +371,10 @@ class DialoguePropagationTest(unittest.TestCase):
     self.assertIsNotNone(turn)
     self.assertEqual(turn['actor'], '王婶')
     self.assertEqual(turn['speech'], '这宅子的事，急不得。')
-    self.assertEqual(turn['resolved_event'], '王婶: 这宅子的事，急不得。')
+    self.assertEqual(
+        turn['resolved_event'],
+        '王婶: 这宅子的事，急不得。\n' + turn['stage_directions'],
+    )
     self.assertTrue(turn['stage_directions'])
     self.assertNotIn(_MARKER, turn['stage_directions'])
 

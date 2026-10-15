@@ -15,9 +15,10 @@
 """Acceptance assets for the manual review of spec section 13.2.
 
 This module hosts the three fixed scenario configurations of appendix C
-plus the human review checklist. Everything here is static content: no
-language model is constructed or called, so the assets can be diffed and
-versioned like any other part of an experiment protocol.
+plus their beat outlines and the human review checklist. Everything here
+is static content: no language model is constructed or called, so the
+assets can be diffed and versioned like any other part of an experiment
+protocol.
 
 The three scenarios (each with 4-5 characters, at least one game-master-
 only secret, and six or more whitelisted environment events):
@@ -25,8 +26,17 @@ only secret, and six or more whitelisted environment events):
 1. 老宅遗嘱 — the default example (see ``story_config.make_example_config``).
 2. 终面疑云 — a fraud-tainted final interview.
 3. 婚礼上的旧歌 — a wedding shadowed by an old flame.
+
+Each scenario also exposes a beat factory matched to its own conflict,
+evidence and allowed endings (acceptance F1); the closing beat of every
+outline is derived from that scenario's ``allowed_endings`` so the run
+config, the game master's constraints and the final completion judgment
+all share one ending range.
 """
 
+from concordia.contrib.components.game_master import drama_director
+
+from examples.story_enactment import run as run_lib
 from examples.story_enactment import story_config
 
 
@@ -185,9 +195,15 @@ def make_scenario_two_config() -> story_config.StoryConfig:
           '罗启铭笑着打圆场，面试间里的空气却凝住了。'
       ),
       allowed_endings=(
-          '真相大白：证书与项目双双败露，唐薇当场承认造假，高翔的沉默也被摆上台面。',
+          (
+              '证据确证：证书与项目的不实之处由有既定来源的公开证据核实，'
+              '郑兰依据核实结果自主明确决定不录用；不要求唐薇承认造假或高翔披露旧识关系。'
+          ),
           '瞒天过海：疑点被圆了过去，唐薇拿到录用通知，高翔在心里埋下一根刺。',
-          '主动坦白：唐薇在通知发出前找到郑兰和盘托出，争取以降级录用重新开始。',
+          (
+              '协商退出：不要求唐薇承认简历不实，她自主明确提出退出本次应聘，'
+              '郑兰自主明确确认终面结束。'
+          ),
           '僵局悬置：面试因突发中断未有结论，是否录用交由更高层裁决。',
       ),
   )
@@ -332,11 +348,124 @@ def make_scenario_three_config() -> story_config.StoryConfig:
           '满堂笑语一下子静了，陆屿转杯子的手停在了半空。'
       ),
       allowed_endings=(
-          '旧情坦白：陆屿或沈玉在仪式前向苏晴和盘托出，婚礼在震动后由新娘重新做出选择。',
+          (
+              '旧事核实：旧日关系由有既定来源的公开证据核实，'
+              '不要求沈玉或陆屿主动披露；苏晴保持体面并自主明确决定继续或暂缓婚礼。'
+          ),
           '体面告别：两人私下郑重道别，秘密守住，婚礼如期完成，只有彼此知道代价。',
           '当众揭穿：苏航拿到实证当众摊牌，婚礼中断，两个家庭开始艰难的清算。',
           '疑云消散：兄弟的疑问被合理解释化解，婚礼完成，疑点只留在个别人心里。',
       ),
+  )
+
+
+def make_scenario_one_beats() -> tuple[drama_director.Beat, ...]:
+  """Returns the beat outline of scenario one: the old estate dispute.
+
+  The opening beats are the estate story's own quarrel, evidence and
+  showdown beats (the default example's first three); the closing beat
+  is derived from this scenario's allowed endings.
+
+  Returns:
+    The 老宅遗嘱 beat outline.
+  """
+  return (
+      *run_lib.make_example_beats()[:3],
+      run_lib.make_final_beat(make_scenario_one_config().allowed_endings),
+  )
+
+
+def make_scenario_two_beats() -> tuple[drama_director.Beat, ...]:
+  """Returns the beat outline of scenario two: the fraud-tainted interview.
+
+  The beats follow the interview's own arc — doubt surfacing over the
+  résumé's flagship claim, background-check leads and third parties
+  arriving, the showdown that forces a response — and close on a beat
+  derived from this scenario's allowed endings.
+
+  Returns:
+    The 终面疑云 beat outline.
+  """
+  return (
+      drama_director.Beat(
+          id='b1',
+          description=(
+              '终面开场后的第一轮交锋：唐薇的讲述与高翔的追问形成张力，'
+              '可供追问的疑点（项目数据口径、证书编号、履历时间线）被摆上台面'
+          ),
+          tension_range=(3, 5),
+          done_question='已有可供郑兰追问的疑点（口径矛盾、编号存疑或时间线冲突）被公开点出了吗？',
+          min_turns=3,
+          max_turns=10,
+      ),
+      drama_director.Beat(
+          id='b2',
+          description=(
+              '背调发酵：出现可供查证的新证据或反常迹象（推荐人来电、'
+              '背调弹窗、材料散落、旧同事到访等任一）'
+          ),
+          tension_range=(5, 7),
+          done_question='剧中是否已出现至少一件可供各方查证的新证据或反常迹象？',
+          min_turns=3,
+          max_turns=10,
+      ),
+      drama_director.Beat(
+          id='b3',
+          description='摊牌时刻：简历造假的关键事实被揭示，有人面临不得不当场回应的压力',
+          tension_range=(7, 9),
+          done_question='是否有人不得不面对被揭示的关键事实并作出回应？',
+          min_turns=3,
+          max_turns=10,
+      ),
+      run_lib.make_final_beat(make_scenario_two_config().allowed_endings),
+  )
+
+
+def make_scenario_three_beats() -> tuple[drama_director.Beat, ...]:
+  """Returns the beat outline of scenario three: the wedding's old song.
+
+  The beats follow the wedding's own arc — the toast interrupted by the
+  brother's probing question, wedding details turning into evidence, the
+  showdown that forces a response — and close on a beat derived from
+  this scenario's allowed endings.
+
+  Returns:
+    The 婚礼上的旧歌 beat outline.
+  """
+  return (
+      drama_director.Beat(
+          id='b1',
+          description=(
+              '祝酒辞被打断后的第一轮试探：各方表面立场浮现，可供追问的'
+              '疑点（两人相识的时间、旧照片、彩排夜看到的争执）被摆上台面'
+          ),
+          tension_range=(3, 5),
+          done_question=(
+              '已有可供苏航追问的疑点（相识时间、旧照片或彩排夜的情形）被公开摆到台面了吗？'
+          ),
+          min_turns=3,
+          max_turns=10,
+      ),
+      drama_director.Beat(
+          id='b2',
+          description=(
+              '婚礼细节发酵：出现可供追问的新证据或反常迹象（投影旧照、'
+              '突然响起的老歌、错递的戒枕、香槟塔倾倒等任一）'
+          ),
+          tension_range=(5, 7),
+          done_question='剧中是否已出现至少一件可供各方追问的新证据或反常迹象？',
+          min_turns=3,
+          max_turns=10,
+      ),
+      drama_director.Beat(
+          id='b3',
+          description='摊牌时刻：旧情的关键事实被揭示，有人面临不得不当场回应的压力',
+          tension_range=(7, 9),
+          done_question='是否有人不得不面对被揭示的关键事实并作出回应？',
+          min_turns=3,
+          max_turns=10,
+      ),
+      run_lib.make_final_beat(make_scenario_three_config().allowed_endings),
   )
 
 

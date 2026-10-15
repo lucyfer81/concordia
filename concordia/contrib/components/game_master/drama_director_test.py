@@ -357,10 +357,12 @@ class LifecycleTest(unittest.TestCase):
     self.assertIn('- Alice: I hid the letter.', prompt)
     self.assertIn('## Completion criteria', prompt)
     self.assertIn(
-        'Judging only by events that have actually happened'
-        ' (not intentions or future plans)',
+        'Judge only public events that have actually happened.',
         prompt,
     )
+    self.assertIn('accusations, requests, proposals, commands', prompt)
+    self.assertIn('count GM-imposed voluntary choices', prompt)
+    self.assertIn('if evidence is missing, answer No', prompt)
     self.assertLess(
         prompt.index('Completion question:'),
         prompt.index('## Recent events'),
@@ -414,6 +416,47 @@ class LifecycleTest(unittest.TestCase):
     state = director.get_state()
     state['last_story_turn']['speech'] = 'tampered'
     self.assertEqual(director.get_state()['last_story_turn']['speech'], 'hi')
+
+  def test_public_history_excludes_uncommitted_resolution(self):
+    director, gm = _make_director(_BeatModel(False))
+    _complete_turn(gm, 'first')
+    history = director.get_committed_events()
+    self.assertEqual(history, ('Alice: first',))
+    gm.observe('[putative_event] Alice: second')
+    result = gm.act(_RESOLVE_SPEC)
+    self.assertEqual(director.get_committed_events(), history)
+    gm.observe(f'[event] {result}')
+    self.assertEqual(
+        director.get_committed_events(), ('Alice: first', 'Alice: second')
+    )
+
+  def test_no_directive_diagnostics_and_legacy_restore(self):
+    director, gm = _make_director(_BeatModel(False), eval_interval=0)
+    _complete_turn(gm, 'hi')
+    diagnostics = director.get_last_story_turn()['director_diagnostics']
+    self.assertEqual(
+        diagnostics,
+        {
+            'directive_at_start': None,
+            'directive_after_resolution': None,
+            'directive_after_turn': None,
+            'cooldown_active': False,
+            'last_executed_turn': None,
+        },
+    )
+    diagnostics['directive_at_start'] = 'tampered'
+    self.assertIsNone(
+        director.get_last_story_turn()['director_diagnostics'][
+            'directive_at_start'
+        ]
+    )
+    state = director.get_state()
+    del state['last_story_turn']['director_diagnostics']
+    fresh, fresh_gm = _make_director(_BeatModel(False), eval_interval=0)
+    fresh.set_state(state)
+    self.assertEqual(fresh.get_state(), state)
+    _complete_turn(fresh_gm, 'second')
+    self.assertIn('director_diagnostics', fresh.get_last_story_turn())
 
 
 class TensionScoringTest(unittest.TestCase):
@@ -479,8 +522,10 @@ class TensionScoringTest(unittest.TestCase):
     turn = director.get_last_story_turn()
     self.assertIsNone(turn['tension'])
     # Exactly one retry on an unparseable answer, then no further
-    # scoring actions (spec 11.1).
+    # scoring actions (spec 11.1). The re-ask is counted as an
+    # output-parse retry, apart from API retries (spec 13.3).
     self.assertEqual(len(model.text_prompts), 2)
+    self.assertEqual(director.get_state()['scoring_parse_retries'], 1)
     self.assertEqual(
         director.get_state()['tension_history'],
         [{
@@ -490,6 +535,23 @@ class TensionScoringTest(unittest.TestCase):
             'deviated': False,
         }],
     )
+
+  def test_parse_retry_counter_accumulates_and_restores(self):
+    model = _ScoringModel(False, 'quite tense')
+    director, gm = _make_director(model, eval_interval=1)
+    _complete_turn(gm, 'one')
+    _complete_turn(gm, 'two')
+    state = director.get_state()
+    self.assertEqual(state['scoring_parse_retries'], 2)
+    fresh, _ = _make_director(_ScoringModel(False, 'quite tense'))
+    fresh.set_state(state)
+    self.assertEqual(fresh.get_state()['scoring_parse_retries'], 2)
+
+  def test_valid_scores_never_count_parse_retries(self):
+    model = _ScoringModel(False, '7')
+    director, gm = _make_director(model, eval_interval=1)
+    _complete_turn(gm, 'one')
+    self.assertEqual(director.get_state()['scoring_parse_retries'], 0)
 
   def test_budget_exhausted_at_scoring_still_commits_step(self):
     model = _BudgetExhaustedTextModel()
@@ -526,11 +588,16 @@ class TensionScoringTest(unittest.TestCase):
     self.assertIn('## Scale anchors', prompt)
     self.assertIn('1 = calm routine, no conflict or stakes in motion.', prompt)
     self.assertIn(
-        '5 = clear conflict or stakes present, but pressure is steady.', prompt
+        '5 = unresolved conflict or stakes, including repeated arguments,',
+        prompt,
     )
     self.assertIn(
-        '10 = open confrontation or crisis, the outcome hangs on this moment.',
+        '10 = an immediate crisis with new consequential risk',
         prompt,
+    )
+    self.assertIn('volume and repetition alone do not warrant', prompt)
+    self.assertIn(
+        'Do not assume characters abandon their private goals', prompt
     )
     self.assertIn('## Recent events (oldest first)', prompt)
     self.assertIn('- Alice: one', prompt)
@@ -572,6 +639,26 @@ class TensionScoringTest(unittest.TestCase):
 class DirectiveGenerationTest(unittest.TestCase):
   """Stage-2 director directives (spec sections 4.4 step 4, 4.5, 11.1)."""
 
+  def test_boundaries_only_enter_private_directive_prompt(self):
+    model = _DirectiveModel(False)
+    director, gm = _make_director(
+        model,
+        character_constraints={'Alice': 'Never confess touching the will.'},
+        world_constraints=('Bob secretly holds a recording.',),
+        **_DIRECTOR_FEEDBACK_PARAMS,
+    )
+    _complete_turn(gm, 'A courier arrives at the door.')
+    generation = next(p for p in model.text_prompts if _DIRECTIVE_MARK in p)
+    scoring = next(p for p in model.text_prompts if _SCORING_MARK in p)
+    self.assertIn('Never confess touching the will.', generation)
+    self.assertIn('Bob secretly holds a recording.', generation)
+    self.assertIn('Alice: A courier arrives at the door.', generation)
+    self.assertNotIn('Never confess touching the will.', scoring)
+    self.assertNotIn('Bob secretly holds a recording.', scoring)
+    self.assertNotIn(
+        'Bob secretly holds a recording.', director.get_committed_events()[0]
+    )
+
   def test_deviation_generates_pending_directive_bound_to_beat(self):
     # A score of 7 against beat b1's range (1, 3) with tolerance 1
     # deviates, so the pipeline's fourth step creates a pending
@@ -591,6 +678,10 @@ class DirectiveGenerationTest(unittest.TestCase):
         },
     )
     self.assertIsNone(state['last_directive_executed_turn'])
+    diagnostics = director.get_last_story_turn()['director_diagnostics']
+    self.assertIsNone(diagnostics['directive_at_start'])
+    self.assertIsNone(diagnostics['directive_after_resolution'])
+    self.assertEqual(diagnostics['directive_after_turn'], state['directive'])
     # The P3 generation prompt carries the deviation, the direction,
     # the allowed means and the immutable facts (plan appendix B).
     prompt = next(p for p in model.text_prompts if _DIRECTIVE_MARK in p)
@@ -604,6 +695,11 @@ class DirectiveGenerationTest(unittest.TestCase):
         prompt,
     )
     self.assertIn('moves tension lower', prompt)
+    self.assertIn(
+        '## Recent public events (oldest first)\n- Alice: one', prompt
+    )
+    self.assertIn('do not introduce an event already established', prompt)
+    self.assertIn('Never make players agree, confess, disclose secrets', prompt)
     self.assertIn(
         'Never contradict immutable facts: the house is old; '
         'the will is sealed',
@@ -742,6 +838,12 @@ class DirectiveGenerationTest(unittest.TestCase):
     self.assertEqual(directive['status'], 'invalidated')
     self.assertEqual(directive['beat_id'], 'b1')
     self.assertEqual(directive['generated_at_turn'], 1)
+    self.assertEqual(directive['invalidated_at_turn'], 2)
+    diagnostics = fresh.get_last_story_turn()['director_diagnostics']
+    self.assertEqual(diagnostics['directive_at_start']['status'], 'pending')
+    self.assertEqual(
+        diagnostics['directive_after_turn']['status'], 'invalidated'
+    )
     # The transition step also generated no replacement directive.
     self.assertEqual(fresh.get_last_story_turn()['beat_id_after_event'], 'b2')
     self.assertFalse(any(_DIRECTIVE_MARK in p for p in completing.text_prompts))

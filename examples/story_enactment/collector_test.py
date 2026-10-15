@@ -217,6 +217,18 @@ class StepCallbackTest(unittest.TestCase):
     self.assertFalse(os.path.exists(self.harness.checkpoint_path))
     self.harness.simulation.make_checkpoint_data.assert_not_called()
 
+  def test_director_diagnostics_are_archived_without_changing_events(self):
+    diagnostics = {
+        'before': {'status': 'pending', 'content': 'A knock at the door.'},
+        'after': {'status': 'consumed', 'content': 'A knock at the door.'},
+    }
+    self.harness.director.set_turn(_make_turn(director_diagnostics=diagnostics))
+    self.harness.callback()(self.harness.step_data())
+    record = self.harness.turn_log.load()[0]
+    self.assertEqual(record['director_diagnostics'], diagnostics)
+    self.assertEqual(record['resolved_event'], f'{_ACTOR}说：{_SPEECH}')
+    self.assertNotIn('A knock', record['resolved_event'])
+
   def test_saves_turn_then_checkpoint_envelope(self):
     self.harness.callback()(self.harness.step_data())
     records = self.harness.turn_log.load()

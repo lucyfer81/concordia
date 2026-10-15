@@ -16,6 +16,7 @@
 
 import json
 from typing import Any, cast
+from unittest import mock
 
 from absl.testing import absltest
 from concordia.agents import entity_agent_with_logging
@@ -26,6 +27,7 @@ from concordia.components.game_master import event_resolution as event_resolutio
 from concordia.contrib.components.agent import emotional_stance
 from concordia.contrib.components.agent import relationships as relationships_lib
 from concordia.contrib.components.game_master import drama_director as drama_director_lib
+from concordia.contrib.components.game_master import story_resolution
 from concordia.contrib.components.game_master import story_terminator as story_terminator_lib
 from concordia.contrib.prefabs.entity import story_character
 from concordia.contrib.prefabs.game_master import story_dramaturgic
@@ -86,13 +88,16 @@ _DUAL_TRACK_RESPONSE = (
 class _PromptRecordingModel(mock_model.MockModel):
   """Mock model recording every prompt it is asked to sample."""
 
-  def __init__(self, response: str):
+  def __init__(self, response: str, *, review: str | None = None):
     super().__init__(response)
     self.prompts: list[str] = []
+    self.review = review or '{"valid": true, "reason": "Only speech occurs."}'
 
   def sample_text(self, prompt, **kwargs):
     del kwargs
     self.prompts.append(prompt)
+    if '# Story resolution semantic review' in prompt:
+      return self.review
     return self._response
 
 
@@ -361,18 +366,82 @@ class StoryGameMasterPrefabTest(absltest.TestCase):
   def test_real_act_resolution_prompt_contains_beat_and_constraints(self):
     players = [_build_character(name) for name in _PLAYERS]
     model = _PromptRecordingModel(_DUAL_TRACK_RESPONSE)
-    gm = _build_game_master(model, players)
+    gm = _build_game_master(
+        model,
+        players,
+        player_names=list(_PLAYERS),
+        character_constraints={
+            'Alice': 'Alice never lies.',
+            'Bob': 'Bob never signs.',
+        },
+        public_facts=('Both players saw the sealed envelope.',),
+    )
     environment = sequential.Sequential()
     environment.run_loop(game_masters=[gm], entities=players, max_steps=1)
     # The final dual-track output step must see the current beat and the
     # world constraints in its prompt, proving the resolution chain is
     # conditioned on the drama director and the constraints component.
-    resolution_prompts = [p for p in model.prompts if 'resolved_event' in p]
+    resolution_prompts = [
+        p
+        for p in model.prompts
+        if 'Output a JSON object with exactly two string fields' in p
+    ]
     self.assertTrue(resolution_prompts)
     prompt = resolution_prompts[-1]
     self.assertIn('The rehearsal begins (beat b1)', prompt)
     self.assertIn('\n'.join(_WORLD_CONSTRAINTS), prompt)
     self.assertIn('\n'.join(_IMMUTABLE_FACTS), prompt)
+    reviews = [
+        p for p in model.prompts if '# Story resolution semantic review' in p
+    ]
+    self.assertLen(reviews, 1)
+    for text in (prompt, reviews[0]):
+      self.assertIn('Alice never lies.', text)
+      self.assertIn('Bob never signs.', text)
+      self.assertIn('Both players saw the sealed envelope.', text)
+    director = gm.get_component('__drama_director__')
+    committed = director.get_last_story_turn()
+    self.assertEqual(committed['resolved_event'], f'Alice: {_SPEECH}')
+
+  def test_semantic_rejection_never_broadcasts_or_commits_or_consumes(self):
+    players = [_build_character(name) for name in _PLAYERS]
+    model = _PromptRecordingModel(
+        _DUAL_TRACK_RESPONSE,
+        review='{"valid": false, "reason": "Invented joint agreement."}',
+    )
+    gm = _build_game_master(model, players)
+    director = gm.get_component('__drama_director__')
+    state = director.get_state()
+    state['directive'] = {
+        'beat_id': 'b1',
+        'generated_at_turn': 0,
+        'content': 'Thunder outside.',
+        'status': 'integrating',
+    }
+    director.set_state(state)
+    queue = gm.get_component('__make_observation__')
+    with (
+        mock.patch.object(
+            queue, 'add_to_queue', wraps=queue.add_to_queue
+        ) as add,
+        mock.patch.object(
+            director,
+            'set_validated_resolution',
+            wraps=director.set_validated_resolution,
+        ) as validate,
+    ):
+      with self.assertRaisesRegex(
+          story_resolution.StoryOutputError, 'Invented joint agreement'
+      ):
+        sequential.Sequential().run_loop(
+            game_masters=[gm], entities=players, max_steps=1
+        )
+    validate.assert_not_called()
+    self.assertFalse(any('Event:' in str(call) for call in add.call_args_list))
+    self.assertIsNone(director.get_last_story_turn())
+    self.assertEqual(director.get_state()['story_turn'], 0)
+    self.assertEqual(director.get_state()['directive']['status'], 'integrating')
+    self.assertIsNone(director.get_state()['last_directive_executed_turn'])
 
 
 if __name__ == '__main__':

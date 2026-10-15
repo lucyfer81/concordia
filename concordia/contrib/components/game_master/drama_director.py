@@ -47,7 +47,8 @@ by the `director_note` resolution step, and only marked consumed after
 the dual-track final output validates successfully.
 """
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+import copy
 import dataclasses
 import re
 from typing import Any, cast, override
@@ -86,8 +87,14 @@ _TENSION_QUESTION = (
 )
 _TENSION_ANCHORS = (
     '1 = calm routine, no conflict or stakes in motion.',
-    '5 = clear conflict or stakes present, but pressure is steady.',
-    '10 = open confrontation or crisis, the outcome hangs on this moment.',
+    (
+        '5 = unresolved conflict or stakes, including repeated arguments, '
+        'but no new immediate risk or consequential change.'
+    ),
+    (
+        '10 = an immediate crisis with new consequential risk or an'
+        ' irreversible turning point; the outcome hangs on this moment.'
+    ),
 )
 _TENSION_OUTPUT_INSTRUCTION = (
     'Respond with a single integer from 1 to 10 and nothing else.'
@@ -271,6 +278,8 @@ class DramaDirector(
       allowed_environment_events: Sequence[str] = (),
       immutable_facts: Sequence[str] = (),
       player_names: Sequence[str] = (),
+      character_constraints: Mapping[str, str] | None = None,
+      world_constraints: Sequence[str] = (),
   ):
     """Initializes the director.
 
@@ -300,6 +309,8 @@ class DramaDirector(
         contradict.
       player_names: Names of the player characters, whose voluntary
         actions no directive may decide.
+      character_constraints: Player-specific boundaries, visible only to GM.
+      world_constraints: GM-only world facts and information boundaries.
 
     Raises:
       ValueError: If the beat configuration is invalid or the scoring
@@ -327,6 +338,8 @@ class DramaDirector(
     self._allowed_environment_events = tuple(allowed_environment_events)
     self._immutable_facts = tuple(immutable_facts)
     self._player_names = tuple(player_names)
+    self._character_constraints = dict(character_constraints or {})
+    self._world_constraints = tuple(world_constraints)
     # One stored window serves both the completion question (up to
     # `_COMPLETION_QUERY_EVENTS` events) and the scoring question (the
     # last `scoring_window` events), so it keeps the larger need.
@@ -342,6 +355,7 @@ class DramaDirector(
     self._last_story_turn: dict[str, Any] | None = None
     self._tension_eval_count = 0
     self._tension_history: list[dict[str, Any]] = []
+    self._scoring_parse_retries = 0
     self._directive: dict[str, Any] | None = None
     self._last_directive_executed_turn: int | None = None
 
@@ -384,6 +398,7 @@ class DramaDirector(
             # Strip the speaker prefix once to recover the raw speech.
             'original_speech': content.removeprefix(f'{actor}: '),
             'beat_id_at_action': beat.id if beat is not None else None,
+            'directive_at_start': copy.deepcopy(self._directive),
         }
     elif (
         self._awaiting_event
@@ -503,7 +518,11 @@ class DramaDirector(
         and directive is not None
         and (directive['status'] in _ACTIVE_DIRECTIVE_STATUSES)
     ):
-      directive = {**directive, 'status': _DIRECTIVE_INVALIDATED}
+      directive = {
+          **directive,
+          'status': _DIRECTIVE_INVALIDATED,
+          'invalidated_at_turn': turn_id,
+      }
     generate = (
         not budget_stopped
         and self._feedback_enabled
@@ -524,6 +543,7 @@ class DramaDirector(
             score=tension,
             beat_id=snapshot['beat_id_at_action'],
             turn_id=turn_id,
+            recent_events=recent_events,
         )
       except budget_wrapper.BudgetExhaustedError:
         # Budget path B at the directive-generation position (spec
@@ -545,6 +565,15 @@ class DramaDirector(
         'stage_directions': snapshot['stage_directions'],
         'tension': tension,
         'budget_stopped': budget_stopped,
+        # Private diagnostics stay in the collector/checkpoint, never in
+        # the resolved event that is broadcast to the players.
+        'director_diagnostics': {
+            'directive_at_start': snapshot['directive_at_start'],
+            'directive_after_resolution': copy.deepcopy(self._directive),
+            'directive_after_turn': copy.deepcopy(directive),
+            'cooldown_active': self._in_cooldown(turn_id),
+            'last_executed_turn': self._last_directive_executed_turn,
+        },
     }
     self._pending_commit = {
         'beat_index': beat_index,
@@ -664,7 +693,11 @@ class DramaDirector(
         or self._directive['status'] != _DIRECTIVE_INTEGRATING
     ):
       return
-    self._directive = {**self._directive, 'status': _DIRECTIVE_CONSUMED}
+    self._directive = {
+        **self._directive,
+        'status': _DIRECTIVE_CONSUMED,
+        'executed_at_turn': self._story_turn + 1,
+    }
     # The turn in progress is one past the last committed story turn.
     self._last_directive_executed_turn = self._story_turn + 1
     self._logging_channel({'DirectorDirective': self._directive})
@@ -686,6 +719,7 @@ class DramaDirector(
           **self._directive,
           'status': _DIRECTIVE_FAILED,
           'reason': reason,
+          'failed_at_turn': self._story_turn + 1,
       }
       self._logging_channel({'DirectorDirective': self._directive})
 
@@ -704,11 +738,25 @@ class DramaDirector(
     """Player characters whose voluntary actions directives may not decide."""
     return self._player_names
 
+  @property
+  def character_constraints(self) -> dict[str, str]:
+    """Returns a copy of the GM-only player boundaries."""
+    return dict(self._character_constraints)
+
+  @property
+  def world_constraints(self) -> tuple[str, ...]:
+    """Returns the GM-only world and information boundaries."""
+    return self._world_constraints
+
   def get_last_story_turn(self) -> dict[str, Any] | None:
     """Returns a copy of the most recently committed story turn, if any."""
     if self._last_story_turn is None:
       return None
-    return dict(self._last_story_turn)
+    return copy.deepcopy(self._last_story_turn)
+
+  def get_committed_events(self) -> tuple[str, ...]:
+    """Returns the recent committed public events, excluding candidates."""
+    return tuple(self._recent_events)
 
   def get_current_original_speech(self) -> str | None:
     """Returns the original speech of the turn in progress, if any."""
@@ -740,12 +788,13 @@ class DramaDirector(
         'beat_timeout': self._beat_timeout,
         'budget_stopped': self._budget_stopped,
         'last_story_turn': (
-            dict(self._last_story_turn)
+            copy.deepcopy(self._last_story_turn)
             if self._last_story_turn is not None
             else None
         ),
         'tension_eval_count': self._tension_eval_count,
         'tension_history': [dict(entry) for entry in self._tension_history],
+        'scoring_parse_retries': self._scoring_parse_retries,
         'directive': (
             dict(self._directive) if self._directive is not None else None
         ),
@@ -771,7 +820,7 @@ class DramaDirector(
     self._budget_stopped = state['budget_stopped']  # pyrefly: ignore[bad-assignment]
     last_story_turn = cast('dict[str, Any] | None', state['last_story_turn'])
     self._last_story_turn = (
-        dict(last_story_turn) if last_story_turn is not None else None
+        copy.deepcopy(last_story_turn) if last_story_turn is not None else None
     )
     # The tension fields postdate the stage-1 state schema; older
     # checkpoints (and fixtures built against them) resume with an
@@ -784,6 +833,12 @@ class DramaDirector(
         state.get('tension_history', ()),
     )
     self._tension_history = [dict(entry) for entry in tension_history]
+    # Output-parse re-asks of the scoring question are tracked apart
+    # from API retries (spec 13.3); the field postdates the stage-2
+    # state schema, so older checkpoints resume with zero.
+    self._scoring_parse_retries = state.get(  # pyrefly: ignore[bad-assignment]
+        'scoring_parse_retries', 0
+    )
     # The directive fields postdate the stage-1 state schema; older
     # checkpoints resume with no directive and no execution recorded.
     directive = cast('dict[str, Any] | None', state.get('directive', None))
@@ -842,9 +897,15 @@ class DramaDirector(
       prompt.statement(f'- {event}')
     prompt.statement('## Completion criteria')
     prompt.statement(
-        'Judging only by events that have actually happened (not'
-        " intentions or future plans), is the beat's completion"
-        ' question satisfied?'
+        'Judge only public events that have actually happened. Intentions,'
+        ' accusations, requests, proposals, commands and future plans do not'
+        ' establish their requested outcomes. A request to seal evidence or'
+        ' leave does not establish that evidence was sealed or anyone left.'
+        ' Do not infer agreement, confession, disclosure or compliance for'
+        ' other player characters, or count GM-imposed voluntary choices as'
+        ' evidence of completion. Every required part of an allowed ending'
+        ' must already be established by the public events; if evidence is'
+        " missing, answer No. Is the beat's completion question satisfied?"
     )
     try:
       return prompt.yes_no_question(question=beat.done_question)
@@ -897,6 +958,14 @@ class DramaDirector(
     document.statement('## Scale anchors')
     for anchor in _TENSION_ANCHORS:
       document.statement(anchor)
+    document.statement(
+        'Rate only the public events below. Distinguish new risks, revelations'
+        ' and consequential changes from repeated loud accusations or'
+        ' procedural demands; volume and repetition alone do not warrant a'
+        ' crisis score. Quieter dialogue does not prove the conflict is'
+        ' resolved. Do not assume characters abandon their private goals or'
+        ' change positions to lower tension.'
+    )
     document.statement('## Recent events (oldest first)')
     for event in window:
       document.statement(f'- {event}')
@@ -906,7 +975,9 @@ class DramaDirector(
     )
     if score is None:
       # Retry once on an unparseable answer only; API and budget errors
-      # are never treated as parse failures.
+      # are never treated as parse failures. The re-ask is a new logical
+      # request counted apart from API retries (spec 13.3).
+      self._scoring_parse_retries += 1
       score = _parse_tension_score(
           document.open_question(_TENSION_OUTPUT_INSTRUCTION)
       )
@@ -932,6 +1003,7 @@ class DramaDirector(
       score: int,
       beat_id: str,
       turn_id: int,
+      recent_events: Sequence[str],
   ) -> dict[str, Any]:
     """Asks the model for a directive moving the tension toward range.
 
@@ -946,6 +1018,7 @@ class DramaDirector(
       beat_id: The beat the directive binds to, the one current when
         the player acted.
       turn_id: The story turn generating the directive.
+      recent_events: Public resolved events through the current turn.
 
     Returns:
       The new directive dictionary. An empty model answer is recorded
@@ -977,10 +1050,27 @@ class DramaDirector(
         "You may ONLY use these means, never player characters' "
         f'voluntary actions: {events}'
     )
+    document.statement(
+        'Never make players agree, confess, disclose secrets or comply with'
+        ' commands. Never change their goals or positions to lower tension.'
+        ' Whitelisting an event does not make it repeatable: do not introduce'
+        ' an event already established in the public history, or repeat a'
+        ' demand as if it were new progress.'
+    )
+    document.statement('## GM-only boundaries (never disclose these)')
+    for name, constraint in self._character_constraints.items():
+      document.statement(f'- {name}: {constraint}')
+    for constraint in self._world_constraints:
+      document.statement(f'- {constraint}')
+    document.statement('## Recent public events (oldest first)')
+    for event in recent_events:
+      document.statement(f'- {event}')
     content = document.open_question(
         'Write one short director instruction (one sentence) describing '
         f'an event or NPC action that moves tension {raise_or_lower}. '
-        f'Never contradict immutable facts: {facts}'
+        f'Never contradict immutable facts: {facts}. '
+        'If no unused permitted event can help without violating the '
+        'constraints, return an empty response.'
     ).strip()
     if not content:
       return {
@@ -989,6 +1079,7 @@ class DramaDirector(
           'content': '',
           'status': _DIRECTIVE_FAILED,
           'reason': 'empty directive instruction',
+          'failed_at_turn': turn_id,
       }
     return {
         'beat_id': beat_id,

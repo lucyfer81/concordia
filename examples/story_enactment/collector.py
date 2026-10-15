@@ -239,6 +239,7 @@ def _save_checkpoint(
     *,
     simulation: Any,
     budget_guard: Any,
+    retry_stats: Any = None,
     checkpoint_path: str,
     run_config: Mapping[str, Any],
     committed_turn_id: int,
@@ -250,11 +251,15 @@ def _save_checkpoint(
   The envelope contains the fields of spec §12: the run configuration, the
   standard simulation checkpoint state, the committed turn id, the used
   model attempts, and the original total limits. Saving it is the commit
-  boundary for the accompanying story turn.
+  boundary for the accompanying story turn. The cumulative API retry
+  count (spec §13.3, acceptance F5) is persisted next to the attempt
+  count so a resumed run reports both with the same restored baseline.
 
   Args:
     simulation: the simulation; must expose ``make_checkpoint_data()``.
     budget_guard: the budget guard; must expose ``used_attempts``.
+    retry_stats: the retry-statistics wrapper; must expose
+      ``used_retries``. Optional for callers without the wrapper.
     checkpoint_path: destination file path of the envelope.
     run_config: the run's saved configuration dictionary.
     committed_turn_id: the maximum fully saved story turn id.
@@ -267,6 +272,7 @@ def _save_checkpoint(
       'simulation_state': simulation.make_checkpoint_data(),
       'committed_turn_id': committed_turn_id,
       'used_model_attempts': budget_guard.used_attempts,
+      'used_api_retries': retry_stats.used_retries if retry_stats else 0,
       'total_turn_limit': total_turn_limit,
       'total_model_attempt_limit': total_model_attempt_limit,
   }
@@ -286,6 +292,7 @@ def make_step_callback(
     total_turn_limit: int,
     total_model_attempt_limit: int,
     emotion_enabled: bool,
+    retry_stats: Any = None,
 ) -> StepCallback:
   """Builds the step callback that collects and saves story turns.
 
@@ -308,6 +315,8 @@ def make_step_callback(
     total_turn_limit: the run's original total turn limit.
     total_model_attempt_limit: the run's original model attempt limit.
     emotion_enabled: whether emotional stance collection is enabled.
+    retry_stats: the retry-statistics wrapper whose cumulative count is
+      persisted in the envelope; optional for callers without it.
 
   Returns:
     The step callback to pass to ``Simulation.play``.
@@ -345,6 +354,10 @@ def make_step_callback(
         'tension': turn['tension'],
         'budget_stopped': turn['budget_stopped'],
     }
+    # Diagnostics belong to the archived record, never player observations.
+    # Older directors/checkpoints omit this optional field.
+    if 'director_diagnostics' in turn:
+      record['director_diagnostics'] = turn['director_diagnostics']
     turn_log.append(record)
 
     committed = _read_committed_turn_id(checkpoint_path)
@@ -358,6 +371,7 @@ def make_step_callback(
     _save_checkpoint(
         simulation=simulation,
         budget_guard=budget_guard,
+        retry_stats=retry_stats,
         checkpoint_path=checkpoint_path,
         run_config=run_config,
         committed_turn_id=record['turn_id'],

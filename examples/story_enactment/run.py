@@ -54,17 +54,18 @@ from concordia.components.game_master import terminate as terminate_lib
 from concordia.contrib.components.game_master import drama_director
 from concordia.contrib.components.game_master import story_terminator
 from concordia.contrib.language_models import budget_wrapper
+from concordia.contrib.language_models import retry_stats_wrapper
 from concordia.contrib.prefabs.entity import story_character
 from concordia.contrib.prefabs.game_master import story_dramaturgic
 from concordia.contrib.prefabs.game_master import story_scene
 from concordia.language_model import language_model
-from concordia.language_model import retry_wrapper
 from concordia.prefabs.simulation import generic as simulation_lib
 from concordia.typing import prefab as prefab_lib
 from concordia.typing import scene as scene_lib
 import numpy as np
 
 from examples.story_enactment import collector
+from examples.story_enactment import provenance
 from examples.story_enactment import renderer
 from examples.story_enactment import story_config
 from examples.story_enactment import testing_stubs
@@ -153,6 +154,18 @@ class RunResult:
       only, excluding the count restored from the checkpoint.
     used_model_attempts: total model attempts accounted for by the
       guard, including the restored count.
+    api_retries_used_this_process: API retries initiated and reaching
+      the provider in this process only (spec 13.3, acceptance F5).
+      Budget-blocked requests never count; output-parse re-asks (e.g.
+      the second tension-scoring call after an unparseable answer) are
+      new logical requests and are counted separately below.
+    used_api_retries: cumulative API retries including the count
+      restored from the checkpoint envelope.
+    scoring_parse_retries_used_this_process: output-parse re-asks of
+      the tension-scoring question issued in this process only; these
+      consume model attempts but are not API retries.
+    used_scoring_parse_retries: cumulative scoring parse re-asks,
+      including the count restored with the director's state.
     wall_time_seconds: wall time of the playing phase.
     step_durations: elapsed seconds between consecutive saved steps.
     token_usage: always None; token counts are unavailable.
@@ -165,6 +178,10 @@ class RunResult:
   error_message: str | None
   attempts_used_this_process: int
   used_model_attempts: int
+  api_retries_used_this_process: int
+  used_api_retries: int
+  scoring_parse_retries_used_this_process: int
+  used_scoring_parse_retries: int
   wall_time_seconds: float
   step_durations: list[float]
   token_usage: None
@@ -207,23 +224,62 @@ def make_example_beats() -> tuple[drama_director.Beat, ...]:
       ),
       drama_director.Beat(
           id='b3',
-          description='摊牌时刻：关键事实被揭示，有人面临不得不当场回应的压力',
+          description=(
+              '摊牌时刻：已有来源的关键事实通过角色自己的发言或合法环境事件公开，'
+              '相关角色可自主回应；不要求任何角色认罪或违反底线'
+          ),
           tension_range=(7, 9),
-          done_question='是否已有角色不得不面对被揭示的关键事实并作出回应？',
+          done_question=(
+              '仅按公开且已发生的事件判断，是否已有来源的关键事实被明确披露，'
+              '并由相关角色在自己的发言中作出具体回应？'
+              '私密设定、未拆阅的信件、未公开的录音、指控与核验请求本身都不算事实揭示。'
+          ),
           min_turns=3,
           max_turns=10,
       ),
-      drama_director.Beat(
-          id='b4',
-          description=(
-              '走向结局：争执朝某个允许的结局方向收束（真相大白、秘密'
-              '永埋、坦白和解或僵局散场之一）'
-          ),
-          tension_range=(4, 6),
-          done_question='故事的结局走向是否已经清晰并开始收束？',
-          min_turns=2,
-          max_turns=8,
+      make_final_beat(story_config.make_example_config().allowed_endings),
+  )
+
+
+def make_final_beat(
+    allowed_endings: Sequence[str],
+    *,
+    beat_id: str = 'b4',
+) -> drama_director.Beat:
+  """Builds the closing beat from a story's allowed ending range.
+
+  The description and the completion question are constructed from the
+  endings the story may reach, so both the game master's resolutions and
+  the last beat's completion judgment are conditioned on this story's
+  ending range instead of a fixed catalogue. The completion question
+  keeps the "judge only by events that actually happened" constraint of
+  the P1 prompt (spec section 4.3).
+
+  Args:
+    allowed_endings: the endings the enactment may reach.
+    beat_id: stable identifier of the closing beat.
+
+  Returns:
+    The final beat of a story's outline.
+
+  Raises:
+    ValueError: if ``allowed_endings`` is empty.
+  """
+  if not allowed_endings:
+    raise ValueError('a story must allow at least one ending.')
+  endings = '；'.join(f'「{ending}」' for ending in allowed_endings)
+  return drama_director.Beat(
+      id=beat_id,
+      description=f'结局成立：下列允许结局之一的具体条件已经公开发生：{endings}',
+      tension_range=(4, 6),
+      done_question=(
+          '仅按已发生的事件判断，下列允许结局之一的全部具体条件是否已经公开成立：'
+          f'{endings}？不能把朝某方向发展、提出核验或封存、计划离开、'
+          '暂缓争执当作结局成立。涉及同意、承诺或协商的条件必须有相应角色'
+          '自己的明确发言支持；GM不能代替角色决定。若条件仍待落实，回答否。'
       ),
+      min_turns=2,
+      max_turns=8,
   )
 
 
@@ -292,11 +348,47 @@ def make_gm_params(story: story_config.StoryConfig) -> dict[str, Any]:
       if character.secret
   )
   constraints += (
+      (
+          '裁决者知道秘密不等于角色知道。私隐和仅裁决者可知事实不得直接广播；'
+          '只有角色自己的合法披露或有既定来源的公开证据才能增加共同知识。'
+      ),
+      (
+          '所有玩家角色自主决定自己的认罪、承诺、交付物证、签字和秘密披露；'
+          '裁决者不得代替任何玩家作这些选择，也不得将请求、指控、计划、'
+          '谎言或他人的陈述直接当作已经发生的行动或客观真相。'
+      ),
       '环境事件只能从以下选项中选择：'
       + '；'.join(story.allowed_environment_events),
   )
+  constraints += tuple(
+      f'角色底线（始终有效）：{character.name}：{character.hard_constraint}'
+      for character in story.characters
+  )
+  # The allowed ending range is game-master-only context (acceptance F3):
+  # it conditions resolutions and the closing beat's judgment here and in
+  # the run config's beat dictionaries, but never enters scene premises
+  # or the broadcast queue, so characters receive no ending guidance.
+  constraints += (
+      '剧情结局只能收束为以下方向之一，不得引入范围外的结局：'
+      + '；'.join(story.allowed_endings),
+  )
   return {
       'name': _GM_NAME,
+      'public_facts': [
+          story.conflict_start,
+          *story.world_facts,
+          *(
+              f'{character.name}：{fact}'
+              for character in story.characters
+              for fact in character.public_facts
+          ),
+      ],
+      'player_names': [character.name for character in story.characters],
+      'character_constraints': {
+          character.name: character.hard_constraint
+          for character in story.characters
+      },
+      'allowed_environment_events': list(story.allowed_environment_events),
       'world_constraints': list(constraints),
       'immutable_facts': list(story.immutable_facts),
   }
@@ -315,6 +407,39 @@ def _public_model_identity(
   identity.setdefault('api_type', 'stub')
   identity.setdefault('model_name', 'prompt_stub')
   return identity
+
+
+def _actual_model_identity(
+    model_config: Mapping[str, Any] | None,
+    *,
+    disable_language_model: bool,
+) -> dict[str, Any]:
+  """Returns the secret-free identity of the model actually in effect.
+
+  A first run may receive a run config built without a model config
+  (the README's standard call passes the live model as the
+  ``model_config`` argument of ``run`` instead), and
+  ``disable_language_model`` replaces either with the deterministic
+  prompt stub. The identity of the normalized run config therefore
+  follows what ``make_language_model`` actually builds, so checkpoints
+  and summaries archive the provider really in use.
+
+  Args:
+    model_config: the effective model config of the invocation.
+    disable_language_model: whether the deterministic stub is forced.
+
+  Returns:
+    The secret-free model identity: the effective config's identity for
+    a live provider, or the canonical stub identity (plus any stub
+    parameters) when the prompt stub is in effect.
+  """
+  config = dict(model_config or {})
+  if _uses_stub_model(config, disable_language_model=disable_language_model):
+    identity = {'api_type': 'stub', 'model_name': 'prompt_stub'}
+    if 'prompt_stub' in config:
+      identity['prompt_stub'] = config['prompt_stub']
+    return identity
+  return _public_model_identity(config)
 
 
 def _merge_resume_model_config(
@@ -355,6 +480,7 @@ def _merge_resume_model_config(
 def make_run_config(
     story: story_config.StoryConfig,
     *,
+    beats: Sequence[drama_director.Beat] | None = None,
     total_turn_limit: int = 24,
     total_model_attempt_limit: int = 400,
     mode: str = MODE_BEATS_ONLY,
@@ -362,8 +488,16 @@ def make_run_config(
 ) -> dict[str, Any]:
   """Builds the JSON-safe run config of one story enactment.
 
+  The beats travel explicitly (acceptance F1): every non-default story
+  must pass its own beat sequence, matched to its conflict, evidence and
+  allowed endings — the acceptance scenarios provide such factories in
+  ``acceptance.py``. ``beats=None`` keeps the default outline of the
+  appendix-C estate-dispute example, which matches that story only.
+
   Args:
     story: the story to enact.
+    beats: the beat outline of the story; None uses the default
+      estate-dispute example beats.
     total_turn_limit: original total story-turn budget.
     total_model_attempt_limit: original total model-attempt budget.
     mode: stage switch; one of ``MODES``.
@@ -384,6 +518,7 @@ def make_run_config(
   problems = story_config.validate(story)
   if problems:
     raise ValueError('invalid story configuration: ' + '; '.join(problems))
+  outline = tuple(beats) if beats is not None else make_example_beats()
   if mode == MODE_BEATS_ONLY:
     director_params = dict(_BEATS_ONLY_DIRECTOR_PARAMS)
   elif mode == MODE_TENSION_OBSERVE:
@@ -423,7 +558,7 @@ def make_run_config(
       'schema_version': RUN_CONFIG_SCHEMA,
       'story': story.to_dict(),
       'scene_dicts': [story_scene.scene_to_dict(scene)],
-      'beat_dicts': [beat.to_dict() for beat in make_example_beats()],
+      'beat_dicts': [beat.to_dict() for beat in outline],
       'entity_params': entity_params,
       'gm_params': make_gm_params(story),
       'total_turn_limit': total_turn_limit,
@@ -557,18 +692,24 @@ def build_simulation(
     embedder: Callable[[str], np.ndarray],
     used_attempts: int = 0,
     retryable_exceptions: Sequence[type[Exception]] = (),
+    used_api_retries: int = 0,
 ) -> tuple[
     simulation_lib.Simulation,
     drama_director.DramaDirector,
     budget_wrapper.BudgetGuardLanguageModel,
+    retry_stats_wrapper.RetryStatsLanguageModel,
 ]:
   """Builds the simulation with the shared budget and retry wrapper chain.
 
-  Every entity and the game master share one chain,
-  ``RetryLanguageModel(BudgetGuard(provider_model))``, so each retry
-  passes the budget check. The guard uses the ORIGINAL total attempt
-  limit of the run config and the given used count. Building performs
-  no model calls.
+  Every entity and the game master share one chain assembled by the
+  retry-statistics wrapper around the budget guard,
+  ``RetryStats(guard)``, so each retry passes the budget check, each
+  logical request's attempts are attributed to that request alone, and
+  the retry counter sees every logical request. The guard uses the
+  ORIGINAL total attempt limit of the run config and the given used
+  count; the retry-statistics wrapper is seeded with
+  ``used_api_retries`` (e.g. restored from a checkpoint envelope).
+  Building performs no model calls.
 
   Args:
     run_config: the run's saved configuration dictionary.
@@ -578,9 +719,12 @@ def build_simulation(
       checkpoint envelope.
     retryable_exceptions: transient API exception whitelist; broad
       bases and budget errors are rejected.
+    used_api_retries: cumulative API retries already accounted for,
+      e.g. restored from a checkpoint envelope.
 
   Returns:
-    The simulation, its drama director, and the budget guard.
+    The simulation, its drama director, the budget guard, and the
+    retry-statistics wrapper.
 
   Raises:
     ValueError: if the retry whitelist is broad or catches budget
@@ -592,15 +736,13 @@ def build_simulation(
       total_attempt_limit=run_config['total_model_attempt_limit'],
       used_attempts=used_attempts,
   )
-  wrapped = retry_wrapper.RetryLanguageModel(
+  retry_stats = retry_stats_wrapper.RetryStatsLanguageModel(
       guard,
       retry_on_exceptions=tuple(retryable_exceptions),
+      used_retries=used_api_retries,
       # Zero-delay retries keep deterministic tests fast; production
       # runs may prefer backoff, which does not change the contract.
-      retry_tries=3,
       retry_delay=0.0,
-      jitter=(0.0, 0.0),
-      exponential_backoff=False,
   )
   instances = [
       prefab_lib.InstanceConfig(
@@ -637,14 +779,14 @@ def build_simulation(
   )
   simulation = simulation_lib.Simulation(
       config=config,
-      model=wrapped,
+      model=retry_stats,
       embedder=embedder,
   )
   director = simulation.game_masters[0].get_component(
       drama_director.DEFAULT_DRAMA_DIRECTOR_COMPONENT_KEY,
       type_=drama_director.DramaDirector,
   )
-  return simulation, director, guard
+  return simulation, director, guard, retry_stats
 
 
 class _CheckpointAdapter:
@@ -702,6 +844,11 @@ def _load_envelope(checkpoint_path: str) -> dict[str, Any]:
   turn_limit = envelope['total_turn_limit']
   if not 0 <= used <= attempt_limit:
     raise ValueError(f'envelope attempt budget out of range: {used}.')
+  if not 0 <= envelope.get('used_api_retries', 0) <= used:
+    raise ValueError(
+        'envelope API retry count out of range:'
+        f" {envelope.get('used_api_retries')}."
+    )
   if not 0 <= committed <= turn_limit:
     raise ValueError(f'envelope committed turn id out of range: {committed}.')
   return envelope
@@ -799,7 +946,7 @@ def _write_outputs(
     turn_log: collector.StoryTurnLog,
     committed_turn_id: int,
 ) -> None:
-  """Writes summary.json and the two script exports.
+  """Writes summary.json and the FDX, Fountain and plain-text exports.
 
   Only story turns confirmed by the latest full checkpoint are
   rendered; an uncommitted tail never reaches the exports.
@@ -834,6 +981,10 @@ def _write_outputs(
       'location': story['location'],
       'time_label': story['time_label'],
   }
+  collector._atomic_write_text(  # pylint: disable=protected-access
+      os.path.join(state_dir, 'script.fdx'),
+      renderer.render_fdx(records, scene_display),
+  )
   collector._atomic_write_text(  # pylint: disable=protected-access
       os.path.join(state_dir, 'script.fountain'),
       renderer.render_fountain(records, scene_display),
@@ -878,9 +1029,15 @@ def run(
       RelationshipsToOthers view on every character, with the acting
       character's emotion collected into the story turns.
     model_config: identity of a live model (api_type, model_name,
-      api_key); a first run without it uses the prompt stub. On resume
-      the identity must match the checkpoint and only the api_key
-      carries over.
+      api_key); a first run without it uses the prompt stub. On a first
+      run the model actually in effect defines the archived identity:
+      the run config used for building, saving and summarizing is
+      normalized to it, with the API key stripped — so the README's
+      standard call (a run config built without a model config plus a
+      live ``model_config`` here) records the live provider, and
+      ``disable_language_model`` records the stub actually used. On
+      resume the identity must match the checkpoint and only the
+      api_key carries over.
     run_config: optional prebuilt run config for a first run (used by
       tests and higher-level drivers); when given, its limits and mode
       are authoritative and the limit/mode parameters are ignored.
@@ -902,8 +1059,10 @@ def run(
   )
 
   used_at_start = 0
+  api_retries_at_start = 0
   committed_start = 0
   saved_state: dict[str, Any] = {}
+  config: dict[str, Any]
   if resume:
     envelope = _load_envelope(checkpoint_path)
     config = envelope['run_config']
@@ -926,6 +1085,7 @@ def run(
     )
     _reject_budget_exhausted_summary(summary_path)
     used_at_start = envelope['used_model_attempts']
+    api_retries_at_start = envelope.get('used_api_retries', 0)
     committed_start = envelope['committed_turn_id']
     saved_state = envelope['simulation_state']
   else:
@@ -944,7 +1104,7 @@ def run(
     else:
       # A supplied run config is authoritative; the limit and mode
       # parameters of this call are ignored on a first run.
-      config = run_config
+      config = dict(run_config)
 
   if resume:
     # The checkpointed identity is authoritative; only this invocation's
@@ -963,12 +1123,27 @@ def run(
   embedder = _make_embedder(
       effective_model_config, disable_language_model=disable_language_model
   )
-  simulation, director, guard = build_simulation(
+  if not resume:
+    # The effective model — not the possibly stub-defaulted run config
+    # — defines the archived identity: the README's standard call passes
+    # the live model to ``run`` while building the run config without
+    # it. Normalize the config used for building, saving and
+    # summarizing so checkpoints record the provider actually in use,
+    # with the API key stripped.
+    config = {
+        **config,
+        'model_config': _actual_model_identity(
+            effective_model_config,
+            disable_language_model=disable_language_model,
+        ),
+    }
+  simulation, director, guard, retry_stats = build_simulation(
       run_config=config,
       model=provider,
       embedder=embedder,
       used_attempts=used_at_start,
       retryable_exceptions=retryable,
+      used_api_retries=api_retries_at_start,
   )
   # The collector serializes the whole envelope, so checkpoint data
   # must be JSON-safe (see _CheckpointAdapter).
@@ -1026,6 +1201,7 @@ def run(
     collector._save_checkpoint(  # pylint: disable=protected-access
         simulation=checkpoint_source,
         budget_guard=guard,
+        retry_stats=retry_stats,
         checkpoint_path=checkpoint_path,
         run_config=config,
         committed_turn_id=0,
@@ -1033,6 +1209,18 @@ def run(
         total_model_attempt_limit=attempt_limit,
     )
     max_steps = turn_limit
+  # The scoring-parse-retry baseline is read only after component state
+  # is restored (a fresh director still holds zero), so the per-process
+  # metric never counts scoring re-asks of previous processes.
+  director_state: Mapping[str, Any] = director.get_state()
+  parse_retries_at_start = int(director_state.get('scoring_parse_retries', 0))
+
+  provenance.archive_invocation(
+      state_dir,
+      run_config=config,
+      committed_turn_id=committed_start,
+      resume=resume,
+  )
 
   base_callback = collector.make_step_callback(
       simulation=checkpoint_source,
@@ -1046,6 +1234,7 @@ def run(
       # Only character_depth registers EmotionalStance on the entities,
       # so only that mode collects the acting character's emotion.
       emotion_enabled=config['mode'] == MODE_CHARACTER_DEPTH,
+      retry_stats=retry_stats,
   )
   step_marks: list[float] = []
 
@@ -1077,7 +1266,8 @@ def run(
   )
   if committed is None:
     committed = 0
-  director_budget_stopped = director.get_state()['budget_stopped']
+  final_director_state: Mapping[str, Any] = director.get_state()
+  director_budget_stopped = final_director_state['budget_stopped']
   if director_budget_stopped and budget_error is None:
     budget_error = (
         'post-resolution budget stop after committed turn '
@@ -1090,6 +1280,9 @@ def run(
       committed,
       turn_limit,
   )
+  used_scoring_parse_retries = int(
+      final_director_state['scoring_parse_retries']
+  )
   result = RunResult(
       reason=reason,
       committed_turn_id=committed,
@@ -1098,6 +1291,14 @@ def run(
       error_message=error_message,
       attempts_used_this_process=guard.used_attempts - used_at_start,
       used_model_attempts=guard.used_attempts,
+      api_retries_used_this_process=(
+          retry_stats.used_retries - api_retries_at_start
+      ),
+      used_api_retries=retry_stats.used_retries,
+      scoring_parse_retries_used_this_process=(
+          used_scoring_parse_retries - parse_retries_at_start
+      ),
+      used_scoring_parse_retries=used_scoring_parse_retries,
       wall_time_seconds=wall_time,
       step_durations=_step_durations(step_marks, play_start),
       token_usage=None,

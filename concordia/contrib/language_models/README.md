@@ -54,6 +54,38 @@ the story-enactment example).
 
 --------------------------------------------------------------------------------
 
+## The Retry Stats Wrapper
+
+`retry_stats_wrapper.py` provides `RetryStatsLanguageModel`, a wrapper that
+counts API retries for cost records (spec section 13.3 of the story-enactment
+design).
+
+-   **Position in the chain:** it is constructed around the budget guard and
+    assembles the chain itself —
+    `RetryLanguageModel` over a per-request attempt recorder over
+    `BudgetGuardLanguageModel(provider_model)` — so the recording layer
+    cannot be misassembled. The recorder counts the attempts of the
+    logical request executing on the calling thread (tenacity retries
+    are synchronous, so they stay on that thread); a request that made
+    `n >= 1` provider attempts initiated exactly `n - 1` API retries.
+    Because attribution is thread-local, concurrent logical requests
+    sharing one guard never count each other's attempts.
+
+-   **Metric contract:** a request succeeding on its first attempt counts
+    zero retries; one failure followed by success counts one; a request
+    exhausting three attempts counts two. Requests blocked by the budget
+    before any attempt — and retries the budget blocks before they reach
+    the provider — never count. Output-parse re-asks (for example, the
+    second tension-scoring call after an unparseable answer) are new
+    logical requests, not API retries, and are tracked separately by the
+    component that issues them.
+
+-   **Checkpoint resume:** `used_retries` is cumulative and
+    `restore(used_retries)` seeds it from the run's checkpoint envelope,
+    mirroring the guard's `restore`.
+
+--------------------------------------------------------------------------------
+
 ## How to Contribute
 
 We welcome and encourage pull requests that add new language model wrappers or

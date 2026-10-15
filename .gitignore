@@ -23,3 +23,13 @@ __pycache__/
 
 # Test cache
 .pytest_cache
+
+# Secrets and environment variables.
+.env
+
+# Local agent instructions and planning docs.
+AGENTS.md
+docs/
+
+# Local run outputs.
+run_results/

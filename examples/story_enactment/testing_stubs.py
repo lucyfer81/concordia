@@ -45,6 +45,9 @@ _SPEAKER_IN_CALL = re.compile(r'根据你已知的信息，(.+?) 现在说什么
 # Fingerprints and field patterns of the dual-track resolution prompt
 # built by `concordia.contrib.components.game_master.story_resolution`.
 _DUAL_TRACK_MARK = 'Output a JSON object with exactly two string fields'
+_REVIEW_MARK = (
+    'Evaluate all rules above. Output only a JSON object with exactly'
+)
 _CURRENT_SPEAKER = re.compile(r'## Current speaker\n(.+)')
 _ORIGINAL_SPEECH = re.compile(r'## Original speech \(verbatim\)\n(.*)')
 
@@ -101,6 +104,7 @@ class PromptStubModel(language_model.LanguageModel):
       choice_answer: str = 'No',
       completion_answers: Mapping[str, str] | None = None,
       fail_choice_calls_from: int | None = None,
+      review_response: str = '{"valid": true, "reason": "scripted approval"}',
   ) -> None:
     """Initializes the stub.
 
@@ -118,6 +122,8 @@ class PromptStubModel(language_model.LanguageModel):
       fail_choice_calls_from: 0-based index from which every
         `sample_choice` call raises `TransientAPIError`, letting tests
         exercise API retry exhaustion.
+      review_response: scripted JSON returned for semantic reviews. This
+        exercises review plumbing only, never real semantic correctness.
     """
     self._dialogue_lines = dict(dialogue_lines or {})
     self._default_line = default_line
@@ -125,6 +131,7 @@ class PromptStubModel(language_model.LanguageModel):
     self._choice_answer = choice_answer
     self._completion_answers = dict(completion_answers or {})
     self._fail_choice_calls_from = fail_choice_calls_from
+    self._review_response = review_response
     self._choice_calls = 0
     self.text_prompts: list[str] = []
     self.choice_prompts: list[str] = []
@@ -199,6 +206,8 @@ class PromptStubModel(language_model.LanguageModel):
     block = _last_question_block(prompt)
     if not block:
       return self._default_line
+    if _REVIEW_MARK in block:
+      return self._review_response
     if _DUAL_TRACK_MARK in block:
       return self._dual_track_output(block)
     if _SPEECH_CALL_MARK in block:
@@ -220,6 +229,8 @@ class PromptStubModel(language_model.LanguageModel):
       resolved = f'{speaker} 沉默片刻。'
     else:
       resolved = f'{speaker}: {speech}'
+    if self._stage_directions:
+      resolved += '\n' + self._stage_directions
     return json.dumps(
         {
             'resolved_event': resolved,

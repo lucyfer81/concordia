@@ -112,6 +112,31 @@ def _join(values: Sequence[str]) -> str:
   return '; '.join(values) if values else '(none)'
 
 
+def _public_history(director: drama_director.DramaDirector) -> str:
+  """Returns committed public history, never the current candidate."""
+  return '\n'.join(director.get_committed_events()) or '(none)'
+
+
+def _private_boundaries(director: drama_director.DramaDirector) -> str:
+  """Formats GM-only constraints, without treating secrets as public."""
+  return _join([
+      *(
+          f'{name}: {rule}'
+          for name, rule in director.character_constraints.items()
+      ),
+      *director.world_constraints,
+  ])
+
+
+_AGENCY_AND_NOVELTY = (
+    'Never make players agree, confess, disclose secrets, sign, hand over'
+    ' evidence or comply with commands. Never change their goals or positions'
+    ' to lower tension. Allowed means are permissions, not evidence: do not'
+    ' repeat an environmental event already established in the public history.'
+    ' A proposed command or accusation does not establish its outcome.'
+)
+
+
 def _complication_question(
     directive_content: str,
     director: drama_director.DramaDirector,
@@ -128,9 +153,14 @@ def _complication_question(
   return (
       'Suggest five plausible in-story complications that fulfill this '
       f'director instruction: "{directive_content}". One per line, no '
-      'numbering.\n'
+      'numbering. Return fewer than five if fewer are legal; if none is legal,'
+      ' return an empty response.\n'
       'Only NPC or environmental events; never assume any player '
       'character voluntarily does anything.\n'
+      f'{_AGENCY_AND_NOVELTY}\n'
+      'GM-only boundaries (never disclose these): '
+      f'{_private_boundaries(director)}\n'
+      f'## Committed public history\n{_public_history(director)}\n'
       f'Allowed means: {_join(director.allowed_environment_events)}\n'
       f'Immutable facts: {_join(director.immutable_facts)}\n'
       'Player characters whose voluntary actions you cannot decide: '
@@ -162,9 +192,11 @@ def _merge_question(
       " event and the complication into one event.\nPreserve the player's"
       ' dialogue verbatim. Do not add any voluntary action\nfor any player'
       ' character. Do not contradict immutable facts.\nImmutable facts:'
-      f' {_join(director.immutable_facts)}\nAllowed means for new events:'
-      f' {_join(director.allowed_environment_events)}\nPlayer characters whose'
-      ' voluntary actions you cannot decide:'
+      f' {_join(director.immutable_facts)}\n{_AGENCY_AND_NOVELTY}\nGM-only'
+      f' boundaries (never disclose these): {_private_boundaries(director)}\n##'
+      f' Committed public history\n{_public_history(director)}\nAllowed means'
+      f' for new events: {_join(director.allowed_environment_events)}\nPlayer'
+      ' characters whose voluntary actions you cannot decide:'
       f' {", ".join(director.player_names) if director.player_names else "(none)"}\n\n##'
       ' Output\nWrite the single merged event and nothing else.'
   )

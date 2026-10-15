@@ -31,6 +31,15 @@ by the event-resolution chain carries the reserved `Event: ` prefix
 (that chain's pre-act label). Public premises and ordinary background
 observations never use the reserved prefix, so they cannot inflate the
 refresh cursor.
+
+The story game masters queue their items through
+`concordia.contrib.components.game_master.observation_queue`, which
+boundary-encodes every item so an event that itself contains a triple
+newline (a multi-paragraph event, or a paragraph that even starts with
+`Event: `) survives the join unchanged. This component decodes the
+observation with the matching decoder before identifying event blocks,
+so the stored window holds complete events: the evidence that changes a
+relationship is never truncated to the event's first paragraph.
 """
 
 from collections.abc import Sequence
@@ -38,14 +47,12 @@ from typing import override
 
 from concordia.components.agent import action_spec_ignored
 from concordia.components.game_master import event_resolution as event_resolution_lib
+from concordia.contrib.components.game_master import observation_queue
 from concordia.document import interactive_document
 from concordia.language_model import language_model
 from concordia.typing import entity_component
 
 DEFAULT_RELATIONSHIPS_PRE_ACT_LABEL = 'Relationships to others'
-
-# Separator the observation queue uses between consecutive items.
-_OBSERVATION_SEPARATOR = '\n\n\n'
 
 # Reserved prefix of adjudicated-event blocks, reused from the event
 # resolution chain's pre-act label (plan appendix D-4).
@@ -116,18 +123,14 @@ class RelationshipsToOthers(
       self,
       observation: str,
   ) -> str:
-    # Split the observation queue's output into its blocks and keep
-    # only complete adjudicated-event blocks: the reserved prefix is
-    # the resolution chain's, and premises never use it. Queued events
-    # end with a newline of their own, so blocks after the first start
-    # with a leftover newline where that newline meets the separator;
-    # stripping the separator artifacts recovers the event blocks.
+    # Decode the observation queue's boundary encoding first, so an event
+    # that itself contains a triple newline is restored whole before the
+    # reserved-prefix filter runs; only complete adjudicated-event blocks
+    # count. Premises and ordinary background never use the prefix.
     self._pending_batch = [
-        block
-        for block in (
-            raw.strip() for raw in observation.split(_OBSERVATION_SEPARATOR)
-        )
-        if block.startswith(_EVENT_BLOCK_PREFIX)
+        item
+        for item in observation_queue.decode_observation(observation)
+        if item.startswith(_EVENT_BLOCK_PREFIX)
     ]
     return ''
 
