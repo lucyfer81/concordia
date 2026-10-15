@@ -32,6 +32,13 @@ Element mapping (spec §10):
   the export option ``show_emotion`` is disabled or the label is empty;
 - action: the turn's ``stage_directions`` when non-empty.
 
+A turn whose decoded ``speech`` is empty (an adjudicated action-only
+turn of schema 2) contributes only its Action narration: no character
+cue, no empty dialogue and no invented placeholder such as “沉默片刻”.
+Narration comes only from ``stage_directions``; the unexecuted
+``action_intent`` and the raw action JSON never enter any script, and
+legacy records missing the new fields render unchanged (spec §9).
+
 Fountain rules (spec §8, following fountain.io syntax): scene headings
 carry the uppercase ``INT.``/``EXT.`` prefix; CJK character names are not
 valid native character cues, so every character cue is forced with a
@@ -220,7 +227,9 @@ def render_fdx(
   parentheses, backslashes, markup, spaces and line breaks remain text.
   Only an enabled emotion produces a Parenthetical paragraph. Narration
   comes from stage_directions, never resolved_event, to avoid repeating
-  dialogue. This function performs no file IO or model calls.
+  dialogue. A turn with empty speech emits only its Action paragraph
+  (no Character, Parenthetical or Dialogue). This function performs no
+  file IO or model calls.
 
   Args:
     turns: story turn records in enactment order.
@@ -232,11 +241,12 @@ def render_fdx(
   """
   elements = [('Scene Heading', _scene_heading(scene_display))]
   for turn in turns:
-    elements.append(('Character', turn['actor']))
-    emotion = _emotion(turn, show_emotion)
-    if emotion is not None:
-      elements.append(('Parenthetical', f'({emotion})'))
-    elements.append(('Dialogue', turn['speech']))
+    if turn['speech']:
+      elements.append(('Character', turn['actor']))
+      emotion = _emotion(turn, show_emotion)
+      if emotion is not None:
+        elements.append(('Parenthetical', f'({emotion})'))
+      elements.append(('Dialogue', turn['speech']))
     if turn['stage_directions']:
       elements.append(('Action', turn['stage_directions']))
 
@@ -264,7 +274,8 @@ def render_fountain(
   as one dialogue block (forced ``@`` character cue, optional
   parenthetical emotion line, dialogue body with paragraph breaks
   normalized to line breaks) followed by an action block when
-  ``stage_directions`` is non-empty.
+  ``stage_directions`` is non-empty. A turn with empty speech emits
+  only its action block, without a character cue.
 
   Args:
     turns: story turn records in enactment order (spec §7 fields).
@@ -277,12 +288,13 @@ def render_fountain(
   """
   elements = [_scene_heading(scene_display)]
   for turn in turns:
-    lines = ['@' + turn['actor']]
-    emotion = _emotion(turn, show_emotion)
-    if emotion is not None:
-      lines.append(f'({emotion})')
-    lines.append(_encode_dialogue(turn['speech']))
-    elements.append('\n'.join(lines))
+    if turn['speech']:
+      lines = ['@' + turn['actor']]
+      emotion = _emotion(turn, show_emotion)
+      if emotion is not None:
+        lines.append(f'({emotion})')
+      lines.append(_encode_dialogue(turn['speech']))
+      elements.append('\n'.join(lines))
     if turn['stage_directions']:
       elements.append(_encode_action(turn['stage_directions']))
   return '\n\n'.join(elements) + '\n'
@@ -299,7 +311,8 @@ def render_plain_text(
   The layout mirrors ``render_fountain``: the scene heading once at the
   top, then per turn an ``角色（情绪）：对白`` line (full-width
   parentheses) and, when non-empty, a stage-directions line, each block
-  separated by a blank line.
+  separated by a blank line. A turn with empty speech omits the speaker
+  line and keeps only its stage-directions line.
 
   Args:
     turns: story turn records in enactment order (spec §7 fields).
@@ -313,11 +326,12 @@ def render_plain_text(
   """
   elements = [_scene_heading(scene_display)]
   for turn in turns:
-    emotion = _emotion(turn, show_emotion)
-    if emotion is not None:
-      elements.append(f'{turn["actor"]}（{emotion}）：{turn["speech"]}')
-    else:
-      elements.append(f'{turn["actor"]}：{turn["speech"]}')
+    if turn['speech']:
+      emotion = _emotion(turn, show_emotion)
+      if emotion is not None:
+        elements.append(f'{turn["actor"]}（{emotion}）：{turn["speech"]}')
+      else:
+        elements.append(f'{turn["actor"]}：{turn["speech"]}')
     if turn['stage_directions']:
       elements.append(turn['stage_directions'])
   return '\n\n'.join(elements) + '\n'

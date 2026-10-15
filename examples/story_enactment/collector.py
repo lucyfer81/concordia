@@ -24,7 +24,13 @@ dies after the turn file was written but before the checkpoint was saved, a
 retry of the callback completes the checkpoint without duplicating turns.
 
 The callback performs no language model calls; it only moves data between
-the simulation objects and files on disk.
+the simulation objects and files on disk. Story turns of schema 2 carry
+the raw action (the character's JSON object in ``speech_and_action``
+mode) next to the codec-decoded speech and action intent; the callback
+checks the engine's step action against the recorded raw action and,
+in ``speech_and_action`` mode, re-validates the decoded fields with the
+shared codec. Schema-1 turns are read with pure-speech defaults and are
+never rewritten (spec section 9).
 """
 
 from collections.abc import Callable, Mapping
@@ -34,6 +40,7 @@ import os
 import tempfile
 from typing import Any
 
+from concordia.contrib.components.game_master import story_action
 from concordia.contrib.prefabs.entity import story_character
 from concordia.environment import step_controller as step_controller_lib
 
@@ -293,6 +300,7 @@ def make_step_callback(
     total_model_attempt_limit: int,
     emotion_enabled: bool,
     retry_stats: Any = None,
+    action_mode: str = story_action.ACTION_MODE_SPEECH_ONLY,
 ) -> StepCallback:
   """Builds the step callback that collects and saves story turns.
 
@@ -317,10 +325,18 @@ def make_step_callback(
     emotion_enabled: whether emotional stance collection is enabled.
     retry_stats: the retry-statistics wrapper whose cumulative count is
       persisted in the envelope; optional for callers without it.
+    action_mode: the run's action contract; in ``speech_and_action``
+      mode the collected raw action is the strict JSON object decoded
+      by the shared codec, in ``speech_only`` mode it is the pure
+      speech text (spec section 8).
+
+  Raises:
+    ValueError: if ``action_mode`` does not name a known action mode.
 
   Returns:
     The step callback to pass to ``Simulation.play``.
   """
+  story_action.validate_action_mode(action_mode)
 
   def step_callback(step_data: step_controller_lib.StepData) -> None:
     turn = drama_director.get_last_story_turn()
@@ -333,13 +349,32 @@ def make_step_callback(
           f'story turn actor {actor!r} does not match the acting entity'
           f' {step_data.acting_entity!r}.'
       )
-    # The engine prefixes the action with the speaker's name exactly once;
-    # stripping it once must recover the director's recorded speech.
-    if turn['speech'] != step_data.action.removeprefix(f'{actor}: '):
+    # Schema-2 turns record the raw action (the character's JSON object
+    # in speech_and_action mode) next to the decoded speech and intent;
+    # schema-1 turns predate the split, so reading falls back to the
+    # pure speech with an empty intent (spec section 9). These read
+    # defaults never rewrite history files or committed events.
+    raw_action = turn.get('raw_action', turn['speech'])
+    action_intent = turn.get('action_intent', '')
+    # The engine prefixes the action with the speaker's name exactly
+    # once; stripping it once must recover the director's recorded raw
+    # action. The step action is compared against raw_action, never
+    # against the decoded speech (spec section 9).
+    if raw_action != step_data.action.removeprefix(f'{actor}: '):
       raise ValueError(
-          f'story turn speech {turn["speech"]!r} does not match the step'
+          f'story turn raw action {raw_action!r} does not match the step'
           f' action {step_data.action!r} stripped of its speaker prefix.'
       )
+    if action_mode == story_action.ACTION_MODE_SPEECH_AND_ACTION:
+      # The record's decoded fields must be exactly what the shared
+      # codec decodes from the recorded raw action; the collector keeps
+      # no second, more lenient parser of the action contract.
+      speech, intent = story_action.decode_action(raw_action)
+      if speech != turn['speech'] or intent != action_intent:
+        raise ValueError(
+            'story turn speech/action_intent do not match the codec'
+            f' decoding of the raw action {raw_action!r}.'
+        )
 
     record = {
         'turn_id': turn['turn_id'],
@@ -358,6 +393,12 @@ def make_step_callback(
     # Older directors/checkpoints omit this optional field.
     if 'director_diagnostics' in turn:
       record['director_diagnostics'] = turn['director_diagnostics']
+    # Schema-2 turns archive the action contract verbatim; schema-1
+    # turns keep their original record shape (read defaults only).
+    if 'schema_version' in turn:
+      record['schema_version'] = turn['schema_version']
+      record['raw_action'] = raw_action
+      record['action_intent'] = action_intent
     turn_log.append(record)
 
     committed = _read_committed_turn_id(checkpoint_path)

@@ -334,6 +334,133 @@ class StepCallbackTest(unittest.TestCase):
       callback(self.harness.step_data())
 
 
+class ActionRecordTest(unittest.TestCase):
+  """Schema-2 collection of raw actions and their decoded fields."""
+
+  def setUp(self):
+    super().setUp()
+    self.tmpdir = self.enterContext(tempfile.TemporaryDirectory())
+
+  def test_json_action_is_compared_to_raw_action(self):
+    intent = '悄悄记下保险柜钥匙的位置。'
+    raw_action = json.dumps(
+        {'speech': _SPEECH, 'action_intent': intent}, ensure_ascii=False
+    )
+    harness = _Harness(
+        self.tmpdir,
+        _make_turn(
+            schema_version=2, raw_action=raw_action, action_intent=intent
+        ),
+    )
+    callback = harness.callback(action_mode='speech_and_action')
+    # Consistent: the engine echoes the director's raw JSON verbatim
+    # after the speaker prefix, so the turn commits.
+    callback(harness.step_data(action=f'{_ACTOR}: {raw_action}'))
+    self.assertEqual(harness.read_checkpoint()['committed_turn_id'], 1)
+    self.assertEqual(harness.turn_log.load()[0]['raw_action'], raw_action)
+    # Inconsistent: the decoded speech is not the raw action, and the
+    # collector compares StepData.action against raw_action (never
+    # against the decoded speech), so the step is rejected and the
+    # checkpoint does not advance.
+    harness.director.set_turn(
+        _make_turn(
+            turn_id=2,
+            schema_version=2,
+            raw_action=raw_action,
+            action_intent=intent,
+        )
+    )
+    with self.assertRaises(ValueError):
+      callback(harness.step_data(step=2, action=f'{_ACTOR}: {_SPEECH}'))
+    self.assertEqual([r['turn_id'] for r in harness.turn_log.load()], [1])
+    self.assertEqual(harness.read_checkpoint()['committed_turn_id'], 1)
+
+  def test_decoded_fields_must_match_raw_action(self):
+    speech = '第一段对白，带"引号"和##标记。\n\n第二段对白，一字不改。'
+    intent = '把信悄悄放回抽屉。'
+    raw_action = json.dumps(
+        {'speech': speech, 'action_intent': intent}, ensure_ascii=False
+    )
+    harness = _Harness(
+        self.tmpdir,
+        _make_turn(
+            speech=speech,
+            schema_version=2,
+            raw_action=raw_action,
+            action_intent=intent,
+        ),
+    )
+    callback = harness.callback(action_mode='speech_and_action')
+    callback(harness.step_data(action=f'{_ACTOR}: {raw_action}'))
+    record = harness.turn_log.load()[0]
+    # The archived speech keeps the codec-decoded multi-paragraph text
+    # verbatim, including the blank-line paragraph break.
+    self.assertEqual(record['speech'], speech)
+    self.assertEqual(record['action_intent'], intent)
+    # Tampered speech: raw_action still matches the step, but the
+    # record's speech is no longer what the shared codec decodes from
+    # it, so the turn is rejected and nothing new is written.
+    harness.director.set_turn(
+        _make_turn(
+            turn_id=2,
+            speech=speech.replace('\n\n', ' '),
+            schema_version=2,
+            raw_action=raw_action,
+            action_intent=intent,
+        )
+    )
+    with self.assertRaises(ValueError):
+      callback(harness.step_data(step=2, action=f'{_ACTOR}: {raw_action}'))
+    # Tampered intent: the other decoded field is validated too.
+    harness.director.set_turn(
+        _make_turn(
+            turn_id=2,
+            speech=speech,
+            schema_version=2,
+            raw_action=raw_action,
+            action_intent='无关的意图。',
+        )
+    )
+    with self.assertRaises(ValueError):
+      callback(harness.step_data(step=2, action=f'{_ACTOR}: {raw_action}'))
+    self.assertEqual([r['turn_id'] for r in harness.turn_log.load()], [1])
+    self.assertEqual(harness.read_checkpoint()['committed_turn_id'], 1)
+
+  def test_action_only_turn_commits_once(self):
+    intent = '用铁丝撬开上锁的抽屉。'
+    raw_action = json.dumps(
+        {'speech': '', 'action_intent': intent}, ensure_ascii=False
+    )
+    resolved_event = f'{_ACTOR}撬动抽屉锁，锁舌弹开，抽屉被打开了。'
+    stage_directions = f'{_ACTOR}用铁丝探入锁孔，抽屉应声而开。'
+    harness = _Harness(
+        self.tmpdir,
+        _make_turn(
+            speech='',
+            schema_version=2,
+            raw_action=raw_action,
+            action_intent=intent,
+            resolved_event=resolved_event,
+            stage_directions=stage_directions,
+        ),
+    )
+    callback = harness.callback(action_mode='speech_and_action')
+    callback(harness.step_data(action=f'{_ACTOR}: {raw_action}'))
+    # One adjudicated action is still exactly one story turn with one
+    # commit number; parsing and adjudication add no extra turns.
+    records = harness.turn_log.load()
+    self.assertEqual([r['turn_id'] for r in records], [1])
+    self.assertEqual(harness.read_checkpoint()['committed_turn_id'], 1)
+    self.assertEqual(harness.simulation.make_checkpoint_data.call_count, 1)
+    record = records[0]
+    self.assertEqual(record['speech'], '')
+    self.assertEqual(record['raw_action'], raw_action)
+    self.assertEqual(record['action_intent'], intent)
+    # The approved action result reaches the record unchanged.
+    self.assertEqual(record['resolved_event'], resolved_event)
+    self.assertEqual(record['stage_directions'], stage_directions)
+
+
 class EmotionCollectionTest(unittest.TestCase):
   """Emotion tests driven through a real EmotionalStance component."""
 

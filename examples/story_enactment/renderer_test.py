@@ -20,10 +20,12 @@ the example's compatibility renderer; external Fountain tools may retain
 escape backslashes, so exact interchange uses FDX.
 """
 
+import json
 import os
 import tempfile
 import unittest
 from xml.dom import minidom
+import xml.etree.ElementTree as ET
 
 from examples.story_enactment import acceptance
 from examples.story_enactment import renderer
@@ -142,7 +144,7 @@ class RenderFdxTest(unittest.TestCase):
         (
             paragraph.getAttribute('Type'),
             ''.join(
-                child.data
+                child.data  # pyrefly: ignore[missing-attribute]
                 for child in paragraph.getElementsByTagName('Text')[
                     0
                 ].childNodes
@@ -170,9 +172,14 @@ class RenderFdxTest(unittest.TestCase):
         ],
     )
     document = minidom.parseString(text)
-    self.assertEqual(document.documentElement.tagName, 'FinalDraft')
     self.assertEqual(
-        document.documentElement.getAttribute('DocumentType'), 'Script'
+        document.documentElement.tagName, 'FinalDraft'  # pyrefly: ignore[missing-attribute]
+    )
+    self.assertEqual(
+        document.documentElement.getAttribute(  # pyrefly: ignore[missing-attribute]
+            'DocumentType'
+        ),
+        'Script',
     )
 
   def test_literal_text_and_whitespace_survive_independent_xml_parser(self):
@@ -185,7 +192,9 @@ class RenderFdxTest(unittest.TestCase):
         '<字面标签> & "引号" 与中文、emoji 🎭',
         '  保留首尾空格。 \n\n\t也保留空段和制表符。  ',
         '保留 Windows 换行。\r\n和单独的回车。\r末行。',
-        '',
+        # Empty speech no longer yields a Character cue with an empty
+        # Dialogue paragraph: action-only rendering is asserted by
+        # ActionOnlyRenderingTest instead.
     ):
       with self.subTest(speech=speech):
         turn = _make_turns()[0]
@@ -450,6 +459,168 @@ class RenderPlainTextTest(unittest.TestCase):
     )
     self.assertNotIn('（勉强一笑）', text)
     self.assertIn('陈默：你根本没有打开过那个抽屉。', text.split('\n'))
+
+
+class ActionOnlyRenderingTest(unittest.TestCase):
+  """Empty-speech turns render Action alone; legacy records still render.
+
+  An adjudicated action-only turn (schema 2, decoded ``speech`` empty)
+  must contribute only its Action narration to FDX, Fountain and plain
+  text: no character cue, no empty Dialogue paragraph and no invented
+  placeholder such as “沉默片刻”. Narration comes only from
+  ``stage_directions``; the unexecuted ``action_intent`` and the raw
+  action JSON never enter the script. Legacy records that predate the
+  new fields keep rendering through the classic dialogue mapping.
+  """
+
+  @staticmethod
+  def _paragraphs(text: str) -> list[tuple[str, str]]:
+    """Parses FDX into (Paragraph Type, XML-decoded Text) pairs."""
+    root = ET.fromstring(text.encode('utf-8'))
+    paragraphs = []
+    for paragraph in root.findall('./Content/Paragraph'):
+      element_type = paragraph.get('Type')
+      assert element_type is not None
+      paragraphs.append((element_type, ''.join(paragraph.itertext())))
+    return paragraphs
+
+  @staticmethod
+  def _turn(speech: str, stage_directions: str, action_intent: str) -> dict:
+    """Builds a schema-2 record as the collector would archive it."""
+    return {
+        'turn_id': 1,
+        'scene_id': '故事主线',
+        'schema_version': 2,
+        'actor': '李强',
+        'speech': speech,
+        'raw_action': json.dumps(
+            {'speech': speech, 'action_intent': action_intent},
+            ensure_ascii=False,
+        ),
+        'action_intent': action_intent,
+        'resolved_event': '李强采取了行动。',
+        'stage_directions': stage_directions,
+        'emotion': '紧张',
+        'beat_id_at_action': 'beat_1',
+        'beat_id_after_event': 'beat_1',
+        'tension': None,
+    }
+
+  def _assert_action_only(self, turn: dict, stage_directions: str) -> None:
+    """Asserts all three renderers emit Action alone for the turn."""
+    fdx = renderer.render_fdx([turn], _SCENE_DISPLAY)
+    self.assertEqual(
+        self._paragraphs(fdx),
+        [('Scene Heading', 'INT. 老宅客厅 - 夜'), ('Action', stage_directions)],
+    )
+    fountain = renderer.render_fountain([turn], _SCENE_DISPLAY)
+    self.assertEqual(
+        renderer.parse_fountain(fountain),
+        [
+            ('scene_heading', 'INT. 老宅客厅 - 夜'),
+            ('action', stage_directions),
+        ],
+    )
+    plain = renderer.render_plain_text([turn], _SCENE_DISPLAY)
+    self.assertEqual(
+        plain.split('\n'), ['INT. 老宅客厅 - 夜', '', stage_directions, '']
+    )
+    # The unexecuted intent, the raw JSON and any placeholder for the
+    # missing dialogue never leak into any export; neither does the
+    # emotion label, which has no dialogue to qualify.
+    for text in (fdx, fountain, plain):
+      self.assertNotIn(turn['action_intent'], text)
+      self.assertNotIn(turn['raw_action'], text)
+      self.assertNotIn(turn['emotion'], text)
+      self.assertNotIn('沉默片刻', text)
+
+  def test_successful_action_only_turn_renders_action_alone(self):
+    directions = '李强转动备用钥匙，保险柜应声而开，旧遗嘱躺在最上层。'
+    self._assert_action_only(
+        self._turn('', directions, '用备用钥匙打开保险柜。'), directions
+    )
+
+  def test_blocked_action_only_turn_renders_action_alone(self):
+    directions = '李强试图翻过院墙，被巡夜人拦下，只得退回原地。'
+    self._assert_action_only(
+        self._turn('', directions, '连夜抄近路赶回老宅。'), directions
+    )
+
+  def test_multi_paragraph_dialogue_survives_xml_decoding(self):
+    speech = '第一段对白，带"引号"和##标记。\r\n\r\n第二段对白，一字不改。'
+    turn = self._turn(speech, '林雪合上了抽屉。', '守口如瓶，不提信件。')
+    paragraphs = self._paragraphs(renderer.render_fdx([turn], _SCENE_DISPLAY))
+    self.assertEqual(
+        paragraphs,
+        [
+            ('Scene Heading', 'INT. 老宅客厅 - 夜'),
+            ('Character', '李强'),
+            ('Parenthetical', '(紧张)'),
+            ('Dialogue', speech),
+            ('Action', '林雪合上了抽屉。'),
+        ],
+    )
+    # The Dialogue Text is compared on the XML-decoded actual
+    # characters, including the carriage-return paragraph break.
+    self.assertEqual(paragraphs[3][1], speech)
+    self.assertIn('\r\n\r\n', paragraphs[3][1])
+    self.assertEqual(
+        renderer.parse_fountain(
+            renderer.render_fountain([turn], _SCENE_DISPLAY)
+        ),
+        [
+            ('scene_heading', 'INT. 老宅客厅 - 夜'),
+            ('character', '李强'),
+            ('parenthetical', '紧张'),
+            ('dialogue', '第一段对白，带"引号"和##标记。'),
+            ('dialogue', '第二段对白，一字不改。'),
+            ('action', '林雪合上了抽屉。'),
+        ],
+    )
+    self.assertIn(
+        f'李强（紧张）：{speech}',
+        renderer.render_plain_text([turn], _SCENE_DISPLAY),
+    )
+
+  def test_legacy_record_missing_new_fields_still_renders(self):
+    turn = {
+        'turn_id': 1,
+        'scene_id': '故事主线',
+        'actor': '李强',
+        'speech': '旧记录的对白原样保留。',
+        'resolved_event': '李强说：旧记录的对白原样保留。',
+        'stage_directions': '旧记录的舞台指示原样保留。',
+        'emotion': None,
+        'beat_id_at_action': 'beat_1',
+        'beat_id_after_event': 'beat_1',
+        'tension': None,
+    }
+    self.assertEqual(
+        self._paragraphs(renderer.render_fdx([turn], _SCENE_DISPLAY)),
+        [
+            ('Scene Heading', 'INT. 老宅客厅 - 夜'),
+            ('Character', '李强'),
+            ('Dialogue', '旧记录的对白原样保留。'),
+            ('Action', '旧记录的舞台指示原样保留。'),
+        ],
+    )
+    self.assertEqual(
+        renderer.parse_fountain(
+            renderer.render_fountain([turn], _SCENE_DISPLAY)
+        ),
+        [
+            ('scene_heading', 'INT. 老宅客厅 - 夜'),
+            ('character', '李强'),
+            ('dialogue', '旧记录的对白原样保留。'),
+            ('action', '旧记录的舞台指示原样保留。'),
+        ],
+    )
+    self.assertEqual(
+        renderer.render_plain_text([turn], _SCENE_DISPLAY),
+        'INT. 老宅客厅 - 夜\n\n'
+        '李强：旧记录的对白原样保留。\n\n'
+        '旧记录的舞台指示原样保留。\n',
+    )
 
 
 class DeterminismTest(unittest.TestCase):
