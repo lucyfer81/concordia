@@ -56,6 +56,7 @@ from typing import Any, cast, override
 from concordia.components.agent import action_spec_ignored
 from concordia.components.game_master import event_resolution as event_resolution_lib
 from concordia.components.game_master import next_acting as next_acting_lib
+from concordia.contrib.components.game_master import story_action
 from concordia.contrib.language_models import budget_wrapper
 from concordia.document import interactive_document
 from concordia.language_model import language_model
@@ -111,6 +112,10 @@ _ACTIVE_DIRECTIVE_STATUSES = (_DIRECTIVE_PENDING, _DIRECTIVE_INTEGRATING)
 # Default cooldown, in story turns, after a directive executes before
 # the next one may be generated (plan appendix C).
 _DEFAULT_COOLDOWN_TURNS = 3
+
+# Reasons an intervention candidate may be recorded with (spec section
+# 7.2); at most one candidate may be recorded per story turn.
+_INTERVENTION_REASONS = ('tension', 'repetition')
 
 
 def _parse_tension_score(answer: str) -> int | None:
@@ -280,6 +285,7 @@ class DramaDirector(
       player_names: Sequence[str] = (),
       character_constraints: Mapping[str, str] | None = None,
       world_constraints: Sequence[str] = (),
+      action_mode: str = story_action.ACTION_MODE_SPEECH_ONLY,
   ):
     """Initializes the director.
 
@@ -311,14 +317,19 @@ class DramaDirector(
         actions no directive may decide.
       character_constraints: Player-specific boundaries, visible only to GM.
       world_constraints: GM-only world facts and information boundaries.
+      action_mode: The output contract of character actions; either
+        'speech_only' (the raw action text is pure speech) or
+        'speech_and_action' (a strict JSON object with 'speech' and
+        'action_intent' fields, decoded per turn by the director).
 
     Raises:
-      ValueError: If the beat configuration is invalid or the scoring
-        or feedback configuration is out of range. The model is not
-        called.
+      ValueError: If the beat configuration is invalid, the scoring
+        or feedback configuration is out of range, or the action mode
+        is unknown. The model is not called.
     """
     super().__init__(pre_act_label=pre_act_label)
     _validate_beats(beats)
+    story_action.validate_action_mode(action_mode)
     if eval_interval < 0:
       raise ValueError(f'eval_interval must be >= 0, got {eval_interval}.')
     if scoring_window < 1:
@@ -340,6 +351,7 @@ class DramaDirector(
     self._player_names = tuple(player_names)
     self._character_constraints = dict(character_constraints or {})
     self._world_constraints = tuple(world_constraints)
+    self._action_mode = action_mode
     # One stored window serves both the completion question (up to
     # `_COMPLETION_QUERY_EVENTS` events) and the scoring question (the
     # last `scoring_window` events), so it keeps the larger need.
@@ -389,14 +401,26 @@ class DramaDirector(
       observation: str,
   ) -> str:
     if observation.startswith(_PUTATIVE_EVENT_PREFIX):
+      self._turn_context = None
       actor = self._get_active_player()
       if actor is not None:
         beat = self._current_beat()
         content = observation.removeprefix(_PUTATIVE_EVENT_PREFIX)
+        # Strip the engine's speaker prefix once; what remains is the
+        # character's raw action (the JSON object in speech_and_action
+        # mode). Invalid JSON is a fatal error: no re-ask, no broadcast,
+        # no commit of this turn (spec section 3).
+        raw_action = content.removeprefix(f'{actor}: ')
+        speech, action_intent = self._decode_raw_action(raw_action)
         self._turn_context = {
             'actor': actor,
-            # Strip the speaker prefix once to recover the raw speech.
-            'original_speech': content.removeprefix(f'{actor}: '),
+            'raw_action': raw_action,
+            # Decoded speech; '' means the turn has no dialogue.
+            'original_speech': speech,
+            'action_intent': action_intent,
+            'action_result': None,
+            'intervention': None,
+            'resolution_diagnostics': {},
             'beat_id_at_action': beat.id if beat is not None else None,
             'directive_at_start': copy.deepcopy(self._directive),
         }
@@ -555,6 +579,9 @@ class DramaDirector(
         'turn_id': turn_id,
         'actor': snapshot['actor'],
         'speech': snapshot['original_speech'],
+        'schema_version': 2,
+        'raw_action': snapshot['raw_action'],
+        'action_intent': snapshot['action_intent'],
         'beat_id_at_action': snapshot['beat_id_at_action'],
         'beat_id_after_event': (
             self._beats[beat_index].id
@@ -763,6 +790,172 @@ class DramaDirector(
     if self._turn_context is None:
       return None
     return self._turn_context['original_speech']
+
+  def get_current_action_intent(self) -> str | None:
+    """Returns the action intent of the turn in progress, if any."""
+    if self._turn_context is None:
+      return None
+    return self._turn_context['action_intent']
+
+  def _decode_raw_action(self, raw_action: str) -> tuple[str, str]:
+    """Decodes the raw action per the configured action mode.
+
+    Args:
+      raw_action: the raw action text after the speaker prefix strip.
+
+    Returns:
+      A (speech, action_intent) pair. Speech-only mode treats the raw
+      text as pure speech with an empty intent.
+    """
+    if self._action_mode != story_action.ACTION_MODE_SPEECH_AND_ACTION:
+      return raw_action, ''
+    return story_action.decode_action(raw_action)
+
+  def record_action_result(self, result: str) -> None:
+    """Records the core-adjudicated result of the current turn's action.
+
+    The result is what adjudication actually returned, never the
+    action intent; final generation and review read it explicitly via
+    `get_current_resolution_evidence` (spec section 7).
+
+    Args:
+      result: The adjudicated actual return value of the action.
+
+    Raises:
+      ValueError: If no story turn is in progress.
+    """
+    context = self._require_turn_context('record_action_result')
+    context['action_result'] = result
+
+  def record_intervention_candidate(
+      self,
+      *,
+      reason: str,
+      candidate_before: str,
+      candidate_after: str,
+      trace: str,
+  ) -> None:
+    """Records a tension or repetition intervention candidate.
+
+    The candidate is a proposed change only: recording it neither
+    consumes a directive nor records an execution, and at most one
+    candidate may be recorded per story turn (spec section 7.2). The
+    candidate trace is kept in the private resolution diagnostics,
+    never in the broadcast-facing evidence.
+
+    Args:
+      reason: Why the intervention was proposed; either 'tension' or
+        'repetition'.
+      candidate_before: The resolution text before the proposed change.
+      candidate_after: The resolution text after the proposed change.
+      trace: Private trace of the candidate's derivation.
+
+    Raises:
+      ValueError: If no story turn is in progress, the reason is
+        unknown, or a candidate was already recorded this turn.
+    """
+    context = self._require_turn_context('record_intervention_candidate')
+    if reason not in _INTERVENTION_REASONS:
+      raise ValueError(
+          f'unknown intervention reason {reason!r}; expected one of '
+          f'{_INTERVENTION_REASONS}.'
+      )
+    if context['intervention'] is not None:
+      raise ValueError(
+          'at most one intervention candidate may be recorded per turn.'
+      )
+    context['intervention'] = {
+        'reason': reason,
+        'candidate_before': candidate_before,
+        'candidate_after': candidate_after,
+    }
+    context['resolution_diagnostics'] = {
+        'stage': f'intervention_{reason}',
+        'trace': trace,
+        'error': None,
+    }
+
+  def record_resolution_diagnostics(
+      self,
+      *,
+      stage: str,
+      trace: str,
+      error: str | None = None,
+  ) -> None:
+    """Records the resolution trace currently visible for the turn.
+
+    Supports partial records while a helper has not returned yet; it
+    never changes checked, executed or any committed state (spec
+    section 7.2). Each call replaces the previous stage's record.
+
+    Args:
+      stage: Pipeline stage the record belongs to.
+      trace: Private trace visible at this stage.
+      error: Error message if the stage failed, else None.
+
+    Raises:
+      ValueError: If no story turn is in progress.
+    """
+    context = self._require_turn_context('record_resolution_diagnostics')
+    context['resolution_diagnostics'] = {
+        'stage': stage,
+        'trace': trace,
+        'error': error,
+    }
+
+  def get_current_resolution_evidence(self) -> dict[str, Any]:
+    """Returns a deep copy of the current turn's resolution evidence.
+
+    The evidence carries the core-adjudicated action result and the
+    recorded intervention candidate, if any, for explicit use by final
+    generation and review; private traces are not exposed here (spec
+    section 7).
+
+    Returns:
+      A dictionary with keys 'action_result' (None or the adjudicated
+      result) and 'intervention' (None or a dictionary with 'reason',
+      'candidate_before' and 'candidate_after').
+    """
+    if self._turn_context is None:
+      return {'action_result': None, 'intervention': None}
+    return copy.deepcopy({
+        'action_result': self._turn_context['action_result'],
+        'intervention': self._turn_context['intervention'],
+    })
+
+  def get_current_resolution_diagnostics(self) -> dict[str, Any]:
+    """Returns the current evidence plus private resolution diagnostics.
+
+    For private archiving only (e.g. into director diagnostics on
+    save); the contents are never broadcast (spec section 7.2).
+
+    Returns:
+      A deep copy of the current resolution evidence extended with
+      the 'stage', 'trace' and 'error' of the latest recorded
+      diagnostics, when any.
+    """
+    diagnostics = self.get_current_resolution_evidence()
+    if self._turn_context is not None:
+      diagnostics.update(
+          copy.deepcopy(self._turn_context['resolution_diagnostics'])
+      )
+    return diagnostics
+
+  def _require_turn_context(self, api_name: str) -> dict[str, Any]:
+    """Returns the turn context, requiring a turn in progress.
+
+    Args:
+      api_name: Name of the calling API, for the error message.
+
+    Returns:
+      The current turn context dictionary.
+
+    Raises:
+      ValueError: If no story turn is in progress.
+    """
+    if self._turn_context is None:
+      raise ValueError(f'{api_name} requires a story turn in progress.')
+    return self._turn_context
 
   def is_story_stopped(self) -> bool:
     """Returns whether the story should not continue any further."""

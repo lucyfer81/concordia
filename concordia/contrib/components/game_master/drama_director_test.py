@@ -15,6 +15,7 @@
 """Tests using the actual entity component lifecycle."""
 
 import dataclasses
+import json
 import re
 from typing import Any
 import unittest
@@ -23,6 +24,7 @@ from concordia.agents import entity_agent_with_logging
 from concordia.components.agent import memory as memory_lib
 from concordia.components.game_master import next_acting as next_acting_lib
 from concordia.contrib.components.game_master import drama_director
+from concordia.contrib.components.game_master import story_action
 from concordia.contrib.language_models import budget_wrapper
 from concordia.testing import mock_model
 from concordia.typing import entity as entity_lib
@@ -870,6 +872,197 @@ class DirectiveGenerationTest(unittest.TestCase):
           feedback_enabled=True,
           cooldown_turns=-1,
       )
+
+
+class ActionContractParsingTest(unittest.TestCase):
+  """Current-turn parsing of the speech-and-action contract (spec §3)."""
+
+  def test_speech_and_action_turn_decodes_and_records_raw(self):
+    model = _BeatModel(False)
+    director, gm = _make_director(model, action_mode='speech_and_action')
+    raw = '{"speech": "我现在核对日期。", "action_intent": "拿出原件查看。"}'
+    gm.observe(f'[putative_event] Alice: {raw}')
+    self.assertEqual(director.get_current_original_speech(), '我现在核对日期。')
+    self.assertEqual(director.get_current_action_intent(), '拿出原件查看。')
+    result = gm.act(_RESOLVE_SPEC)
+    gm.observe(f'[event] {result}')
+    turn = director.get_last_story_turn()
+    self.assertEqual(turn['raw_action'], raw)
+    self.assertEqual(turn['speech'], '我现在核对日期。')
+    self.assertEqual(turn['action_intent'], '拿出原件查看。')
+
+  def test_invalid_action_json_is_fatal_before_resolution(self):
+    model = _BeatModel(False)
+    director, gm = _make_director(model, action_mode='speech_and_action')
+    with self.assertRaises(story_action.ActionDecodeError):
+      gm.observe('[putative_event] Alice: 我直接说话')
+    self.assertIsNone(director.get_last_story_turn())
+    self.assertEqual(model.choice_calls, 0)
+
+  def test_speech_only_mode_keeps_raw_speech_and_empty_intent(self):
+    model = _BeatModel(False)
+    director, gm = _make_director(model)
+    result = _complete_turn(gm, '我只有对白。')
+    turn = director.get_last_story_turn()
+    self.assertEqual(turn['raw_action'], '我只有对白。')
+    self.assertEqual(turn['speech'], '我只有对白。')
+    self.assertEqual(turn['action_intent'], '')
+
+  def test_unknown_action_mode_rejected_at_construction(self):
+    with self.assertRaises(ValueError):
+      drama_director.DramaDirector(
+          model=_BeatModel(False), beats=BEATS, action_mode='mime'
+      )
+
+  def test_resolution_evidence_is_transient_and_copied(self):
+    model = _BeatModel(False)
+    director, gm = _make_director(model)
+    _complete_turn(gm, '第一句。')
+    committed = director.get_committed_events()
+    gm.observe('[putative_event] Alice: 第二句。')
+    # 本轮初值为空。
+    self.assertEqual(
+        director.get_current_resolution_evidence(),
+        {'action_result': None, 'intervention': None},
+    )
+    director.record_action_result('核心裁决返回的实际结果。')
+    director.record_intervention_candidate(
+        reason='tension',
+        candidate_before='候选前',
+        candidate_after='候选后',
+        trace='候选 trace',
+    )
+    evidence = director.get_current_resolution_evidence()
+    self.assertEqual(evidence['action_result'], '核心裁决返回的实际结果。')
+    self.assertEqual(
+        evidence['intervention'],
+        {
+            'reason': 'tension',
+            'candidate_before': '候选前',
+            'candidate_after': '候选后',
+        },
+    )
+    # 修改返回字典不影响内部暂态。
+    evidence['action_result'] = 'tampered'
+    evidence['intervention']['reason'] = 'tampered'
+    fresh = director.get_current_resolution_evidence()
+    self.assertEqual(fresh['action_result'], '核心裁决返回的实际结果。')
+    self.assertEqual(fresh['intervention']['reason'], 'tension')
+    # 新 putative_event 清空暂态，已提交事件不变。
+    gm.observe('[putative_event] Alice: 第三句。')
+    self.assertEqual(
+        director.get_current_resolution_evidence(),
+        {'action_result': None, 'intervention': None},
+    )
+    self.assertEqual(director.get_committed_events(), committed)
+
+  def test_intervention_candidate_does_not_consume_directive(self):
+    # 记录候选只是提案：不消费指令、不记执行、不进冷却；同轮不
+    # 得记录两路候选（spec §7.2）。
+    model = _DirectiveModel(False)
+    director, gm = _make_director(model, **_DIRECTOR_FEEDBACK_PARAMS)
+    _complete_turn(gm, 'one')
+    pending = director.get_pending_directive()
+    self.assertIsNotNone(pending)
+    gm.observe('[putative_event] Alice: two')
+    director.record_intervention_candidate(
+        reason='tension',
+        candidate_before='候选前',
+        candidate_after='候选后',
+        trace='候选 trace',
+    )
+    # 候选 trace 只进私有诊断，不进对外依据。
+    self.assertNotIn('trace', director.get_current_resolution_evidence())
+    diagnostics = director.get_current_resolution_diagnostics()
+    self.assertEqual(diagnostics['stage'], 'intervention_tension')
+    self.assertEqual(diagnostics['trace'], '候选 trace')
+    # 指令仍是 pending，执行轮与冷却计数未前移。
+    self.assertEqual(director.get_pending_directive(), pending)
+    self.assertIsNone(director.get_state()['last_directive_executed_turn'])
+    with self.assertRaises(ValueError):
+      director.record_intervention_candidate(
+          reason='repetition',
+          candidate_before='候选前',
+          candidate_after='候选后',
+          trace='第二路候选 trace',
+      )
+    with self.assertRaises(ValueError):
+      director.record_intervention_candidate(
+          reason='vibes',
+          candidate_before='候选前',
+          candidate_after='候选后',
+          trace='未知理由 trace',
+      )
+    self.assertEqual(
+        director.get_current_resolution_evidence()['intervention']['reason'],
+        'tension',
+    )
+
+  def test_diagnostics_are_not_public_context(self):
+    # trace 只进私有归档接口，绝不进入已提交的公开事件（spec
+    # §7.2）；正式广播隔离于 Task 9/13 再联测。
+    model = _BeatModel(False)
+    director, gm = _make_director(model, action_mode='speech_and_action')
+    gm.observe(
+        '[putative_event] Alice: {"speech": "我说对白。", '
+        '"action_intent": "我做动作。"}'
+    )
+    director.record_resolution_diagnostics(
+        stage='adjudication', trace='私有 trace：裁决中途', error=None
+    )
+    diagnostics = director.get_current_resolution_diagnostics()
+    self.assertEqual(diagnostics['stage'], 'adjudication')
+    self.assertEqual(diagnostics['trace'], '私有 trace：裁决中途')
+    self.assertIsNone(diagnostics['error'])
+    self.assertIsNone(diagnostics['action_result'])
+    self.assertIsNone(diagnostics['intervention'])
+    diagnostics['trace'] = 'tampered'
+    self.assertEqual(
+        director.get_current_resolution_diagnostics()['trace'],
+        '私有 trace：裁决中途',
+    )
+    result = gm.act(_RESOLVE_SPEC)
+    gm.observe(f'[event] {result}')
+    turn = director.get_last_story_turn()
+    self.assertNotIn('私有 trace', turn['resolved_event'])
+    self.assertNotIn('私有 trace', turn['stage_directions'])
+    for public_event in director.get_committed_events():
+      self.assertNotIn('私有 trace', public_event)
+
+  def test_parse_failure_does_not_broadcast_or_commit(self):
+    model = _BeatModel(False)
+    director, gm = _make_director(model, action_mode='speech_and_action')
+    _complete_turn(gm, '{"speech": "已提交对白。", "action_intent": ""}')
+    committed = director.get_committed_events()
+    calls = model.choice_calls
+    with self.assertRaises(story_action.ActionDecodeError):
+      gm.observe('[putative_event] Alice: 不是 JSON')
+    # 解析失败路径不广播、不提交：失败回合不留暂态，已提交事件、
+    # 回合记录与计数不变，也没有任何新的模型调用。
+    self.assertIsNone(director.get_current_original_speech())
+    self.assertIsNone(director.get_current_action_intent())
+    self.assertEqual(director.get_last_story_turn()['turn_id'], 1)
+    self.assertEqual(director.get_last_story_turn()['speech'], '已提交对白。')
+    self.assertEqual(director.get_committed_events(), committed)
+    self.assertEqual(director.get_state()['story_turn'], 1)
+    self.assertEqual(model.choice_calls, calls)
+
+  def test_decoded_speech_whitespace_is_preserved_verbatim(self):
+    model = _BeatModel(False)
+    director, gm = _make_director(model, action_mode='speech_and_action')
+    speech = '第一句，\n  第二句。'
+    raw = json.dumps(
+        {'speech': speech, 'action_intent': '意图。'}, ensure_ascii=False
+    )
+    gm.observe(f'[putative_event] Alice: {raw}')
+    # 字段内空白不得规范化：解码保留原文；空白容错只属于 Task 8
+    # 的模型草稿比对。
+    self.assertEqual(director.get_current_original_speech(), speech)
+    result = gm.act(_RESOLVE_SPEC)
+    gm.observe(f'[event] {result}')
+    turn = director.get_last_story_turn()
+    self.assertEqual(turn['speech'], speech)
+    self.assertEqual(turn['raw_action'], raw)
 
 
 if __name__ == '__main__':
