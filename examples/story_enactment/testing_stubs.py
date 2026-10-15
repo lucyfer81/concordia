@@ -17,8 +17,10 @@
 Unlike `concordia.testing.mock_model.MockModel`, which always returns
 one fixed string and always the first choice, this stub routes by
 prompt semantics: the shared speech call to action returns a
-per-character dialogue line, the dual-track resolution request returns
-valid JSON that preserves the authored speech verbatim, and the basic
+per-character dialogue line, the speech-and-action contract call
+returns strict JSON preserving the authored speech verbatim, the
+dual-track resolution request returns valid JSON derived from the
+resolution evidence carried by the current prompt, and the basic
 entity's perception questions receive short fixed answers. Text
 routing keys on the LAST `Question:`/`Exercise:` block of the prompt,
 so earlier question blocks embedded in a component's context (e.g. the
@@ -28,18 +30,29 @@ option letter, so the interactive document's letter shuffling cannot
 break determinism, and beat-completion answers are configured per beat
 id so no beat is completed by default. Every prompt is recorded for
 later assertions.
+
+The stub doubles as the deterministic verification instrument of the
+propagation tests: its dual-track output narrates only the
+core-adjudicated action result and the intervention candidate carried
+by the current prompt's marked evidence section, never configuration
+values or anything earlier calls generated, so tests can prove that
+adjudicated facts actually reach final generation.
 """
 
 from collections.abc import Collection, Mapping, Sequence
 import json
 import re
-from typing import override
+from typing import Any, override
 
+from concordia.contrib.components.game_master import story_action
 from concordia.language_model import language_model
 
 # Fingerprint of the shared speech call to action, and the pattern that
-# extracts the addressed character's name from it.
+# extracts the addressed character's name from it. The
+# speech-and-action contract variant is checked first, because its call
+# to action contains this fingerprint's text as a prefix.
 _SPEECH_CALL_MARK = '现在说什么'
+_SPEECH_ACTION_CALL_MARK = '现在说什么、做什么'
 _SPEAKER_IN_CALL = re.compile(r'根据你已知的信息，(.+?) 现在说什么')
 
 # Fingerprints and field patterns of the dual-track resolution prompt
@@ -51,14 +64,34 @@ _REVIEW_MARK = (
 _CURRENT_SPEAKER = re.compile(r'## Current speaker\n(.+)')
 _ORIGINAL_SPEECH = re.compile(r'## Original speech \(verbatim\)\n(.*)')
 
+# Heading marking the JSON data section that final-generation prompts
+# carry next to their evidence (the turn's speech, action intent,
+# core-adjudicated action result and recorded intervention candidate).
+# The section is read with a JSON decoder, never with regexes, so
+# multi-paragraph speech inside the JSON survives verbatim.
+EVIDENCE_SECTION_MARK = '## Resolution evidence (data)'
+
+# Fingerprints of the drama director's tension-scoring output
+# instruction (prompt P2) and of the core event-resolution questions
+# the stub answers with dedicated parameters.
+_SCORING_MARK = 'Respond with a single integer from 1 to 10 and nothing else'
+_ATTEMPT_RESULT_MARK = 'What happens as a result of the attempted action?'
+_PUSH_SUGGEST_MARK = 'Suggest five plausible events'
+_PUSH_MERGE_MARK = 'How does 2 modify'
+_PUSH_GIVEN = re.compile(r'Given:\n(.*?)\n\nHow does 2 modify', re.S)
+
+# Fingerprint of the core repetition-detector choice question, and the
+# statement fingerprint of the drama director's beat-completion prompt
+# plus one '(letter) option' pair per line of the final choice block.
+_REPETITION_MARK = (
+    'Is the story traced out by the above list of events repetitive?'
+)
+_CURRENT_BEAT = re.compile(r'Current beat "([^"]+)"')
+_CHOICE_LINE = re.compile(r'^  \(([^)]+)\) (.+)$', re.M)
+
 # The last `Question:`/`Exercise:` block opener; task routing always
 # reads this final block only.
 _LAST_BLOCK_OPENER = re.compile(r'^(?:Question|Exercise): ', re.M)
-
-# Statement fingerprint of the drama director's beat-completion prompt,
-# and one '(letter) option' pair per line of the final block.
-_CURRENT_BEAT = re.compile(r'Current beat "([^"]+)"')
-_CHOICE_LINE = re.compile(r'^  \(([^)]+)\) (.+)$', re.M)
 
 # Fixed answers for the basic entity's perception questions, keyed by a
 # fingerprint of the question text.
@@ -86,6 +119,37 @@ def _last_question_block(prompt: str) -> str:
   return prompt[matches[-1].start() :]
 
 
+def read_evidence_section(text: str) -> dict[str, Any] | None:
+  """Reads the marked JSON resolution-evidence section, if present.
+
+  Final-generation prompts carry the turn's actual evidence (speech,
+  action intent, core-adjudicated action result and any recorded
+  intervention candidate) in a clearly marked JSON data section. The
+  section is decoded with a JSON decoder stopping at the matching close
+  brace, never guessed at with regexes, so multi-paragraph speech and
+  quotes inside the JSON survive verbatim.
+
+  Args:
+    text: the prompt (or its last question block) to read from.
+
+  Returns:
+    The decoded evidence object, or None when no marked section holds a
+    decodable JSON object.
+  """
+  index = text.find(EVIDENCE_SECTION_MARK)
+  if index < 0:
+    return None
+  remainder = text[index + len(EVIDENCE_SECTION_MARK) :]
+  start = remainder.find('{')
+  if start < 0:
+    return None
+  try:
+    payload, _ = json.JSONDecoder().raw_decode(remainder[start:])
+  except json.JSONDecodeError:
+    return None
+  return payload if isinstance(payload, dict) else None
+
+
 class PromptStubModel(language_model.LanguageModel):
   """Deterministic stub routing story prompts to canned outputs.
 
@@ -105,6 +169,12 @@ class PromptStubModel(language_model.LanguageModel):
       completion_answers: Mapping[str, str] | None = None,
       fail_choice_calls_from: int | None = None,
       review_response: str = '{"valid": true, "reason": "scripted approval"}',
+      action_intents: Mapping[str, str] | None = None,
+      action_result: str = '',
+      repetition_answer: str | None = None,
+      push_events: str = '',
+      push_merged: str = '',
+      scoring_answer: str = '',
   ) -> None:
     """Initializes the stub.
 
@@ -113,6 +183,8 @@ class PromptStubModel(language_model.LanguageModel):
         when the speech call to action addresses that character.
       default_line: line spoken for characters not in the mapping.
       stage_directions: fixed stage-directions track of resolutions.
+        With resolution evidence present it is background only; the
+        propagation tests set it to ''.
       choice_answer: option text chosen for choice prompts without a
         configured beat-completion answer.
       completion_answers: mapping from beat id to the yes/no option
@@ -124,6 +196,26 @@ class PromptStubModel(language_model.LanguageModel):
         exercise API retry exhaustion.
       review_response: scripted JSON returned for semantic reviews. This
         exercises review plumbing only, never real semantic correctness.
+      action_intents: mapping from character name to the action intent
+        field of the speech-and-action JSON contract call; the speech
+        field still comes from `dialogue_lines`.
+      action_result: answer to the core attempt_to_result question
+        only. It never enters final generation directly: dual-track
+        output narrates the action result carried by the current
+        prompt's evidence section, never this configuration value.
+      repetition_answer: yes/no option text answered for the core
+        repetition-detector choice question when it is the prompt's
+        last choice question.
+      push_events: single plausible event (one line, no trailing
+        newline) answering the repetition push's suggestion question;
+        one legal suggestion keeps the core helper's `random.choice`
+        deterministic.
+      push_merged: suffix appended to the actual numbered candidate
+        when answering the repetition push's merge question. It is a
+        test fusion template only: the final dual-track output includes
+        the intervention fact solely from the current prompt's evidence.
+      scoring_answer: answer to the drama director's tension-scoring
+        question.
     """
     self._dialogue_lines = dict(dialogue_lines or {})
     self._default_line = default_line
@@ -132,6 +224,12 @@ class PromptStubModel(language_model.LanguageModel):
     self._completion_answers = dict(completion_answers or {})
     self._fail_choice_calls_from = fail_choice_calls_from
     self._review_response = review_response
+    self._action_intents = dict(action_intents or {})
+    self._action_result = action_result
+    self._repetition_answer = repetition_answer
+    self._push_events = push_events
+    self._push_merged = push_merged
+    self._scoring_answer = scoring_answer
     self._choice_calls = 0
     self.text_prompts: list[str] = []
     self.choice_prompts: list[str] = []
@@ -196,6 +294,9 @@ class PromptStubModel(language_model.LanguageModel):
 
   def _wanted_option(self, prompt: str) -> str:
     """Returns the option text semantically wanted for this choice."""
+    block = _last_question_block(prompt)
+    if self._repetition_answer and _REPETITION_MARK in block:
+      return self._repetition_answer
     beat = _CURRENT_BEAT.search(prompt)
     if beat:
       return self._completion_answers.get(beat.group(1), self._choice_answer)
@@ -210,6 +311,16 @@ class PromptStubModel(language_model.LanguageModel):
       return self._review_response
     if _DUAL_TRACK_MARK in block:
       return self._dual_track_output(block)
+    if _SCORING_MARK in block and self._scoring_answer:
+      return self._scoring_answer
+    if _ATTEMPT_RESULT_MARK in block and self._action_result:
+      return self._action_result
+    if _PUSH_SUGGEST_MARK in block and self._push_events:
+      return self._push_events
+    if _PUSH_MERGE_MARK in block and self._push_merged:
+      return self._merge_output(block)
+    if _SPEECH_ACTION_CALL_MARK in block:
+      return self._action_contract_output(block)
     if _SPEECH_CALL_MARK in block:
       match = _SPEAKER_IN_CALL.search(block)
       name = match.group(1) if match else ''
@@ -219,16 +330,86 @@ class PromptStubModel(language_model.LanguageModel):
         return answer
     return self._default_line
 
+  def _action_contract_output(self, prompt: str) -> str:
+    """Builds the strict speech-and-action JSON of one call to action.
+
+    The payload is validated through the shared codec so the stub can
+    never emit a contract-violating response the drama director would
+    treat as a fatal turn error.
+
+    Args:
+      prompt: the last question block of the action-contract call.
+
+    Returns:
+      A JSON object with exactly the `speech` and `action_intent`
+      string fields, the speech preserved verbatim.
+    """
+    match = _SPEAKER_IN_CALL.search(prompt)
+    name = match.group(1) if match else ''
+    speech = self._dialogue_lines.get(name, self._default_line)
+    action_intent = self._action_intents.get(name, '')
+    payload = json.dumps(
+        {'speech': speech, 'action_intent': action_intent},
+        ensure_ascii=False,
+    )
+    story_action.decode_action(payload)
+    return payload
+
+  def _merge_output(self, block: str) -> str:
+    """Composes the repetition-push merge answer from the real candidate.
+
+    The merge question quotes the actual numbered candidate (the
+    putative event and the actually selected suggestion); the configured
+    `push_merged` text is appended as a suffix, never a replacement, so
+    the answer always carries the real candidate forward.
+
+    Args:
+      block: the last question block, containing the merge question.
+
+    Returns:
+      The quoted candidate plus the configured suffix.
+    """
+    given = _PUSH_GIVEN.search(block)
+    if given is None:
+      return self._push_merged
+    if self._push_merged:
+      return f'{given.group(1)}\n{self._push_merged}'
+    return given.group(1)
+
   def _dual_track_output(self, prompt: str) -> str:
-    """Builds a valid dual-track JSON preserving the speech verbatim."""
+    """Builds a valid dual-track JSON preserving the speech verbatim.
+
+    Beyond the speech, the resolved event narrates only what the
+    current prompt's marked evidence section actually carries: the
+    core-adjudicated action result and the intervention candidate's
+    post-merge text. Nothing is read from configuration or from what
+    earlier calls generated, so propagation tests can trust the output
+    as a faithful record of the evidence passed in.
+
+    Args:
+      prompt: the last question block of the final-generation prompt.
+
+    Returns:
+      The dual-track JSON object as a string.
+    """
+    evidence = read_evidence_section(prompt)
     speaker_match = _CURRENT_SPEAKER.search(prompt)
-    speech_match = _ORIGINAL_SPEECH.search(prompt)
     speaker = speaker_match.group(1) if speaker_match else ''
-    speech = speech_match.group(1) if speech_match else ''
+    if evidence is not None and isinstance(evidence.get('speech'), str):
+      # The JSON data section is authoritative: unlike the verbatim-
+      # speech heading, JSON decoding cannot truncate multi-paragraph
+      # dialogue at the first line.
+      speech = evidence['speech']
+    else:
+      speech_match = _ORIGINAL_SPEECH.search(prompt)
+      speech = speech_match.group(1) if speech_match else ''
     if not speech or speech == '(none)':
       resolved = f'{speaker} 沉默片刻。'
     else:
       resolved = f'{speaker}: {speech}'
+    if evidence is not None:
+      for part in self._evidence_narration_parts(evidence):
+        resolved += '\n' + part
     if self._stage_directions:
       resolved += '\n' + self._stage_directions
     return json.dumps(
@@ -238,3 +419,28 @@ class PromptStubModel(language_model.LanguageModel):
         },
         ensure_ascii=False,
     )
+
+  @staticmethod
+  def _evidence_narration_parts(
+      evidence: Mapping[str, Any],
+  ) -> list[str]:
+    """Collects the narratable facts of one evidence object.
+
+    Args:
+      evidence: the decoded evidence section.
+
+    Returns:
+      The non-empty adjudicated action result and intervention
+      candidate text, in that order; missing or non-string fields
+      contribute nothing.
+    """
+    parts = []
+    action_result = evidence.get('action_result')
+    if isinstance(action_result, str) and action_result:
+      parts.append(action_result)
+    intervention = evidence.get('intervention')
+    if isinstance(intervention, Mapping):
+      candidate_after = intervention.get('candidate_after')
+      if isinstance(candidate_after, str) and candidate_after:
+        parts.append(candidate_after)
+    return parts
