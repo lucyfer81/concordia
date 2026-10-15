@@ -150,5 +150,35 @@ class StoryConfigTest(unittest.TestCase):
       )
 
 
+class ActionSpecModeTest(unittest.TestCase):
+
+  def test_speech_only_spec_requests_dialogue_only(self):
+    spec = story_config.make_scene_action_spec('speech_only')
+    self.assertIn('现在说什么？只输出自己的对白正文', spec.call_to_action)
+
+  def test_speech_and_action_spec_requests_the_json_contract(self):
+    spec = story_config.make_scene_action_spec('speech_and_action')
+    for fragment in ('JSON', 'speech', 'action_intent', '两者不能同时为空'):
+      self.assertIn(fragment, spec.call_to_action)
+
+  def test_unknown_mode_raises(self):
+    with self.assertRaises(ValueError):
+      story_config.make_scene_action_spec('mime')
+
+
+class ExampleFactsTest(unittest.TestCase):
+  """Evidence grounding facts required by spec sections 5 and 11."""
+
+  def test_cabinet_needs_two_keys_is_public(self):
+    config = story_config.make_example_config()
+    self.assertTrue(any('两把钥匙' in fact for fact in config.world_facts))
+
+  def test_old_will_date_is_gm_only(self):
+    config = story_config.make_example_config()
+    self.assertTrue(
+        any('二〇一九年三月十二日' in fact for fact in config.gm_only_facts)
+    )
+
+
 if __name__ == '__main__':
   unittest.main()

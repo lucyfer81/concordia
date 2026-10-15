@@ -23,6 +23,7 @@ conflict that starts the story and the endings the enactment may reach.
 import dataclasses
 from typing import Any
 
+from concordia.contrib.components.game_master import story_action
 from concordia.typing import entity as entity_lib
 from concordia.typing import scene as scene_lib
 
@@ -36,6 +37,22 @@ _SPEECH_CALL_TO_ACTION = (
     '回应最近公开的新信息，保持自己的目标、底线和表达风格；'
     '说出自己的具体疑问、取舍或不同意见，避免跟着他人重复核验、封存等程序口号。'
     '没有新事实时也不要编造证据或声称他人已经同意。'
+)
+
+# Speech-and-action prompt (design doc section 3): the character outputs
+# a strict JSON object with their own dialogue and their own current
+# action attempt. The action intent never prewrites outcomes, object
+# contents, other characters' decisions, or already-completed actions.
+_SPEECH_AND_ACTION_CALL_TO_ACTION = (
+    '根据你已知的信息，{name} 现在说什么、做什么？只输出一个 JSON 对象，'
+    '且仅包含两个字符串字段："speech" 为 {name} 现在的对白正文'
+    '（无对白时为空字符串），"action_intent" 为 {name} 现在尝试的自身动作'
+    '（无动作时为空字符串），两者不能同时为空。'
+    '对白不含角色名、引号包裹、他人台词、旁白或推理过程；'
+    '行动意图只描述此刻自己尝试的动作，不预写成功结果、物件内容、'
+    '他人的决定或过去已完成的动作。'
+    '回应最近公开的新信息，保持自己的目标、底线和表达风格；'
+    '没有新事实时不要编造证据或声称他人已经同意。只输出该 JSON 对象。'
 )
 
 
@@ -192,6 +209,37 @@ def make_speech_action_spec() -> entity_lib.ActionSpec:
   return entity_lib.free_action_spec(call_to_action=_SPEECH_CALL_TO_ACTION)
 
 
+def make_speech_and_action_action_spec() -> entity_lib.ActionSpec:
+  """Returns the FREE action spec of the speech-and-action contract.
+
+  Returns:
+    An action spec whose call to action requests the strict JSON object
+    with exactly the ``speech`` and ``action_intent`` string fields.
+  """
+  return entity_lib.free_action_spec(
+      call_to_action=_SPEECH_AND_ACTION_CALL_TO_ACTION
+  )
+
+
+def make_scene_action_spec(action_mode: str) -> entity_lib.ActionSpec:
+  """Returns the scene action spec of the given action mode.
+
+  Args:
+    action_mode: one of ``story_action.ACTION_MODES``.
+
+  Returns:
+    The dialogue-only spec for ``speech_only`` and the JSON-contract
+    spec for ``speech_and_action``.
+
+  Raises:
+    ValueError: if the mode is unknown.
+  """
+  story_action.validate_action_mode(action_mode)
+  if action_mode == story_action.ACTION_MODE_SPEECH_AND_ACTION:
+    return make_speech_and_action_action_spec()
+  return make_speech_action_spec()
+
+
 def validate(config: StoryConfig) -> list[str]:
   """Checks the structural invariants of a story configuration.
 
@@ -241,11 +289,16 @@ def make_example_config() -> StoryConfig:
           '陈老先生（陈望山）一周前病逝，今晚是头七，众人聚在老宅守灵。',
           '窗外雷雨大作，老宅电路老化，堂灯时明时暗。',
           '周律师今晚受托当众启封并宣读遗嘱。',
+          '堂屋侧室的保险柜须两把钥匙同时转动才能开启，林雪与陈母各执一把。',
       ),
       gm_only_facts=(
           '真相：遗嘱已被调包——头七前夜，有人从保险柜里换走了老人临终新立的遗嘱。',
           '真相：被焚毁的新遗嘱其实把老宅留给了照顾老人两年的林雪。',
           '真相：周律师如今保管的是被换上的旧遗嘱，封印从未被核验。',
+          (
+              '真相：被换上的旧遗嘱全文落款日期为二〇一九年三月十二日，'
+              '有陈望山签名与手印，无见证人；信封封印完好，从未被当众核验。'
+          ),
       ),
       allowed_environment_events=(
           '雷雨骤紧，老宅骤然断电，堂内只剩烛光',
