@@ -20,12 +20,19 @@ components of `concordia.contrib.components.game_master`: a
 `DramaDirector` advances the story through its beats and periodically
 scores the dramatic tension of the recent events, event resolution
 produces the dual-track output that separates player speech (agency)
-from stage directions (narrator authority), a director-note step weaves
-pending directives into resolutions through whitelisted NPC and
-environmental means only, and a `SceneOrStoryTerminator` stops the run
-when either the scene schedule or the story itself ends. Every
-resolution is conditioned on the current beat, the world constraints,
-and all character constraints, with a separate model review before publication.
+from stage directions (narrator authority), and a `SceneOrStoryTerminator`
+stops the run when either the scene schedule or the story itself ends.
+Every resolution is conditioned on the current beat, the world constraints,
+and all character constraints, with a separate model review before
+publication.
+
+In `speech_and_action` mode (the `action_mode` prefab param, defaulting
+to pure speech) the resolution chain first adjudicates the current
+character's own action attempt through the core `attempt_to_result`
+helper; its true return value is recorded as resolution evidence that
+the director-note step, the final dual-track generation and the
+semantic review all consume, so only adjudicated outcomes — never
+unadjudicated intents — reach the public event.
 """
 
 from collections.abc import Mapping, Sequence
@@ -40,6 +47,8 @@ from concordia.components.game_master import event_resolution as thought_chains_
 from concordia.contrib.components.game_master import director_note
 from concordia.contrib.components.game_master import drama_director
 from concordia.contrib.components.game_master import observation_queue
+from concordia.contrib.components.game_master import story_action
+from concordia.contrib.components.game_master import story_action_adjudication
 from concordia.contrib.components.game_master import story_resolution
 from concordia.contrib.components.game_master import story_terminator
 from concordia.contrib.prefabs.game_master import story_scene
@@ -68,6 +77,12 @@ class GameMaster(prefab_lib.Prefab):
   params: Mapping[str, Any] = dataclasses.field(
       default_factory=lambda: {
           'name': DEFAULT_NAME,
+          # The characters' action contract: 'speech_only' treats a
+          # raw action as pure speech, 'speech_and_action' expects
+          # the strict JSON object of `story_action` (spec section
+          # 3). Validated at build time and forwarded to the
+          # director and the adjudication chain.
+          'action_mode': story_action.ACTION_MODE_SPEECH_ONLY,
           # Scene schedule, as dictionaries encoded by
           # `concordia.contrib.prefabs.game_master.story_scene`.
           'scene_dicts': (),
@@ -229,6 +244,15 @@ class GameMaster(prefab_lib.Prefab):
         scene_tracker_component_key=scene_tracker_key,
     )
 
+    # The action contract is validated here and forwarded to the
+    # director, which decodes each turn's raw action per the mode; the
+    # adjudication chain step consumes the decoded intent. The default
+    # keeps the pure-speech stage-1 behavior (spec sections 3 and 8).
+    action_mode = self.params.get(
+        'action_mode', story_action.ACTION_MODE_SPEECH_ONLY
+    )
+    story_action.validate_action_mode(action_mode)
+
     # The drama director advances the story through its beats; its pre-act
     # value exposes the current beat to every resolution prompt. The
     # scoring and feedback configuration comes from the JSON-safe prefab
@@ -249,6 +273,7 @@ class GameMaster(prefab_lib.Prefab):
         player_names=player_names,
         character_constraints=self.params.get('character_constraints', {}),
         world_constraints=self.params.get('world_constraints', ()),
+        action_mode=action_mode,
     )
 
     world_constraints = actor_components.constant.Constant(
@@ -256,13 +281,19 @@ class GameMaster(prefab_lib.Prefab):
         pre_act_label=WORLD_CONSTRAINTS_PRE_ACT_LABEL,
     )
 
-    # Stage-1 resolution chain: strip the putative-event prefix, weave in
-    # any pending director directive (identity when none is pending), then
-    # ask for the dual-track output (verbatim speech plus stage directions)
-    # that respects the immutable facts. Non-verbal intent is not modeled
-    # in this first version.
+    # Stage-1 resolution chain: strip the putative-event prefix, then (in
+    # speech_and_action mode) adjudicate the current character's own
+    # action attempt through the core `attempt_to_result` helper, whose
+    # true return value the later steps consume as resolution evidence;
+    # weave in any pending director directive (identity when none is
+    # pending); finally ask for the dual-track output (verbatim speech
+    # plus stage directions) that respects the immutable facts. Turns
+    # without an action intent skip the adjudication model call.
     remove_prefix = thought_chains_lib.RemoveSpecificText(
         substring_to_remove='Putative event to resolve: '
+    )
+    adjudication_step = story_action_adjudication.make_action_adjudication_step(
+        director
     )
     director_note_step = director_note.make_director_note_step(director)
     final_output_step = story_resolution.make_final_output_step(
@@ -284,6 +315,7 @@ class GameMaster(prefab_lib.Prefab):
         model=model,
         event_resolution_steps=(
             remove_prefix,
+            adjudication_step,
             director_note_step,
             final_output_step,
         ),

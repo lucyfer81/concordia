@@ -1344,6 +1344,10 @@ def run(
       # so only that mode collects the acting character's emotion.
       emotion_enabled=config['mode'] == MODE_CHARACTER_DEPTH,
       retry_stats=retry_stats,
+      # The collector re-validates the recorded raw action with the
+      # shared codec in speech_and_action mode (spec section 9); the
+      # effective contract travels with the config.
+      action_mode=config['action_mode'],
   )
   step_marks: list[float] = []
 

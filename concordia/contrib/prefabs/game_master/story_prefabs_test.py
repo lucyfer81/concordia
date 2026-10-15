@@ -84,20 +84,92 @@ _DUAL_TRACK_RESPONSE = (
     '{"resolved_event": "Alice: ' + _SPEECH + '", "stage_directions": ""}'
 )
 
+# Fingerprints of the core adjudication question (asked by the core
+# `attempt_to_result` helper) and of the director-note fusion questions.
+_ATTEMPT_QUESTION_MARK = 'What happens as a result of the attempted action?'
+_ADJUDICATION_CONTEXT_MARK = '# Action adjudication (current turn only)'
+_COMPLICATION_MARK = 'Suggest five plausible in-story complications'
+
+# A valid speech-and-action JSON contract the mock player returns.
+_ACTION_INTENT = 'Alice walks to the window and checks the latch.'
+_CONTRACT_RESPONSE = json.dumps(
+    {'speech': _SPEECH, 'action_intent': _ACTION_INTENT}, ensure_ascii=False
+)
+_CORE_ATTEMPT_ANSWER = 'The latch is loose; the window stays shut.'
+# The core helper's true return value: its causal-statement glue plus
+# the attempt answer.
+_CORE_RESULT = f'{_ACTION_INTENT} Because of that, {_CORE_ATTEMPT_ANSWER}'
+# Valid dual-track JSON for the speech-and-action chain: narrating the
+# core-adjudicated result in the stage-directions track is required
+# (the canonical event is assembled from speech and approved stage
+# directions only), mirroring the example stub's evidence-driven draft.
+_ACTION_DUAL_TRACK_RESPONSE = json.dumps(
+    {
+        'resolved_event': f'Alice: {_SPEECH}\n{_CORE_RESULT}',
+        'stage_directions': _CORE_RESULT,
+    },
+    ensure_ascii=False,
+)
+
+
+def _last_block(prompt: str) -> str:
+  """Returns the prompt from its last Question block on (routing scope)."""
+  start = prompt.rfind('Question: ')
+  return prompt[start:] if start >= 0 else ''
+
+
+def _read_evidence(prompt: str) -> dict:
+  """Reads the marked JSON resolution-evidence section of a prompt.
+
+  Mirrors the decoder of the example's stub (contrib must not import
+  examples, so the few lines live here): the section is a JSON object on
+  the line after the mark, decoded with a JSON decoder so multi-line
+  values survive verbatim.
+
+  Args:
+    prompt: the recorded final-generation or review prompt.
+
+  Returns:
+    The decoded evidence object.
+
+  Raises:
+    AssertionError: if the marked section holds no decodable object.
+  """
+  mark = '## Resolution evidence (data)'
+  index = prompt.find(mark)
+  assert index >= 0, 'prompt carries no evidence section'
+  remainder = prompt[index + len(mark) :]
+  start = remainder.find('{')
+  payload, _ = json.JSONDecoder().raw_decode(remainder[start:])
+  return payload
+
 
 class _PromptRecordingModel(mock_model.MockModel):
   """Mock model recording every prompt it is asked to sample."""
 
-  def __init__(self, response: str, *, review: str | None = None):
+  def __init__(
+      self,
+      response: str,
+      *,
+      review: str | None = None,
+      attempt: str | None = None,
+  ):
     super().__init__(response)
     self.prompts: list[str] = []
     self.review = review or '{"valid": true, "reason": "Only speech occurs."}'
+    self.attempt = attempt
 
   def sample_text(self, prompt, **kwargs):
     del kwargs
     self.prompts.append(prompt)
     if '# Story resolution semantic review' in prompt:
       return self.review
+    # Route on the last Question block: the resolution chain shares one
+    # document, so earlier questions stay quoted inside later prompts.
+    if self.attempt is not None and _ATTEMPT_QUESTION_MARK in _last_block(
+        prompt
+    ):
+      return self.attempt
     return self._response
 
 
@@ -114,9 +186,14 @@ def _character_params(name: str, secret: str = '') -> dict:
   }
 
 
-def _build_character(name: str, secret: str = ''):
+def _build_character(name: str, secret: str = '', response: str | None = None):
+  model = (
+      mock_model.MockModel(response)
+      if response is not None
+      else mock_model.MockModel()
+  )
   return story_character.Entity(params=_character_params(name, secret)).build(
-      model=mock_model.MockModel(),
+      model=model,
       memory_bank=associative_memory.AssociativeMemoryBank(
           sentence_embedder=_embedder
       ),
@@ -442,6 +519,179 @@ class StoryGameMasterPrefabTest(absltest.TestCase):
     self.assertEqual(director.get_state()['story_turn'], 0)
     self.assertEqual(director.get_state()['directive']['status'], 'integrating')
     self.assertIsNone(director.get_state()['last_directive_executed_turn'])
+
+
+class StoryActionModeWiringTest(absltest.TestCase):
+  """The prefab validates and forwards action_mode through the chain.
+
+  The action contract is observable only through behavior: with
+  ``speech_and_action`` the built game master decodes the player's JSON
+  contract, adjudicates the character's own action attempt through the
+  core helper before the director note and the final dual-track output,
+  and the core's true return value reaches both later prompts through
+  the resolution evidence. The default build stays pure speech.
+  """
+
+  def test_build_rejects_unknown_action_mode(self):
+    players = [_build_character(name) for name in _PLAYERS]
+    with self.assertRaises(ValueError):
+      _build_game_master(
+          _PromptRecordingModel(_DUAL_TRACK_RESPONSE),
+          players,
+          action_mode='telepathy',
+      )
+
+  def test_default_build_is_speech_only_without_adjudication_calls(self):
+    players = [_build_character(name) for name in _PLAYERS]
+    model = _PromptRecordingModel(_DUAL_TRACK_RESPONSE)
+    gm = _build_game_master(model, players)
+    sequential.Sequential().run_loop(
+        game_masters=[gm], entities=players, max_steps=1
+    )
+    self.assertFalse(
+        any(_ADJUDICATION_CONTEXT_MARK in p for p in model.prompts)
+    )
+    self.assertFalse(any(_ATTEMPT_QUESTION_MARK in p for p in model.prompts))
+    director = gm.get_component(
+        drama_director_lib.DEFAULT_DRAMA_DIRECTOR_COMPONENT_KEY,
+        type_=drama_director_lib.DramaDirector,
+    )
+    turn = director.get_last_story_turn()
+    assert turn is not None
+    self.assertEqual(turn['speech'], _SPEECH)
+    self.assertEqual(turn['action_intent'], '')
+    self.assertEqual(turn['raw_action'], _SPEECH)
+
+  def test_speech_and_action_decodes_and_adjudicates_before_final(self):
+    players = [
+        _build_character(name, response=_CONTRACT_RESPONSE) for name in _PLAYERS
+    ]
+    model = _PromptRecordingModel(
+        _ACTION_DUAL_TRACK_RESPONSE, attempt=_CORE_ATTEMPT_ANSWER
+    )
+    gm = _build_game_master(
+        model,
+        players,
+        action_mode='speech_and_action',
+        character_constraints={
+            'Alice': 'Alice never lies.',
+            'Bob': 'Bob never signs.',
+        },
+    )
+    sequential.Sequential().run_loop(
+        game_masters=[gm], entities=players, max_steps=1
+    )
+    director = gm.get_component(
+        drama_director_lib.DEFAULT_DRAMA_DIRECTOR_COMPONENT_KEY,
+        type_=drama_director_lib.DramaDirector,
+    )
+    turn = director.get_last_story_turn()
+    assert turn is not None
+    # The director received the contract mode: the raw JSON action is
+    # decoded into speech and action intent for the committed turn.
+    self.assertEqual(turn['speech'], _SPEECH)
+    self.assertEqual(turn['action_intent'], _ACTION_INTENT)
+    self.assertEqual(turn['raw_action'], _CONTRACT_RESPONSE)
+
+    adjudication_prompts = [
+        p for p in model.prompts if _ATTEMPT_QUESTION_MARK in _last_block(p)
+    ]
+    self.assertLen(adjudication_prompts, 1)
+    adjudication = adjudication_prompts[0]
+    self.assertIn('## Current speaker\nAlice', adjudication)
+    self.assertIn(f'## Original speech (verbatim)\n{_SPEECH}', adjudication)
+    self.assertIn(
+        "## The speaker's own attempted action (adjudicate only this)\n"
+        + _ACTION_INTENT,
+        adjudication,
+    )
+    self.assertIn('## Adjudication rules', adjudication)
+    self.assertIn(
+        'Never decide a new voluntary action for any other player character',
+        adjudication,
+    )
+    self.assertIn(f'- immutable fact: {_IMMUTABLE_FACTS[0]}', adjudication)
+    self.assertIn('- Alice: Alice never lies.', adjudication)
+    self.assertIn('- Bob: Bob never signs.', adjudication)
+    self.assertIn(
+        'Player characters whose voluntary actions only they can choose:'
+        ' Alice, Bob',
+        adjudication,
+    )
+
+    final_prompts = [
+        p
+        for p in model.prompts
+        if 'Output a JSON object with exactly two string fields' in p
+    ]
+    reviews = [
+        p for p in model.prompts if '# Story resolution semantic review' in p
+    ]
+    self.assertLen(final_prompts, 1)
+    self.assertLen(reviews, 1)
+    # Chain order: adjudication, then the final dual-track generation,
+    # then the review (the director note is the identity without a
+    # pending directive, so it contributes no prompt).
+    self.assertLess(
+        model.prompts.index(adjudication), model.prompts.index(final_prompts[0])
+    )
+    self.assertLess(
+        model.prompts.index(final_prompts[0]), model.prompts.index(reviews[0])
+    )
+    self.assertFalse(any(_COMPLICATION_MARK in p for p in model.prompts))
+    # The core helper's true return value (its causal-statement glue
+    # included) is the evidence both later prompts consume.
+    core_result = f'{_ACTION_INTENT} Because of that, {_CORE_ATTEMPT_ANSWER}'
+    for prompt in (final_prompts[0], reviews[0]):
+      evidence = _read_evidence(prompt)
+      self.assertEqual(evidence['action_intent'], _ACTION_INTENT)
+      self.assertEqual(evidence['action_result'], core_result)
+      self.assertIsNone(evidence['intervention'])
+
+  def test_director_note_sits_between_adjudication_and_final_output(self):
+    players = [
+        _build_character(name, response=_CONTRACT_RESPONSE) for name in _PLAYERS
+    ]
+    model = _PromptRecordingModel(
+        _ACTION_DUAL_TRACK_RESPONSE, attempt=_CORE_ATTEMPT_ANSWER
+    )
+    gm = _build_game_master(model, players, action_mode='speech_and_action')
+    director = gm.get_component(
+        drama_director_lib.DEFAULT_DRAMA_DIRECTOR_COMPONENT_KEY,
+        type_=drama_director_lib.DramaDirector,
+    )
+    state = director.get_state()
+    state['directive'] = {
+        'beat_id': 'b1',
+        'generated_at_turn': 0,
+        'content': 'Thunder outside.',
+        'status': 'pending',
+    }
+    director.set_state(state)
+    sequential.Sequential().run_loop(
+        game_masters=[gm], entities=players, max_steps=1
+    )
+    adjudication = next(
+        p for p in model.prompts if _ADJUDICATION_CONTEXT_MARK in p
+    )
+    complication = next(p for p in model.prompts if _COMPLICATION_MARK in p)
+    merge = next(
+        p for p in model.prompts if '## Chosen complication to weave in' in p
+    )
+    final = next(
+        p
+        for p in model.prompts
+        if 'Output a JSON object with exactly two string fields' in p
+    )
+    review = next(
+        p for p in model.prompts if '# Story resolution semantic review' in p
+    )
+    order = [adjudication, complication, merge, final, review]
+    positions = [model.prompts.index(p) for p in order]
+    self.assertEqual(positions, sorted(positions))
+    # The directive fused by the note is committed as consumed with the
+    # validated resolution of the same turn.
+    self.assertEqual(director.get_state()['directive']['status'], 'consumed')
 
 
 if __name__ == '__main__':

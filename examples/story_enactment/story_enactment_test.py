@@ -26,6 +26,12 @@ seven mandated scenario groups of the stage-1 plan are covered:
 6. budget path B (exhaustion at the completion-judgment position);
 7. API retry exhaustion at the completion judgment recorded as error.
 
+The task-9 action suites cover the adjudicated chain end to end:
+`ActionPipelineIntegrationTest` (core results flow to observation and
+exports), `ActionBoundaryIntegrationTest` (agency boundaries on real
+prompts) and `ActionChainBudgetTest` (both budget paths of the
+speech-and-action chain).
+
 Model-call counts are deterministic in the sequential engine: one story
 turn costs three perception questions plus the speech exercise plus the
 final resolution and its semantic review (6 text attempts), plus one choice
@@ -42,12 +48,13 @@ import os
 import tempfile
 import time
 import types
-from typing import Any
+from typing import Any, cast
 import unittest
 from unittest import mock
 import xml.etree.ElementTree as ET
 
 from concordia.contrib.components.game_master import drama_director
+from concordia.contrib.components.game_master import story_action
 from concordia.contrib.language_models import budget_wrapper
 from concordia.prefabs.simulation import generic as simulation_lib
 import numpy as np
@@ -2011,6 +2018,711 @@ class ActionModeRunTest(_StateDirTestCase):
       json.dump(envelope, handle, ensure_ascii=False, indent=2)
     with self.assertRaisesRegex(ValueError, 'schema version'):
       run_lib.run(self.state_dir, resume=True)
+
+
+# The GM-only date of the swapped old will: public only after the core
+# adjudication discloses it (task-9 pipeline tests).
+_WILL_DATE = '二〇一九年三月十二日'
+
+# Fingerprints for locating real prompts of the action chain.
+_ATTEMPT_QUESTION = 'What happens as a result of the attempted action?'
+_DUAL_TRACK_MARK = 'Output a JSON object with exactly two string fields'
+_REVIEW_MARK = '# Story resolution semantic review'
+
+
+def _last_question_block(prompt: str) -> str:
+  """Returns the prompt from its last Question block on."""
+  start = prompt.rfind('Question: ')
+  return prompt[start:] if start >= 0 else ''
+
+
+def _prompts_routed_to(stub, fingerprint: str) -> list[str]:
+  """Returns the prompts whose LAST question block carries the mark.
+
+  The resolution chain shares one document, so earlier questions stay
+  quoted inside later prompts; routing scope mirrors the stub's. Use
+  `_prompts_containing` for statement fingerprints that never appear
+  inside a question (e.g. the review heading).
+
+  Args:
+    stub: the recorded prompt stub model.
+    fingerprint: substring identifying the routed question.
+
+  Returns:
+    The matching prompts in call order.
+  """
+  return [
+      p for p in stub.text_prompts if fingerprint in _last_question_block(p)
+  ]
+
+
+def _prompts_containing(stub, fingerprint: str) -> list[str]:
+  """Returns the prompts containing a statement fingerprint anywhere."""
+  return [p for p in stub.text_prompts if fingerprint in p]
+
+
+def _exercise_prompts_of(stub, name: str) -> list[str]:
+  """Returns one character's recorded action prompts (speech contract)."""
+  return [p for p in stub.text_prompts if f'{name} 现在说什么' in p]
+
+
+def _fdx_paragraphs(state_dir: str, paragraph_type: str) -> list[str]:
+  """Returns the text of one paragraph type of the exported FDX."""
+  root = ET.fromstring(
+      open(os.path.join(state_dir, 'script.fdx'), encoding='utf-8').read()
+  )
+  return [
+      node.text or ''
+      for node in root.findall(
+          f"./Content/Paragraph[@Type='{paragraph_type}']/Text"
+      )
+  ]
+
+
+class _ActionChainTestCase(_StateDirTestCase):
+  """Base for speech-and-action chain tests with a recorded stub.
+
+  All runs use the beats_only stage switch with scoring disabled and no
+  director feedback (and no repetition intervention exists yet at this
+  stage), so the only behavioral change under test is the character's
+  own action adjudication.
+  """
+
+  def _action_config(
+      self,
+      *,
+      total_turn_limit: int = 4,
+      total_model_attempt_limit: int = 100,
+  ) -> dict[str, Any]:
+    return _fixture_config(
+        total_turn_limit=total_turn_limit,
+        total_model_attempt_limit=total_model_attempt_limit,
+        beats=(_beat('b1', max_turns=99),),
+        completion_answers={},
+        scene_rounds=99,
+        action_mode='speech_and_action',
+    )
+
+  def _run_with_stub(self, directory: str, config, stub):
+    with mock.patch.object(
+        run_lib, 'make_language_model', return_value=(stub, ())
+    ):
+      return run_lib.run(directory, run_config=config)
+
+
+class ActionPipelineIntegrationTest(_ActionChainTestCase):
+  """Adjudicated core results flow through observation and exports.
+
+  The deterministic stub's dual-track draft narrates only the evidence
+  the current prompt carries (never stub configuration), so a marker
+  reaching the canonical event, the next player's observation and the
+  FDX Action paragraph proves the core helper's true return value
+  traveled the whole chain.
+  """
+
+  _LAWYER_LINE = '于程序而言，我要求当庭核验这份原件。'
+  _LAWYER_INTENT = '周律师从封套中取出旧遗嘱原件，逐字查验落款日期。'
+  _SUCCESS_RESULT = f'原件落款日期为{_WILL_DATE}，纸面上有陈望山的签名与手印。'
+  _FAILURE_RESULT = '封套受潮粘连，落款日期无法辨认。'
+  _SAFE_INTENT = '林雪用自己持有的那把钥匙去开堂屋侧室的保险柜。'
+  _BLOCKED_RESULT = (
+      '保险柜纹丝不动：它须两把钥匙同时转动才能开启，林雪手里只有一把，'
+      '柜门没有开启。'
+  )
+
+  def test_success_result_flows_to_observation_and_fdx(self):
+    config = self._action_config()
+    stub = testing_stubs.PromptStubModel(
+        dialogue_lines={'周律师': self._LAWYER_LINE},
+        action_intents={'周律师': self._LAWYER_INTENT},
+        action_result=self._SUCCESS_RESULT,
+        stage_directions='',
+    )
+    result = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(result.reason, 'step_limit')
+    self.assertEqual(result.committed_turn_id, 4)
+    records = self.turn_log().load()
+    self.assertEqual([r['turn_id'] for r in records], [1, 2, 3, 4])
+    # The lawyer's turn is decoded from the JSON contract.
+    lawyer = records[2]
+    self.assertEqual(lawyer['actor'], '周律师')
+    self.assertEqual(lawyer['speech'], self._LAWYER_LINE)
+    self.assertEqual(lawyer['action_intent'], self._LAWYER_INTENT)
+    speech, intent = story_action.decode_action(lawyer['raw_action'])
+    self.assertEqual((speech, intent), (self._LAWYER_LINE, self._LAWYER_INTENT))
+    self.assertEqual(lawyer['schema_version'], 2)
+    # The core helper's true return value (its causal glue included) is
+    # the whole narrator track and reaches the canonical event verbatim.
+    core_result = (
+        f'{self._LAWYER_INTENT} Because of that, {self._SUCCESS_RESULT}'
+    )
+    self.assertEqual(lawyer['stage_directions'], core_result)
+    self.assertEqual(
+        lawyer['resolved_event'],
+        f'周律师: {self._LAWYER_LINE}\n' + core_result,
+    )
+    # The same evidence section reached the final generation and review.
+    finals = _prompts_routed_to(stub, _DUAL_TRACK_MARK)
+    reviews = _prompts_containing(stub, _REVIEW_MARK)
+    self.assertEqual(len(finals), 4)
+    self.assertEqual(len(reviews), 4)
+    for prompt in (finals[2], reviews[2]):
+      evidence = testing_stubs.read_evidence_section(prompt)
+      assert evidence is not None
+      self.assertEqual(evidence['action_result'], core_result)
+      self.assertEqual(evidence['action_intent'], self._LAWYER_INTENT)
+    # Only the lawyer's turn was adjudicated.
+    self.assertEqual(len(_prompts_routed_to(stub, _ATTEMPT_QUESTION)), 1)
+    # Before the action happened, no earlier round exposed the date.
+    for record in records[:2]:
+      self.assertNotIn(_WILL_DATE, record['resolved_event'])
+      self.assertNotIn(_WILL_DATE, record['stage_directions'])
+    for name in ('林雪', '陈默', '周律师'):
+      for prompt in _exercise_prompts_of(stub, name):
+        self.assertNotIn(_WILL_DATE, prompt)
+    # After the adjudicated disclosure, the next player observed it: the
+    # date is in 王婶's actual action prompt and in her restored memory.
+    wang_prompts = _exercise_prompts_of(stub, '王婶')
+    self.assertEqual(len(wang_prompts), 1)
+    self.assertIn(_WILL_DATE, wang_prompts[0])
+    sim_after, director_after = self.restored(config)
+    recent_events = cast(
+        'list[str]', director_after.get_state()['recent_events']
+    )
+    self.assertIn(_WILL_DATE, recent_events[2])
+    self.assertIn(_WILL_DATE, _entity_memory_text(sim_after, '王婶'))
+    # The FDX carries the adjudicated date in exactly one Action
+    # paragraph; the dialogue track only has the lawyer's own words.
+    actions = _fdx_paragraphs(self.state_dir, 'Action')
+    self.assertEqual(actions, [core_result])
+    self.assertIn(_WILL_DATE, actions[0])
+    dialogues = _fdx_paragraphs(self.state_dir, 'Dialogue')
+    self.assertEqual(dialogues.count(self._LAWYER_LINE), 1)
+    self.assertNotIn(_WILL_DATE, '\n'.join(dialogues))
+
+  def test_blocked_result_flows_to_observation_and_fdx(self):
+    config = self._action_config(total_turn_limit=2)
+    stub = testing_stubs.PromptStubModel(
+        action_intents={'林雪': self._SAFE_INTENT},
+        action_result=self._BLOCKED_RESULT,
+        stage_directions='',
+    )
+    result = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(result.reason, 'step_limit')
+    self.assertEqual(result.committed_turn_id, 2)
+    records = self.turn_log().load()
+    blocked = records[0]
+    core_result = f'{self._SAFE_INTENT} Because of that, {self._BLOCKED_RESULT}'
+    self.assertEqual(blocked['stage_directions'], core_result)
+    self.assertIn('柜门没有开启', blocked['resolved_event'])
+    # The adjudication question was conditioned on the public two-key
+    # constraint (the world constraints section of the shared document).
+    adjudication = _prompts_routed_to(stub, _ATTEMPT_QUESTION)[0]
+    self.assertIn('保险柜须两把钥匙同时转动才能开启', adjudication)
+    # No other player's new choice is generated: nobody hands over the
+    # second key, and the key holder is never made to act.
+    self.assertNotIn('陈母', blocked['resolved_event'])
+    for fabricated in ('交出', '递上', '第二把钥匙', '陈默', '周律师'):
+      self.assertNotIn(fabricated, blocked['stage_directions'])
+    # The explicit failure reached the next player's observation.
+    chen_prompts = _exercise_prompts_of(stub, '陈默')
+    self.assertEqual(len(chen_prompts), 1)
+    self.assertIn('柜门没有开启', chen_prompts[0])
+    # And the exported Action paragraph narrates the failure.
+    self.assertEqual(_fdx_paragraphs(self.state_dir, 'Action'), [core_result])
+
+  def test_changing_only_core_result_changes_final_event(self):
+    # Same config, inputs and background (no fixed stage directions):
+    # only the core adjudication's answer differs between the two runs.
+    def core_run(subdir: str, core_answer: str):
+      os.makedirs(subdir, exist_ok=True)
+      config = self._action_config()
+      stub = testing_stubs.PromptStubModel(
+          dialogue_lines={'周律师': self._LAWYER_LINE},
+          action_intents={'周律师': self._LAWYER_INTENT},
+          action_result=core_answer,
+          stage_directions='',
+      )
+      result = self._run_with_stub(subdir, config, stub)
+      return result, self._records_of(subdir), stub
+
+    success_dir = os.path.join(self._tmp.name, 'success')
+    failure_dir = os.path.join(self._tmp.name, 'failure')
+    success_result, success_records, success_stub = core_run(
+        success_dir, self._SUCCESS_RESULT
+    )
+    failure_result, failure_records, failure_stub = core_run(
+        failure_dir, self._FAILURE_RESULT
+    )
+    self.assertEqual(success_result.reason, failure_result.reason)
+    # The turns before the action are identical across the runs.
+    self.assertEqual(success_records[:2], failure_records[:2])
+    # The final event and every export follow the core's answer.
+    self.assertNotEqual(
+        success_records[2]['resolved_event'],
+        failure_records[2]['resolved_event'],
+    )
+    self.assertIn(_WILL_DATE, success_records[2]['resolved_event'])
+    self.assertNotIn(_WILL_DATE, failure_records[2]['resolved_event'])
+    self.assertIn('无法辨认', failure_records[2]['stage_directions'])
+    self.assertNotEqual(
+        _fdx_paragraphs(success_dir, 'Action'),
+        _fdx_paragraphs(failure_dir, 'Action'),
+    )
+    self.assertIn(_WILL_DATE, _fdx_paragraphs(success_dir, 'Action')[0])
+    self.assertNotIn(
+        _WILL_DATE, '\n'.join(_fdx_paragraphs(failure_dir, 'Action'))
+    )
+    # The next player's observation also differs.
+    self.assertIn(_WILL_DATE, _exercise_prompts_of(success_stub, '王婶')[0])
+    self.assertNotIn(
+        _WILL_DATE, '\n'.join(_exercise_prompts_of(failure_stub, '王婶'))
+    )
+
+  def _records_of(self, directory: str) -> list[dict[str, Any]]:
+    return collector.StoryTurnLog(
+        os.path.join(directory, 'story_turns.jsonl')
+    ).load()
+
+  def test_action_only_is_visible_without_fabricated_speech(self):
+    intent = '林雪起身去关紧被穿堂风扫开的窗门。'
+    for subdir, core_answer, marker in (
+        ('success', '窗门被关紧，堂内的烛火稳了下来。', '窗门被关紧'),
+        ('failure', '窗门卡住了，怎么也关不上。', '窗门卡住'),
+    ):
+      with self.subTest(outcome=subdir):
+        directory = os.path.join(self._tmp.name, subdir)
+        os.makedirs(directory, exist_ok=True)
+        config = self._action_config(total_turn_limit=2)
+        stub = testing_stubs.PromptStubModel(
+            dialogue_lines={'林雪': ''},
+            action_intents={'林雪': intent},
+            action_result=core_answer,
+            stage_directions='',
+        )
+        result = self._run_with_stub(directory, config, stub)
+        self.assertEqual(result.reason, 'step_limit')
+        self.assertEqual(result.committed_turn_id, 2)
+        records = self._records_of(directory)
+        action_only = records[0]
+        self.assertEqual(action_only['actor'], '林雪')
+        self.assertEqual(action_only['speech'], '')
+        self.assertEqual(action_only['action_intent'], intent)
+        speech, decoded_intent = story_action.decode_action(
+            action_only['raw_action']
+        )
+        self.assertEqual((speech, decoded_intent), ('', intent))
+        # The canonical event carries no fabricated speaker line: it is
+        # the adjudicated narrator track alone.
+        core_result = f'{intent} Because of that, {core_answer}'
+        self.assertEqual(action_only['resolved_event'], core_result)
+        self.assertEqual(action_only['stage_directions'], core_result)
+        # The outcome reached the next player's observation...
+        chen_prompts = _exercise_prompts_of(stub, '陈默')
+        self.assertEqual(len(chen_prompts), 1)
+        self.assertIn(marker, chen_prompts[0])
+        # ...and the export: an Action paragraph, no Character cue and
+        # no invented dialogue for the silent turn.
+        self.assertIn(marker, _fdx_paragraphs(directory, 'Action')[0])
+        characters = [
+            c
+            for c in ET.fromstring(
+                open(
+                    os.path.join(directory, 'script.fdx'),
+                    encoding='utf-8',
+                ).read()
+            ).findall("./Content/Paragraph[@Type='Character']/Text")
+        ]
+        self.assertEqual([c.text for c in characters], ['陈默'])
+        self.assertNotIn(
+            '林雪', '\n'.join(_fdx_paragraphs(directory, 'Dialogue'))
+        )
+
+  def test_multiline_speech_is_preserved_end_to_end(self):
+    speech = '这话说前半句。\n\n这后半句，我今天必须说完。'
+
+    class FlatteningDraft(testing_stubs.PromptStubModel):
+      """A draft that flattens paragraph breaks, like a real model might."""
+
+      def _dual_track_output(self, prompt):
+        payload = json.loads(super()._dual_track_output(prompt))
+        payload['resolved_event'] = payload['resolved_event'].replace(
+            '\n\n', ' '
+        )
+        return json.dumps(payload, ensure_ascii=False)
+
+    config = self._action_config(total_turn_limit=1)
+    stub = FlatteningDraft(dialogue_lines={'林雪': speech}, stage_directions='')
+    result = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(result.reason, 'step_limit')
+    self.assertEqual(result.committed_turn_id, 1)
+    record = self.turn_log().load()[0]
+    # Whitespace-level draft flattening is tolerated; the canonical
+    # event and the JSONL keep the original characters.
+    self.assertEqual(record['speech'], speech)
+    self.assertEqual(record['resolved_event'], f'林雪: {speech}')
+    self.assertEqual(record['stage_directions'], '')
+    # The XML-decoded FDX dialogue keeps the raw paragraph break.
+    self.assertEqual(_fdx_paragraphs(self.state_dir, 'Dialogue'), [speech])
+
+    class RewritingDraft(testing_stubs.PromptStubModel):
+      """A draft that changes one word: the word-level error branch."""
+
+      def _dual_track_output(self, prompt):
+        payload = json.loads(super()._dual_track_output(prompt))
+        payload['resolved_event'] = payload['resolved_event'].replace(
+            '必须说完', '不必再说'
+        )
+        return json.dumps(payload, ensure_ascii=False)
+
+    error_dir = os.path.join(self._tmp.name, 'word-change')
+    os.makedirs(error_dir, exist_ok=True)
+    stub = RewritingDraft(dialogue_lines={'林雪': speech}, stage_directions='')
+    result = self._run_with_stub(error_dir, config, stub)
+    self.assertEqual(result.reason, 'error')
+    self.assertIn('rewrote the original speech', result.error_message or '')
+    self.assertEqual(self._records_of(error_dir), [])
+    self.assertEqual(
+        _fdx_paragraphs(error_dir, 'Dialogue'),
+        [],
+    )
+
+
+class ActionBoundaryIntegrationTest(_ActionChainTestCase):
+  """Agency boundaries of the adjudicated chain, observed on real prompts.
+
+  NOTE: the stub's fixed approving review exercises the plumbing of the
+  boundary prompts (and, where injected, the rejection path), never the
+  real semantic judgment of a production model. Each case records the
+  actual adjudication / review prompts and asserts the constraints they
+  carry; live-model acceptance remains necessary (see README).
+  """
+
+  _SIGN_INTENT = '周律师把会议笔录推到陈母面前，要求她当场签字认罪。'
+  _SIGN_REFUSAL = '陈母把笔录推了回去，既没有签字，也没有答应任何条件。'
+  _CONSENT_INTENT = '林雪当众明确表示同意暂缓出售老宅。'
+  _CONSENT_RESULT = '林雪当众声明她本人同意暂缓处置老宅，这是她自己的表态。'
+  _READING_INTENT = '周律师当众逐字宣读旧遗嘱的全文内容。'
+  _READING_RESULT = (
+      '周律师展开旧遗嘱准备宣读，但全文的具体条款并未在此刻被当众披露。'
+  )
+  _SECRET_SENTENCE = '他欠下巨额赌债，三个月内必须还清，否则后果不堪设想。'
+
+  def test_signature_request_does_not_create_the_other_players_choice(self):
+    config = self._action_config(total_turn_limit=3)
+    stub = testing_stubs.PromptStubModel(
+        action_intents={'周律师': self._SIGN_INTENT},
+        action_result=self._SIGN_REFUSAL,
+        stage_directions='',
+    )
+    result = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(result.committed_turn_id, 3)
+    # The adjudication prompt carries the agency rule and names every
+    # player whose voluntary choice it must not decide.
+    adjudication = _prompts_routed_to(stub, _ATTEMPT_QUESTION)[0]
+    self.assertIn(
+        'Never decide a new voluntary action for any other player character',
+        adjudication,
+    )
+    self.assertIn(
+        'Player characters whose voluntary actions only they can choose:'
+        ' 林雪, 陈默, 周律师, 王婶, 陈母',
+        adjudication,
+    )
+    # The review prompt carries the matching signature boundary.
+    review = _prompts_containing(stub, _REVIEW_MARK)[2]
+    self.assertIn('signature', review)
+    # The committed event narrates only the scripted refusal.
+    record = self.turn_log().load()[2]
+    self.assertIn('既没有签字', record['stage_directions'])
+    self.assertNotIn('陈母当众签下名字', record['resolved_event'])
+
+    # Injected reviewer rejection of an invented signature: nothing is
+    # broadcast or committed. This verifies the rejection plumbing; the
+    # approving stub above cannot verify real semantic judgment.
+    class SigningDraft(testing_stubs.PromptStubModel):
+
+      def _dual_track_output(self, prompt):
+        payload = json.loads(super()._dual_track_output(prompt))
+        extra = '陈母当众签下名字并认罪。'
+        payload['stage_directions'] += '\n' + extra
+        payload['resolved_event'] += '\n' + extra
+        return json.dumps(payload, ensure_ascii=False)
+
+    reject_dir = os.path.join(self._tmp.name, 'sign-reject')
+    os.makedirs(reject_dir, exist_ok=True)
+    stub = SigningDraft(
+        action_intents={'周律师': self._SIGN_INTENT},
+        action_result=self._SIGN_REFUSAL,
+        stage_directions='',
+        review_response=(
+            '{"valid": false, "reason": "Invented signature for 陈母"}'
+        ),
+    )
+    result = self._run_with_stub(reject_dir, config, stub)
+    self.assertEqual(result.reason, 'error')
+    self.assertIn('Invented signature', result.error_message or '')
+    records = collector.StoryTurnLog(
+        os.path.join(reject_dir, 'story_turns.jsonl')
+    ).load()
+    self.assertEqual(records, [])
+    self.assertNotIn(
+        '陈母当众签下名字', '\n'.join(_fdx_paragraphs(reject_dir, 'Action'))
+    )
+
+  def test_own_consent_recorded_only_for_the_consenting_character(self):
+    config = self._action_config(total_turn_limit=2)
+    stub = testing_stubs.PromptStubModel(
+        action_intents={'林雪': self._CONSENT_INTENT},
+        action_result=self._CONSENT_RESULT,
+        stage_directions='',
+    )
+    self._run_with_stub(self.state_dir, config, stub)
+    adjudication = _prompts_routed_to(stub, _ATTEMPT_QUESTION)[0]
+    self.assertIn(
+        'Adjudicate only the attempted action the current speaker proposed'
+        ' for themself this turn',
+        adjudication,
+    )
+    record = self.turn_log().load()[0]
+    core_result = (
+        f'{self._CONSENT_INTENT} Because of that, {self._CONSENT_RESULT}'
+    )
+    self.assertEqual(record['stage_directions'], core_result)
+    # Only 林雪's own consent is recorded; nobody else's stance appears.
+    for other in ('陈默', '陈母', '周律师', '王婶', '同意出售', '也都同意'):
+      self.assertNotIn(other, record['resolved_event'])
+
+  def test_past_claims_do_not_generate_physical_evidence(self):
+    claim = '陈默当众声称：保险柜里封存着老人生前留下的监控录像。'
+    config = self._action_config(total_turn_limit=2)
+    stub = testing_stubs.PromptStubModel(
+        dialogue_lines={'陈默': claim}, stage_directions=''
+    )
+    result = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(result.committed_turn_id, 2)
+    # A spoken claim about the past is not an action attempt: no
+    # adjudication call happens for it.
+    self.assertEqual(_prompts_routed_to(stub, _ATTEMPT_QUESTION), [])
+    review = _prompts_containing(stub, _REVIEW_MARK)[1]
+    self.assertIn('not proof of the claims it contains', review)
+    record = self.turn_log().load()[1]
+    # The claim stays attributed speech; no evidence materializes.
+    self.assertIn('监控录像', record['speech'])
+    self.assertEqual(record['stage_directions'], '')
+    self.assertNotIn(
+        '监控录像', '\n'.join(_fdx_paragraphs(self.state_dir, 'Action'))
+    )
+
+  def test_outsider_assertion_does_not_confirm_a_secret(self):
+    assertion = '王婶放大嗓门问道：陈默是不是在外头欠了赌债？'
+    config = self._action_config(total_turn_limit=4)
+    stub = testing_stubs.PromptStubModel(
+        dialogue_lines={'王婶': assertion}, stage_directions=''
+    )
+    result = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(result.committed_turn_id, 4)
+    review = _prompts_containing(stub, _REVIEW_MARK)[3]
+    self.assertIn('GM-only knowledge is not public knowledge', review)
+    record = self.turn_log().load()[3]
+    # The assertion remains quoted speech: it is never upgraded into an
+    # established secret in the narrator track or the exports.
+    self.assertIn('赌债', record['speech'])
+    self.assertEqual(record['stage_directions'], '')
+    self.assertNotIn(
+        '赌债', '\n'.join(_fdx_paragraphs(self.state_dir, 'Action'))
+    )
+    # The exact GM-only secret sentence never broadcasts; other players
+    # hold at most the public accusation they heard.
+    sim_after, _ = self.restored(config)
+    for name in ('林雪', '陈默', '周律师', '王婶'):
+      memory = _entity_memory_text(sim_after, name)
+      self.assertNotIn(self._SECRET_SENTENCE, memory)
+
+  def test_unconfigured_document_content_is_not_invented(self):
+    config = self._action_config(total_turn_limit=3)
+    stub = testing_stubs.PromptStubModel(
+        action_intents={'周律师': self._READING_INTENT},
+        action_result=self._READING_RESULT,
+        stage_directions='',
+    )
+    result = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(result.committed_turn_id, 3)
+    records = self.turn_log().load()
+    # The GM-only configured content of the document (its date) stays
+    # hidden: the adjudicated result alone is narrated.
+    self.assertIn('并未在此刻被当众披露', records[2]['stage_directions'])
+    for record in records:
+      self.assertNotIn(_WILL_DATE, record['resolved_event'])
+      self.assertNotIn(_WILL_DATE, record['stage_directions'])
+    self.assertNotIn(
+        _WILL_DATE, '\n'.join(_fdx_paragraphs(self.state_dir, 'Action'))
+    )
+
+
+class ActionChainBudgetTest(_ActionChainTestCase):
+  """Budget paths of the adjudicated chain (spec section 11.3).
+
+  Model-call pattern per story turn in the sequential engine: three
+  perception questions plus the contract exercise (four entity text
+  calls), then — for a turn with an action intent — one adjudication
+  text call, the final dual-track generation and its semantic review;
+  one extra choice attempt whenever the beat-completion question is
+  asked. Fixtures position exhaustion by the total attempt limit.
+  """
+
+  _INTENTS = {'林雪': '林雪检查窗栓。', '陈默': '陈默翻看遗嘱封套。'}
+  _RESULT = '动作有了确定的结果。'
+
+  def _intent_config(self, *, limit: int, turns: int = 4) -> dict[str, Any]:
+    return self._action_config(
+        total_turn_limit=turns, total_model_attempt_limit=limit
+    )
+
+  def _run_budget(self, directory: str, config, *, intents=None, **stub_params):
+    stub = testing_stubs.PromptStubModel(
+        action_intents=self._INTENTS if intents is None else intents,
+        action_result=self._RESULT,
+        stage_directions='',
+        **stub_params,
+    )
+    return self._run_with_stub(directory, config, stub), stub
+
+  def test_exhaustion_at_adjudication_of_step_two(self):
+    # Turn one costs 7 attempts (4 entity + adjudication + final +
+    # review); step two's four entity calls land at 11, so the
+    # adjudication of step two is the blocked 12th attempt.
+    config = self._intent_config(limit=11)
+    result, stub = self._run_budget(
+        self.state_dir, config, dialogue_lines={'陈默': '第二条未广播的台词。'}
+    )
+    self.assertEqual(result.reason, 'budget_limit')
+    self.assertTrue(result.budget_exhausted)
+    self.assertEqual(result.committed_turn_id, 1)
+    self.assertEqual([r['turn_id'] for r in self.turn_log().load()], [1])
+    self.assertEqual(self.envelope()['committed_turn_id'], 1)
+    self.assertEqual(self.envelope()['used_model_attempts'], 7)
+    self.assertEqual(result.used_model_attempts, 11)
+    # The blocked turn was never adjudicated, reviewed, broadcast or
+    # exported: no new StoryTurn, no checkpoint advance, no observation.
+    self.assertEqual(len(_prompts_routed_to(stub, _ATTEMPT_QUESTION)), 1)
+    self.assertEqual(len(_prompts_containing(stub, _REVIEW_MARK)), 1)
+    sim_after, _ = self.restored(config)
+    self.assertNotIn(
+        '第二条未广播的台词', _entity_memory_text(sim_after, '林雪')
+    )
+    self.assertNotIn('第二条未广播的台词', self.read_script('script.fdx'))
+
+  def test_exhaustion_at_final_generation_of_step_two(self):
+    # Limit 12 lets step two's adjudication through (the 12th attempt)
+    # and blocks the final dual-track generation.
+    config = self._intent_config(limit=12)
+    result, stub = self._run_budget(self.state_dir, config)
+    self.assertEqual(result.reason, 'budget_limit')
+    self.assertEqual(result.committed_turn_id, 1)
+    self.assertEqual([r['turn_id'] for r in self.turn_log().load()], [1])
+    self.assertEqual(result.used_model_attempts, 12)
+    # The adjudicated result of the blocked turn exists in the document
+    # trace but is never committed: no second final draft or review.
+    self.assertEqual(len(_prompts_routed_to(stub, _ATTEMPT_QUESTION)), 2)
+    self.assertEqual(len(_prompts_routed_to(stub, _DUAL_TRACK_MARK)), 1)
+    self.assertEqual(len(_prompts_containing(stub, _REVIEW_MARK)), 1)
+
+  def test_exhaustion_at_semantic_review_of_step_two(self):
+    # Limit 13 lets step two's final generation through (the 13th
+    # attempt) and blocks its semantic review.
+    config = self._intent_config(limit=13)
+    result, stub = self._run_budget(self.state_dir, config)
+    self.assertEqual(result.reason, 'budget_limit')
+    self.assertEqual(result.committed_turn_id, 1)
+    self.assertEqual([r['turn_id'] for r in self.turn_log().load()], [1])
+    self.assertEqual(result.used_model_attempts, 13)
+    self.assertEqual(len(_prompts_routed_to(stub, _DUAL_TRACK_MARK)), 2)
+    self.assertEqual(len(_prompts_containing(stub, _REVIEW_MARK)), 1)
+    self.assertEqual(self.envelope()['used_model_attempts'], 7)
+
+  def test_pure_dialogue_skips_the_adjudication_call(self):
+    # In speech_and_action mode, turns without an action intent make
+    # zero adjudication calls: two turns cost exactly the speech-only
+    # pattern (4 + 2 per turn plus one beat-completion choice).
+    action_config = self._intent_config(limit=13, turns=2)
+    result, stub = self._run_budget(self.state_dir, action_config, intents={})
+    self.assertEqual(result.reason, 'step_limit')
+    self.assertEqual(result.committed_turn_id, 2)
+    self.assertEqual(result.used_model_attempts, 13)
+    self.assertEqual(_prompts_routed_to(stub, _ATTEMPT_QUESTION), [])
+    speech_config = _fixture_config(
+        total_turn_limit=2,
+        total_model_attempt_limit=13,
+        beats=(_beat('b1', max_turns=99),),
+        completion_answers={},
+        scene_rounds=99,
+    )
+    speech_dir = os.path.join(self._tmp.name, 'speech-only')
+    speech_result = self._run_with_stub(
+        speech_dir, speech_config, testing_stubs.PromptStubModel()
+    )
+    self.assertEqual(speech_result.reason, 'step_limit')
+    self.assertEqual(speech_result.used_model_attempts, 13)
+
+  def test_intent_adds_exactly_one_attempt_for_the_step(self):
+    # One turn with an adjudicated intent costs exactly one text call
+    # more than the same turn without one (no completion choice is
+    # asked at turn one, since the beat's min_turns is two).
+    with_intent_config = self._intent_config(limit=7, turns=1)
+    result, _ = self._run_budget(self.state_dir, with_intent_config)
+    self.assertEqual(result.committed_turn_id, 1)
+    self.assertEqual(result.used_model_attempts, 7)
+    without_intent_dir = os.path.join(self._tmp.name, 'no-intent')
+    result = self._run_with_stub(
+        without_intent_dir,
+        self._intent_config(limit=6, turns=1),
+        testing_stubs.PromptStubModel(stage_directions=''),
+    )
+    self.assertEqual(result.committed_turn_id, 1)
+    self.assertEqual(result.used_model_attempts, 6)
+
+  def test_path_b_completion_judgment_commits_the_action_step_once(self):
+    # Limit 14 covers both turns fully (7 + 7) and blocks step two's
+    # beat-completion choice: path B commits the adjudicated step once
+    # and the budget stop (not the turn limit) ends the run.
+    config = self._intent_config(limit=14, turns=4)
+    result, _ = self._run_budget(self.state_dir, config)
+    self.assertEqual(result.reason, 'budget_limit')
+    records = self.turn_log().load()
+    self.assertEqual([r['turn_id'] for r in records], [1, 2])
+    self.assertTrue(records[1]['budget_stopped'])
+    self.assertIsNone(records[1]['tension'])
+    self.assertEqual(self.envelope()['committed_turn_id'], 2)
+    self.assertEqual(self.envelope()['used_model_attempts'], 14)
+    # Both adjudicated turns are in the exports exactly once.
+    self.assertEqual(len(_fdx_paragraphs(self.state_dir, 'Action')), 2)
+    _, director = self.restored(config)
+    state = director.get_state()
+    self.assertEqual(state['story_turn'], 2)
+    self.assertTrue(state['budget_stopped'])
+    self.assertFalse(director._awaiting_event)  # pylint: disable=protected-access
+    self.assertIsNone(director._pending_commit)  # pylint: disable=protected-access
+
+  def test_path_b_scoring_position_commits_the_action_step_once(self):
+    # With scoring enabled every second turn, limit 15 covers both
+    # turns plus step two's completion choice, and blocks the scoring
+    # question: still exactly one commit of the adjudicated step.
+    config = self._intent_config(limit=15, turns=4)
+    config['mode'] = 'tension_observe'
+    config['director_params'] = {
+        'eval_interval': 2,
+        'scoring_window': 8,
+        'tolerance': 1,
+        'feedback_enabled': False,
+    }
+    result, _ = self._run_budget(self.state_dir, config)
+    self.assertEqual(result.reason, 'budget_limit')
+    records = self.turn_log().load()
+    self.assertEqual([r['turn_id'] for r in records], [1, 2])
+    self.assertTrue(records[1]['budget_stopped'])
+    self.assertEqual(self.envelope()['committed_turn_id'], 2)
+    self.assertEqual(result.used_model_attempts, 15)
 
 
 if __name__ == '__main__':
