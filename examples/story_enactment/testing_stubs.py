@@ -182,8 +182,8 @@ class PromptStubModel(language_model.LanguageModel):
       dialogue_lines: mapping from character name to the line spoken
         when the speech call to action addresses that character.
       default_line: line spoken for characters not in the mapping.
-      stage_directions: fixed stage-directions track of resolutions.
-        With resolution evidence present it is background only; the
+      stage_directions: fixed background narration appended after the
+        evidence-derived facts in both tracks of a resolution; the
         propagation tests set it to ''.
       choice_answer: option text chosen for choice prompts without a
         configured beat-completion answer.
@@ -379,12 +379,17 @@ class PromptStubModel(language_model.LanguageModel):
   def _dual_track_output(self, prompt: str) -> str:
     """Builds a valid dual-track JSON preserving the speech verbatim.
 
-    Beyond the speech, the resolved event narrates only what the
-    current prompt's marked evidence section actually carries: the
+    Beyond the speech, both tracks narrate only what the current
+    prompt's marked evidence section actually carries: the
     core-adjudicated action result and the intervention candidate's
     post-merge text. Nothing is read from configuration or from what
     earlier calls generated, so propagation tests can trust the output
-    as a faithful record of the evidence passed in.
+    as a faithful record of the evidence passed in. The evidence facts
+    also occupy the stage-directions track because the canonical event
+    is assembled from the speech and the approved narrator track alone:
+    only through that track can adjudicated facts reach the public
+    event, and the draft event and the track then narrate the same
+    facts, as the two-track consistency rule requires.
 
     Args:
       prompt: the last question block of the final-generation prompt.
@@ -395,6 +400,9 @@ class PromptStubModel(language_model.LanguageModel):
     evidence = read_evidence_section(prompt)
     speaker_match = _CURRENT_SPEAKER.search(prompt)
     speaker = speaker_match.group(1) if speaker_match else ''
+    parts = (
+        self._evidence_narration_parts(evidence) if evidence is not None else []
+    )
     if evidence is not None and isinstance(evidence.get('speech'), str):
       # The JSON data section is authoritative: unlike the verbatim-
       # speech heading, JSON decoding cannot truncate multi-paragraph
@@ -407,15 +415,16 @@ class PromptStubModel(language_model.LanguageModel):
       resolved = f'{speaker} 沉默片刻。'
     else:
       resolved = f'{speaker}: {speech}'
-    if evidence is not None:
-      for part in self._evidence_narration_parts(evidence):
-        resolved += '\n' + part
+    for part in parts:
+      resolved += '\n' + part
+    stage_tracks = list(parts)
     if self._stage_directions:
       resolved += '\n' + self._stage_directions
+      stage_tracks.append(self._stage_directions)
     return json.dumps(
         {
             'resolved_event': resolved,
-            'stage_directions': self._stage_directions,
+            'stage_directions': '\n'.join(stage_tracks),
         },
         ensure_ascii=False,
     )

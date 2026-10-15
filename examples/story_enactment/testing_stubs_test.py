@@ -19,17 +19,22 @@ enactment example: propagation tests assert that core-adjudicated
 action results and intervention facts actually flow into final
 generation, so the stub must derive its dual-track output from the
 evidence carried by the CURRENT prompt, never from stale configuration
-or from what an earlier call generated. These tests pin that instrument
-down in isolation (stage A); the real final-generation prompt format is
-wired in a later stage and adopts the marked-section reader unchanged.
+or from what an earlier call generated. Stage-A tests pin the routing
+and the decode instrument in isolation; the stage-B joint tests run
+the REAL production final/review prompts from
+``story_resolution.make_final_output_step`` through the stub, proving
+the marked evidence section the production code emits is the one the
+stub reads.
 """
 
 import json
 from typing import Any
 import unittest
+from unittest import mock
 
 from concordia.components.game_master import event_resolution as event_resolution_lib
 from concordia.contrib.components.game_master import story_action
+from concordia.contrib.components.game_master import story_resolution
 from concordia.document import interactive_document
 
 from examples.story_enactment import story_config
@@ -317,6 +322,96 @@ class PromptStubRoutingTest(unittest.TestCase):
     self.assertEqual(
         stub.sample_choice(completion_last, ['A', 'B']), (1, 'B', {})
     )
+
+
+class RealFinalPromptJointTest(unittest.TestCase):
+  """Stage B: the stub against the real production final/review prompts."""
+
+  _SPEECH = '遗嘱的封印从未核验。'
+
+  def _run_final_step(
+      self,
+      *,
+      action_result: str | None,
+      history: str = '',
+      **stub_kwargs: Any,
+  ):
+    """Runs the production final-output step once with the stub model.
+
+    Args:
+      action_result: the core-adjudicated result in the director's
+        resolution evidence.
+      history: optional statements seeded into the chain before the
+        resolution, standing in for earlier question blocks.
+      **stub_kwargs: extra PromptStubModel constructor parameters.
+
+    Returns:
+      A (result, director, stub) tuple of the canonical event, the mock
+      director and the stub model.
+    """
+    director = mock.MagicMock()
+    director.get_current_original_speech.return_value = self._SPEECH
+    director.get_current_action_intent.return_value = _INTENT
+    director.get_current_resolution_evidence.return_value = {
+        'action_result': action_result,
+        'intervention': None,
+    }
+    director.get_committed_events.return_value = ()
+    stub = testing_stubs.PromptStubModel(stage_directions='', **stub_kwargs)
+    chain = interactive_document.InteractiveDocument(stub)
+    if history:
+      chain.statement(history)
+    step = story_resolution.make_final_output_step(director)
+    result = step(chain, f'林雪: {self._SPEECH}', '林雪')
+    return result, director, stub
+
+  def test_real_prompt_routes_evidence_into_canonical(self):
+    # The real production prompt's marked evidence section is the one
+    # the stub reads: ACTION_SUCCEEDED and ACTION_FAILED evidence yield
+    # different canonical events, each carrying only its own actual
+    # result, and the adjudicated result reaches the stored dual-track
+    # resolution through the approved narrator track.
+    succeeded, director, stub_a = self._run_final_step(
+        action_result=_SUCCEEDED_RESULT
+    )
+    failed, _, stub_b = self._run_final_step(action_result=_FAILED_RESULT)
+    self.assertNotEqual(succeeded, failed)
+    self.assertIn(_SUCCEEDED_RESULT, succeeded)
+    self.assertNotIn(_FAILED_RESULT, succeeded)
+    self.assertIn(_FAILED_RESULT, failed)
+    self.assertNotIn(_SUCCEEDED_RESULT, failed)
+    for stub in (stub_a, stub_b):
+      generation, review = stub.text_prompts
+      self.assertIn(testing_stubs.EVIDENCE_SECTION_MARK, generation)
+      self.assertIn(_INTENT, generation)
+      self.assertIn('# Story resolution semantic review', review)
+      self.assertIn('林雪', review)
+    director.set_validated_resolution.assert_called_once_with(
+        succeeded, _SUCCEEDED_RESULT
+    )
+
+  def test_historical_scoring_and_completion_do_not_hijack(self):
+    # Earlier scoring and beat-completion blocks in the chain history
+    # must never capture the final-generation or review routes, even
+    # with scoring and completion answers configured on the stub.
+    history = (
+        'Question: Respond with a single integer from 1 to 10 and nothing'
+        ' else.\nAnswer: 9\n'
+        'Current beat "b1": 开场\n'
+        'Question: 节拍 b1 的完成条件是否已经出现？\n'
+        '  (A) Yes\n  (B) No\nAnswer: (B)\n'
+    )
+    result, director, stub = self._run_final_step(
+        action_result=_SUCCEEDED_RESULT,
+        history=history,
+        scoring_answer='9',
+        completion_answers={'b1': 'Yes'},
+    )
+    self.assertIn(self._SPEECH, result)
+    self.assertIn(_SUCCEEDED_RESULT, result)
+    self.assertEqual(len(stub.text_prompts), 2)
+    self.assertEqual(stub.choice_prompts, [])
+    director.set_validated_resolution.assert_called_once()
 
 
 if __name__ == '__main__':

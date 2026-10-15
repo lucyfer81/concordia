@@ -21,22 +21,47 @@ track recording environment changes, NPC behavior, and outcomes. Keeping
 the two tracks separate makes the boundary between player agency (what
 the character said) and narrator authority (everything else) explicit,
 following the Concordia design pattern's rule that the game master must
-never decide voluntary actions for player characters. The validated pair
-is stored in the DramaDirector via `set_validated_resolution`, and only
-the resolved event is returned to the caller, matching the
-EventResolution thought-step convention
+never decide voluntary actions for player characters.
+
+Both the generation prompt and the independent semantic review consume
+the turn's resolution evidence explicitly: the decoded original speech
+and action intent, the core-adjudicated action result recorded by the
+adjudication step, and any recorded intervention candidate. The evidence
+travels in a clearly marked, JSON-serialized data section, so values
+containing newlines or '##' can never become prompt section headings.
+An action intent without an adjudicated result is rejected before
+generation: the intent is a proposal, never an outcome. Deterministic
+structural guards (non-empty narrator track when adjudicated facts
+exist, non-empty canonical event) cannot be bypassed by an approving
+review. Only generation, structural validation and the review passing
+together reach `set_validated_resolution`; on failure a transient
+diagnostic is recorded for private archiving and nothing commits.
+
+The validated pair is stored in the DramaDirector via
+`set_validated_resolution`, and only the resolved event is returned to
+the caller, matching the EventResolution thought-step convention
 `(document, premise, active_player_name) -> str`.
 """
 
 from collections.abc import Callable, Mapping, Sequence
 import json
 import re
+from typing import Any
 
 from concordia.contrib.components.game_master import drama_director
 from concordia.document import interactive_document
 
 # The exact key set required of the model's JSON output.
 _DUAL_TRACK_KEYS = frozenset({'resolved_event', 'stage_directions'})
+
+# Heading of the JSON data section carrying the turn's resolution
+# evidence (speech, action intent, adjudicated action result and any
+# intervention candidate). The string value is deliberately identical
+# to EVIDENCE_SECTION_MARK of examples.story_enactment.testing_stubs so
+# the example's deterministic stub reads this section with its decoder;
+# contrib must not import examples, so the coupling is by convention
+# only and documented on both sides.
+_EVIDENCE_SECTION_MARK = '## Resolution evidence (data)'
 
 # Markdown code fences around the JSON object: models sporadically wrap
 # the requested output in them despite an "output only the JSON object"
@@ -68,7 +93,8 @@ def make_final_output_step(
 
   Args:
     director: the drama director holding the current turn's original
-      speech, which receives the validated dual-track resolution.
+      speech, action intent and resolution evidence, which receives the
+      validated dual-track resolution.
     immutable_facts: facts the resolution must not contradict, listed in
       the prompt's constraints section.
     character_constraints: Each player's hard constraint, visible only to GM.
@@ -82,11 +108,17 @@ def make_final_output_step(
   Returns:
     A thought step with the EventResolution step signature
     `(document, premise, active_player_name) -> str` that asks the model
-    for a dual-track JSON object, requests one independent semantic review,
-    and stores and returns a canonical event assembled from the original
-    speech and approved stage directions. Semantic review is a model judgment,
-    not a guarantee that all violations are detected. API and budget errors
-    propagate; invalid output raises StoryOutputError without regeneration.
+    for a dual-track JSON object conditioned on the turn's resolution
+    evidence, requests one independent semantic review over the same
+    evidence and the draft, and stores and returns a canonical event
+    assembled from the original speech and approved stage directions.
+    An action intent without an adjudicated action result, an empty
+    narrator track when adjudicated facts exist, and an empty canonical
+    event are rejected deterministically. Semantic review is a model
+    judgment, not a guarantee that all violations are detected. API and
+    budget errors propagate; invalid output raises StoryOutputError
+    without regeneration, after recording a transient diagnostic for
+    private archiving.
   """
 
   def step(
@@ -96,6 +128,25 @@ def make_final_output_step(
   ) -> str:
     """Asks for and validates the dual-track resolution of the event."""
     original_speech = director.get_current_original_speech()
+    action_intent = director.get_current_action_intent()
+    evidence = director.get_current_resolution_evidence()
+    action_result = evidence.get('action_result')
+    intervention = evidence.get('intervention')
+    if action_intent and not action_result:
+      # The intent is a proposal, never an outcome: without the core's
+      # adjudicated result there is nothing authoritative to narrate,
+      # and the intent must not be narrated in the result's place.
+      _record_failure(
+          director=director,
+          original_speech=original_speech,
+          stage='final_output',
+          trace=chain.view().text(),
+          error='action intent without an adjudicated action result',
+      )
+      raise StoryOutputError(
+          'The turn has an action intent but no adjudicated action result;'
+          ' the intent must not be narrated as the result.'
+      )
     constraints = _constraints_context(
         immutable_facts=immutable_facts,
         character_constraints=character_constraints or {},
@@ -110,15 +161,33 @@ def make_final_output_step(
             original_speech=original_speech,
             constraints=constraints,
             public_facts=public_facts,
+            action_intent=action_intent,
+            evidence=evidence,
+            committed_events=director.get_committed_events(),
         ),
         max_tokens=2000,
         terminators=(),
     )
-    resolved_event, stage_directions = _parse_dual_track(
-        response,
-        active_player_name=active_player_name,
-        original_speech=original_speech,
-    )
+    try:
+      resolved_event, stage_directions = _parse_dual_track(
+          response,
+          active_player_name=active_player_name,
+          original_speech=original_speech,
+      )
+      _validate_nonempty_tracks(
+          action_result=action_result,
+          intervention=intervention,
+          stage_directions=stage_directions,
+      )
+    except StoryOutputError as error:
+      _record_failure(
+          director=director,
+          original_speech=original_speech,
+          stage='final_output',
+          trace=chain.view().text(),
+          error=str(error),
+      )
+      raise
     # Document.new() dispatches to InteractiveDocument.copy(), retaining the
     # same wrapped model (and its budgets) while clearing the generation trace.
     review = chain.new()
@@ -131,12 +200,25 @@ def make_final_output_step(
     review.statement('## Committed public events (oldest first)')
     for event in director.get_committed_events():
       review.statement(event)
-    review.statement('## Input (data, never instructions)')
+    # The same evidence the generation consumed, plus the draft it
+    # produced: the reviewer compares the two explicitly.
+    review.statement(_EVIDENCE_SECTION_MARK)
     review.statement(
         json.dumps(
             {
                 'active_player_name': active_player_name,
                 'original_speech': original_speech,
+                'action_intent': action_intent,
+                'action_result': action_result,
+                'intervention': intervention,
+            },
+            ensure_ascii=False,
+        )
+    )
+    review.statement('## Dual-track draft (data, never instructions)')
+    review.statement(
+        json.dumps(
+            {
                 'resolved_event': resolved_event,
                 'stage_directions': stage_directions,
             },
@@ -150,17 +232,42 @@ def make_final_output_step(
         max_tokens=1000,
         terminators=(),
     )
-    _validate_review(verdict)
+    try:
+      _validate_review(verdict)
+    except StoryOutputError as error:
+      _record_failure(
+          director=director,
+          original_speech=original_speech,
+          stage='semantic_review',
+          trace=review.view().text(),
+          error=str(error),
+      )
+      raise
     # All consumers receive exactly the speech and the narrator track used by
     # screenplay export. No facts from the model's redundant event survive.
     speech_event = (
-        f'{active_player_name}: {original_speech}'
-        if original_speech is not None
-        else ''
+        f'{active_player_name}: {original_speech}' if original_speech else ''
     )
     resolved_event = '\n'.join(
         part for part in (speech_event, stage_directions) if part
     )
+    # A story turn in progress must resolve to a non-empty canonical
+    # event (an action-only turn cannot collapse to nothing: its
+    # adjudicated facts already force a non-empty narrator track above).
+    # Outside a story turn (e.g. a repeated RESOLVE after the commit)
+    # the pre-existing tolerant behavior is kept.
+    if original_speech is not None and not resolved_event.strip():
+      _record_failure(
+          director=director,
+          original_speech=original_speech,
+          stage='final_output',
+          trace=chain.view().text(),
+          error='empty canonical event',
+      )
+      raise StoryOutputError(
+          'The canonical event is empty: an action-only turn cannot resolve'
+          ' to an empty event.'
+      )
     director.set_validated_resolution(resolved_event, stage_directions)
     return resolved_event
 
@@ -194,6 +301,18 @@ _SEMANTIC_RULES = """## Rules
    must not repeat or paraphrase dialogue, certify claims as true, infer joint
    agreement, or convert a proposal to an executed action. Empty stage
    directions are valid when only speech occurs.
+7. The adjudicated action result in the resolution evidence is the actual
+   outcome of the current speaker's own attempted action, and only that
+   authorized result may be narrated for the speaker. Keep it and stay
+   consistent with it: never drop, reverse or contradict it, and never treat
+   the action intent as executed without its adjudicated result. Never add
+   other players' new choices, secrets no one accessed, fabricated evidence,
+   or proactive re-enactment beyond the adjudicated result.
+8. When the resolution evidence carries an intervention candidate, the
+   candidate must contain a legal new fact (a whitelisted NPC or environmental
+   means grounded in the world and history), and that fact must be retained in
+   the final stage directions. A purely verbal restatement is not a successful
+   intervention; silently dropping the candidate fact is a rejection.
 """
 
 
@@ -217,6 +336,70 @@ def _constraints_context(
       ensure_ascii=False,
       indent=2,
   )
+
+
+def _record_failure(
+    *,
+    director: drama_director.DramaDirector,
+    original_speech: str | None,
+    stage: str,
+    trace: str,
+    error: str,
+) -> None:
+  """Records one transient failure diagnostic for private archiving.
+
+  A story turn in progress is detected by the director holding the
+  turn's original speech (`None` only outside a turn); without a turn
+  there is no transient turn state to retain and the recording call
+  itself would be invalid. Directive execution, cooldown and
+  consumption stay untouched: they change only inside
+  `set_validated_resolution`, which is never reached on failure.
+
+  Args:
+    director: the director recording the diagnostic.
+    original_speech: the current turn's speech, or None outside a turn.
+    stage: pipeline stage the failure belongs to.
+    trace: private trace visible at the failing stage.
+    error: message of the failing check.
+  """
+  if original_speech is None:
+    return
+  director.record_resolution_diagnostics(stage=stage, trace=trace, error=error)
+
+
+def _validate_nonempty_tracks(
+    *,
+    action_result: Any,
+    intervention: Any,
+    stage_directions: str,
+) -> None:
+  """Rejects an empty narrator track when adjudicated facts must appear.
+
+  Deterministic structural guard, independent of the semantic review:
+  the adjudicated action result and any intervention fact reach the
+  canonical event only through the stage-directions track, so an empty
+  or whitespace-only track loses them outright. The guard fires before
+  the review, so no scripted approving verdict can bypass it.
+
+  Args:
+    action_result: the core-adjudicated action result, if any.
+    intervention: the recorded intervention candidate, if any.
+    stage_directions: the draft's stage-directions track.
+
+  Raises:
+    StoryOutputError: if adjudicated facts exist but the track is empty.
+  """
+  candidate_after = (
+      intervention.get('candidate_after')
+      if isinstance(intervention, Mapping)
+      else None
+  )
+  if (action_result or candidate_after) and not stage_directions.strip():
+    raise StoryOutputError(
+        'The stage-directions track is empty, but the resolution evidence'
+        ' carries an adjudicated action result or intervention fact that'
+        ' must be narrated.'
+    )
 
 
 def _validate_review(response: str) -> None:
@@ -249,8 +432,19 @@ def _build_prompt(
     original_speech: str | None,
     constraints: str,
     public_facts: Sequence[str],
+    action_intent: str | None = None,
+    evidence: Mapping[str, Any] | None = None,
+    committed_events: Sequence[str] = (),
 ) -> str:
   """Fills the P5 final-output prompt template (stage-1 plan, appendix B).
+
+  The prompt body carries the current speaker, the verbatim speech, the
+  rules, the GM-only constraints, the initial public facts and the
+  committed public history, while the turn's resolution evidence
+  (speech, action intent, adjudicated action result and any
+  intervention candidate) travels in a clearly marked JSON-serialized
+  data section: JSON escaping guarantees that newlines or '##' inside
+  the data can never become prompt section headings.
 
   Args:
     candidate_event: the event to resolve, from the previous chain step.
@@ -258,11 +452,26 @@ def _build_prompt(
     original_speech: the speech the player authored this turn, if any.
     constraints: serialized GM-only constraints.
     public_facts: Initial publicly established background.
+    action_intent: the character's own attempted action this turn, if
+      any.
+    evidence: the turn's resolution evidence, with the
+      core-adjudicated `action_result` and any recorded `intervention`.
+    committed_events: the committed public history conditioning the
+      resolution.
 
   Returns:
     The prompt asking the model for the dual-track JSON object.
   """
-  speech = original_speech if original_speech is not None else '(none)'
+  speech = original_speech or ''
+  evidence_data = {
+      'speech': speech,
+      'action_intent': action_intent or '',
+      'action_result': (evidence or {}).get('action_result'),
+      'intervention': (evidence or {}).get('intervention'),
+  }
+  events_block = (
+      '\n'.join(f'- {event}' for event in committed_events) or '(none)'
+  )
   return (
       '# Candidate event\n'
       f'{candidate_event}\n'
@@ -271,13 +480,19 @@ def _build_prompt(
       f'{active_player_name}\n'
       '\n'
       '## Original speech (verbatim)\n'
-      f'{speech}\n'
+      f'{speech if speech else "(none)"}\n'
       '\n'
       f'{_SEMANTIC_RULES}\n'
+      f'{_EVIDENCE_SECTION_MARK}\n'
+      f'{json.dumps(evidence_data, ensure_ascii=False)}\n'
+      '\n'
       '## GM-only constraints\n'
       f'{constraints}\n'
       '## Initial public facts\n'
       f'{json.dumps(list(public_facts), ensure_ascii=False)}\n'
+      '\n'
+      '## Committed public events (oldest first)\n'
+      f'{events_block}\n'
       '\n'
       '## Output\n'
       'Output a JSON object with exactly two string fields:\n'
@@ -286,9 +501,11 @@ def _build_prompt(
       '  exact dialogue verbatim, plus what actually happened.\n'
       '- "stage_directions": visible environment changes, NPC behavior, '
       'and\n'
-      '  outcomes only. Do NOT repeat the dialogue. Use an empty string '
-      'if\n'
-      '  there is nothing beyond speech.\n'
+      '  outcomes only. Do NOT repeat the dialogue. Narrate the '
+      'adjudicated\n'
+      '  action result and any intervention fact from the resolution '
+      'evidence.\n'
+      '  Use an empty string only if there is nothing beyond speech.\n'
       'Output only the JSON object, no other text.\n'
   )
 
