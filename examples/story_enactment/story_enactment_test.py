@@ -35,11 +35,13 @@ choosing the total attempt limit relative to these counts.
 """
 
 import contextlib
+import copy
 import dataclasses
 import json
 import os
 import tempfile
 import time
+import types
 from typing import Any
 import unittest
 from unittest import mock
@@ -116,6 +118,7 @@ def _fixture_config(
     completion_answers=None,
     scene_rounds: int | None = None,
     prompt_stub: dict[str, Any] | None = None,
+    action_mode: str = 'speech_only',
 ) -> dict[str, Any]:
   """Builds a run config backed by the stub model with fixture overrides.
 
@@ -126,6 +129,7 @@ def _fixture_config(
     completion_answers: beat-id keyed yes/no answers of the stub.
     scene_rounds: override of the scene schedule budget.
     prompt_stub: extra PromptStubModel parameters.
+    action_mode: the action contract recorded in the config.
 
   Returns:
     The run-config dictionary for ``run.run``.
@@ -138,6 +142,7 @@ def _fixture_config(
       story,
       total_turn_limit=total_turn_limit,
       total_model_attempt_limit=total_model_attempt_limit,
+      action_mode=action_mode,
       model_config={'api_type': 'stub', 'prompt_stub': stub_params},
   )
   if beats is not None:
@@ -1684,6 +1689,328 @@ class ConcurrentCharacterDepthRetryTest(_StateDirTestCase):
     self.assertGreater(result.used_model_attempts, 0)
     self.assertEqual(result.used_api_retries, 0)
     self.assertEqual(result.api_retries_used_this_process, 0)
+
+
+class ActionModeRunTest(_StateDirTestCase):
+  """The action-mode entry points of the runner (spec sections 8-9).
+
+  The action contract is independent of the stage switches: a first run
+  without a run config derives it from the explicit parameter (defaulting
+  to pure speech), a supplied or checkpointed run config is authoritative
+  for it, and a resume never switches contracts mid-story — an explicit
+  contradicting mode is rejected before any model request.
+  """
+
+  def _dir(self, name: str) -> str:
+    return os.path.join(self._tmp.name, name)
+
+  def _envelope_of(self, directory: str) -> dict[str, Any]:
+    with open(
+        os.path.join(directory, 'checkpoint.json'), encoding='utf-8'
+    ) as handle:
+      return json.load(handle)
+
+  def _json_fixture(self, *, total_turn_limit: int = 4) -> dict[str, Any]:
+    return _fixture_config(
+        total_turn_limit=total_turn_limit,
+        beats=(_beat('b1'), _beat('b2')),
+        completion_answers={'b1': 'Yes', 'b2': 'Yes'},
+        action_mode='speech_and_action',
+    )
+
+  def _speech_fixture(self, *, total_turn_limit: int = 4) -> dict[str, Any]:
+    return _fixture_config(
+        total_turn_limit=total_turn_limit,
+        beats=(_beat('b1'), _beat('b2')),
+        completion_answers={'b1': 'Yes', 'b2': 'Yes'},
+    )
+
+  def _commit_after_turn_two(self, directory: str, config) -> None:
+    with _interrupt_when(2, when='after_commit'):
+      with self.assertRaises(SimulatedInterruption):
+        run_lib.run(directory, run_config=config)
+    self.assertEqual(self._envelope_of(directory)['committed_turn_id'], 2)
+
+  def test_first_run_defaults_to_speech_only(self):
+    result = run_lib.run(self.state_dir, total_turn_limit=2)
+    self.assertEqual(result.committed_turn_id, 2)
+    envelope = self.envelope()
+    self.assertEqual(envelope['run_config']['schema_version'], 2)
+    self.assertEqual(envelope['run_config']['action_mode'], 'speech_only')
+    self.assertEqual(
+        envelope['run_config']['gm_params']['action_mode'], 'speech_only'
+    )
+    spec = envelope['run_config']['scene_dicts'][0]['scene_type']['action_spec']
+    self.assertIn('现在说什么', spec['call_to_action'])
+    self.assertNotIn('现在说什么、做什么', spec['call_to_action'])
+    self.assertEqual(self.summary()['action_mode'], 'speech_only')
+
+  def test_first_run_records_json_action_mode(self):
+    result = run_lib.run(
+        self.state_dir, total_turn_limit=2, action_mode='speech_and_action'
+    )
+    self.assertEqual(result.committed_turn_id, 2)
+    envelope = self.envelope()
+    self.assertEqual(envelope['run_config']['schema_version'], 2)
+    self.assertEqual(envelope['run_config']['action_mode'], 'speech_and_action')
+    self.assertEqual(
+        envelope['run_config']['gm_params']['action_mode'],
+        'speech_and_action',
+    )
+    spec = envelope['run_config']['scene_dicts'][0]['scene_type']['action_spec']
+    self.assertIn('现在说什么、做什么', spec['call_to_action'])
+    self.assertEqual(self.summary()['action_mode'], 'speech_and_action')
+
+  def test_supplied_config_is_authoritative_and_not_mutated(self):
+    json_config = self._json_fixture(total_turn_limit=2)
+    json_config['scene_dicts'][0]['num_rounds'] = 8
+    json_original = copy.deepcopy(json_config)
+    # The action-mode parameter is ignored when a run config is given,
+    # exactly like the limit and mode parameters: the supplied mode
+    # must not be overridden by the function's defaults.
+    run_lib.run(
+        self._dir('json-authoritative'),
+        run_config=json_config,
+        action_mode='speech_only',
+    )
+    self.assertEqual(
+        self._envelope_of(self._dir('json-authoritative'))['run_config'][
+            'action_mode'
+        ],
+        'speech_and_action',
+    )
+    self.assertEqual(json_config, json_original)
+
+    speech_config = self._speech_fixture(total_turn_limit=2)
+    speech_original = copy.deepcopy(speech_config)
+    run_lib.run(
+        self._dir('speech-authoritative'),
+        run_config=speech_config,
+        action_mode='speech_and_action',
+    )
+    self.assertEqual(
+        self._envelope_of(self._dir('speech-authoritative'))['run_config'][
+            'action_mode'
+        ],
+        'speech_only',
+    )
+    self.assertEqual(speech_config, speech_original)
+
+    # A schema-1 config carries no action_mode: the default is filled
+    # on the copy only, and the source record is never relabeled.
+    schema1_config = {
+        key: value
+        for key, value in json_original.items()
+        if key != 'action_mode'
+    }
+    schema1_config['schema_version'] = 1
+    schema1_config['gm_params'] = {
+        key: value
+        for key, value in json_original['gm_params'].items()
+        if key != 'action_mode'
+    }
+    schema1_original = copy.deepcopy(schema1_config)
+    run_lib.run(self._dir('schema1-authoritative'), run_config=schema1_config)
+    schema1_envelope = self._envelope_of(self._dir('schema1-authoritative'))
+    self.assertEqual(
+        schema1_envelope['run_config']['action_mode'], 'speech_only'
+    )
+    self.assertEqual(schema1_envelope['run_config']['schema_version'], 1)
+    self.assertEqual(schema1_config, schema1_original)
+    self.assertNotIn('action_mode', schema1_config)
+
+  def test_resume_omitted_action_mode_keeps_saved_json_mode(self):
+    config = self._json_fixture()
+    self._commit_after_turn_two(self.state_dir, config)
+    self.assertEqual(
+        self.envelope()['run_config']['action_mode'], 'speech_and_action'
+    )
+    with mock.patch.object(
+        run_lib, 'build_simulation', wraps=run_lib.build_simulation
+    ) as builder:
+      result = run_lib.run(self.state_dir, resume=True)
+    self.assertEqual(result.reason, 'beats_completed')
+    self.assertEqual(result.committed_turn_id, 4)
+    self.assertEqual(
+        [r['turn_id'] for r in self.turn_log().load()], [1, 2, 3, 4]
+    )
+    self.assertEqual(
+        builder.call_args_list[-1].kwargs['run_config']['action_mode'],
+        'speech_and_action',
+    )
+    self.assertEqual(
+        self.envelope()['run_config']['action_mode'], 'speech_and_action'
+    )
+
+  def test_resume_explicit_same_mode_is_allowed(self):
+    config = self._json_fixture()
+    self._commit_after_turn_two(self.state_dir, config)
+    result = run_lib.run(
+        self.state_dir, resume=True, action_mode='speech_and_action'
+    )
+    self.assertEqual(result.reason, 'beats_completed')
+    self.assertEqual(result.committed_turn_id, 4)
+    self.assertEqual(
+        self.envelope()['run_config']['action_mode'], 'speech_and_action'
+    )
+
+  def test_resume_explicit_different_mode_is_rejected(self):
+    json_dir = self._dir('json-checkpoint')
+    self._commit_after_turn_two(json_dir, self._json_fixture())
+    checkpoint_path = os.path.join(json_dir, 'checkpoint.json')
+    log_path = os.path.join(json_dir, 'story_turns.jsonl')
+    with open(checkpoint_path, encoding='utf-8') as handle:
+      checkpoint_before = handle.read()
+    with open(log_path, encoding='utf-8') as handle:
+      log_before = handle.read()
+    with mock.patch.object(
+        run_lib, 'make_language_model', wraps=run_lib.make_language_model
+    ) as maker:
+      with self.assertRaisesRegex(ValueError, 'action_mode mismatch'):
+        run_lib.run(json_dir, resume=True, action_mode='speech_only')
+    maker.assert_not_called()
+    with open(checkpoint_path, encoding='utf-8') as handle:
+      self.assertEqual(handle.read(), checkpoint_before)
+    with open(log_path, encoding='utf-8') as handle:
+      self.assertEqual(handle.read(), log_before)
+
+    speech_dir = self._dir('speech-checkpoint')
+    self._commit_after_turn_two(speech_dir, self._speech_fixture())
+    with mock.patch.object(
+        run_lib, 'make_language_model', wraps=run_lib.make_language_model
+    ) as maker:
+      with self.assertRaisesRegex(ValueError, 'action_mode mismatch'):
+        run_lib.run(speech_dir, resume=True, action_mode='speech_and_action')
+    maker.assert_not_called()
+
+  def test_schema1_checkpoint_really_resumes_as_speech_only(self):
+    # Construct a complete schema-1 checkpoint: two genuinely committed
+    # turns of simulation state under the old contract, an old
+    # schema-1 run_config (no action_mode anywhere) and a schema-1
+    # history log without the schema-2 turn stamps.
+    schema1_config = {
+        key: value
+        for key, value in self._speech_fixture().items()
+        if key != 'action_mode'
+    }
+    schema1_config['schema_version'] = 1
+    schema1_config['gm_params'] = {
+        key: value
+        for key, value in schema1_config['gm_params'].items()
+        if key != 'action_mode'
+    }
+    self._commit_after_turn_two(self.state_dir, schema1_config)
+    envelope = self.envelope()
+    envelope['run_config'] = copy.deepcopy(schema1_config)
+    with open(
+        os.path.join(self.state_dir, 'checkpoint.json'),
+        'w',
+        encoding='utf-8',
+    ) as handle:
+      json.dump(envelope, handle, ensure_ascii=False, indent=2)
+    schema1_records = [
+        {
+            key: value
+            for key, value in record.items()
+            if key not in ('schema_version', 'raw_action', 'action_intent')
+        }
+        for record in self.turn_log().load()
+    ]
+    self.assertEqual([r['turn_id'] for r in schema1_records], [1, 2])
+    for record in schema1_records:
+      self.assertNotIn('schema_version', record)
+      self.assertNotIn('raw_action', record)
+      self.assertNotIn('action_intent', record)
+    old_records = copy.deepcopy(schema1_records)
+    self.turn_log()._rewrite(schema1_records)  # pylint: disable=protected-access
+
+    # The real resume keeps the old contract: numbering continues, the
+    # original dialogue and the old committed records stay untouched,
+    # and only the new turns may carry the schema-2 stamps.
+    with mock.patch.object(
+        run_lib, 'build_simulation', wraps=run_lib.build_simulation
+    ) as builder:
+      result = run_lib.run(self.state_dir, resume=True)
+    self.assertEqual(result.reason, 'beats_completed')
+    self.assertEqual(result.committed_turn_id, 4)
+    records = self.turn_log().load()
+    self.assertEqual([r['turn_id'] for r in records], [1, 2, 3, 4])
+    self.assertEqual(records[:2], old_records)
+    for record in old_records:
+      self.assertEqual(record['speech'], '这宅子的事，急不得。')
+    for record in records[2:]:
+      self.assertEqual(record['schema_version'], 2)
+    self.assertEqual(
+        builder.call_args_list[-1].kwargs['run_config']['action_mode'],
+        'speech_only',
+    )
+    final_envelope = self.envelope()
+    self.assertEqual(final_envelope['run_config']['schema_version'], 1)
+    self.assertEqual(final_envelope['run_config']['action_mode'], 'speech_only')
+    self.assertEqual(self.summary()['action_mode'], 'speech_only')
+
+  def test_cli_distinguishes_omitted_and_explicit_action_mode(self):
+    flags = run_lib._FLAGS  # pylint: disable=protected-access
+    result_stub = types.SimpleNamespace(
+        reason='step_limit',
+        committed_turn_id=0,
+        used_model_attempts=0,
+        wall_time_seconds=0.0,
+    )
+    saved = {
+        name: (flags[name].value, flags[name].present)
+        for name in ('state_dir', 'disable_language_model', 'action_mode')
+    }
+    try:
+      flags['state_dir'].value = self.state_dir
+      flags['state_dir'].present = True
+      flags['disable_language_model'].value = True
+      flags['disable_language_model'].present = True
+      # Omitted --action_mode: main forwards None so run() itself
+      # derives the first-run default or the checkpointed mode.
+      flags['action_mode'].value = None
+      flags['action_mode'].present = False
+      with mock.patch.object(
+          run_lib, 'run', return_value=result_stub
+      ) as run_mock:
+        run_lib.main([])
+      self.assertIsNone(run_mock.call_args.kwargs['action_mode'])
+      # An explicit --action_mode reaches run() as the given value.
+      flags['action_mode'].value = 'speech_and_action'
+      flags['action_mode'].present = True
+      with mock.patch.object(
+          run_lib, 'run', return_value=result_stub
+      ) as run_mock:
+        run_lib.main([])
+      self.assertEqual(
+          run_mock.call_args.kwargs['action_mode'], 'speech_and_action'
+      )
+    finally:
+      for name, (value, present) in saved.items():
+        flags[name].value = value
+        flags[name].present = present
+
+  def test_unknown_run_config_schema_is_rejected(self):
+    unknown_config = self._speech_fixture(total_turn_limit=2)
+    unknown_config['schema_version'] = 99
+    with self.assertRaisesRegex(ValueError, 'schema version'):
+      run_lib.run(self.state_dir, run_config=unknown_config)
+    self.assertFalse(
+        os.path.exists(os.path.join(self.state_dir, 'checkpoint.json'))
+    )
+    run_lib.run(
+        self.state_dir, run_config=self._speech_fixture(total_turn_limit=2)
+    )
+    envelope = self.envelope()
+    envelope['run_config']['schema_version'] = 3
+    with open(
+        os.path.join(self.state_dir, 'checkpoint.json'),
+        'w',
+        encoding='utf-8',
+    ) as handle:
+      json.dump(envelope, handle, ensure_ascii=False, indent=2)
+    with self.assertRaisesRegex(ValueError, 'schema version'):
+      run_lib.run(self.state_dir, resume=True)
 
 
 if __name__ == '__main__':

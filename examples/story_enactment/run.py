@@ -36,6 +36,11 @@ exactly once and this module only summarizes. Any other exception is
 recorded as ``error``; ``BaseException`` (e.g. a simulated crash) is
 never swallowed.
 
+The run config archives the run's action contract (``action_mode``):
+schema-1 configs predate it and are read as pure speech on a copy,
+and a resume keeps the checkpointed contract — a contradicting
+explicit mode is rejected before any model request (spec section 9).
+
 Example:
   python -m examples.story_enactment.run --state_dir /tmp/story-demo \
       --disable_language_model --mode director
@@ -52,6 +57,7 @@ from absl import app
 from absl import flags
 from concordia.components.game_master import terminate as terminate_lib
 from concordia.contrib.components.game_master import drama_director
+from concordia.contrib.components.game_master import story_action
 from concordia.contrib.components.game_master import story_terminator
 from concordia.contrib.language_models import budget_wrapper
 from concordia.contrib.language_models import retry_stats_wrapper
@@ -71,7 +77,10 @@ from examples.story_enactment import story_config
 from examples.story_enactment import testing_stubs
 
 # Schema version of the run config recorded inside the envelope.
-RUN_CONFIG_SCHEMA = 1
+RUN_CONFIG_SCHEMA = 2
+# Run config schema versions this module can read: schema 1 predates
+# the action contract and is normalized on a copy (spec section 9).
+_KNOWN_RUN_CONFIG_SCHEMAS = (1, RUN_CONFIG_SCHEMA)
 
 # Stage switches of the plan; stage 2 adds the tension_observe and
 # director modes, stage 3 adds character_depth.
@@ -129,6 +138,14 @@ flags.DEFINE_bool(
     'use the deterministic PromptStubModel instead of a live model.',
 )
 flags.DEFINE_string('mode', MODE_BEATS_ONLY, 'stage switch of the run.')
+flags.DEFINE_string(
+    'action_mode',
+    None,
+    'action contract of the characters: speech_only (the default) or '
+    'speech_and_action. Omitting the flag means speech_only on a first '
+    'run and keeps the checkpointed mode on resume; a contradicting '
+    'explicit value is rejected.',
+)
 flags.DEFINE_integer('total_turn_limit', 24, 'total story-turn budget.')
 flags.DEFINE_integer(
     'total_model_attempt_limit', 400, 'total model-attempt budget.'
@@ -324,7 +341,11 @@ def make_character_params(
   }
 
 
-def make_gm_params(story: story_config.StoryConfig) -> dict[str, Any]:
+def make_gm_params(
+    story: story_config.StoryConfig,
+    *,
+    action_mode: str = story_action.ACTION_MODE_SPEECH_ONLY,
+) -> dict[str, Any]:
   """Maps the story onto the game master prefab params.
 
   The game master alone conditions its resolutions on the hidden truth
@@ -335,6 +356,8 @@ def make_gm_params(story: story_config.StoryConfig) -> dict[str, Any]:
 
   Args:
     story: the story configuration.
+    action_mode: the action contract the game master receives; the same
+      mode the scene's action spec elicits from the characters.
 
   Returns:
     The params of the story game master prefab, without the scene and
@@ -374,6 +397,7 @@ def make_gm_params(story: story_config.StoryConfig) -> dict[str, Any]:
   )
   return {
       'name': _GM_NAME,
+      'action_mode': action_mode,
       'public_facts': [
           story.conflict_start,
           *story.world_facts,
@@ -477,6 +501,54 @@ def _merge_resume_model_config(
   return effective
 
 
+def _normalize_run_config(
+    run_config: Mapping[str, Any],
+) -> dict[str, Any]:
+  """Normalizes a run config from either configuration source.
+
+  Both entry points — a caller-supplied first-run config and the
+  checkpoint envelope's saved config — pass through this one
+  compatibility gate (spec section 9). Schema-1 configs predate the
+  action contract and the later intervention switches, so missing keys
+  are filled with their read defaults on the copy; the source record
+  itself is never relabeled or rewritten, and the nested dictionaries
+  the defaults may modify are copied so the caller's object stays
+  untouched. Turns and archives produced after normalization carry the
+  effective values.
+
+  Args:
+    run_config: the run config to normalize.
+
+  Returns:
+    The normalized copy of the run config.
+
+  Raises:
+    ValueError: if the schema version is unknown or a recorded action
+      mode does not name a known mode.
+  """
+  version = run_config.get('schema_version')
+  if version not in _KNOWN_RUN_CONFIG_SCHEMAS:
+    raise ValueError(
+        'unknown run config schema version '
+        f'{version!r}; expected one of {_KNOWN_RUN_CONFIG_SCHEMAS}.'
+    )
+  config = dict(run_config)
+  if 'action_mode' in config:
+    story_action.validate_action_mode(config['action_mode'])
+  else:
+    # Schema 1 predates the action contract: such runs elicited pure
+    # speech, so their effective action mode is speech_only.
+    config['action_mode'] = story_action.ACTION_MODE_SPEECH_ONLY
+  # Old configs may predate the director's intervention switches; the
+  # filled defaults match the prefab's own, so this only makes the
+  # effective values explicit, it changes no behavior.
+  director_params = dict(config.get('director_params', {}))
+  director_params.setdefault('feedback_enabled', False)
+  director_params.setdefault('cooldown_turns', 3)
+  config['director_params'] = director_params
+  return config
+
+
 def make_run_config(
     story: story_config.StoryConfig,
     *,
@@ -484,6 +556,7 @@ def make_run_config(
     total_turn_limit: int = 24,
     total_model_attempt_limit: int = 400,
     mode: str = MODE_BEATS_ONLY,
+    action_mode: str = story_action.ACTION_MODE_SPEECH_ONLY,
     model_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
   """Builds the JSON-safe run config of one story enactment.
@@ -501,20 +574,25 @@ def make_run_config(
     total_turn_limit: original total story-turn budget.
     total_model_attempt_limit: original total model-attempt budget.
     mode: stage switch; one of ``MODES``.
+    action_mode: the action contract of the characters, recorded in the
+      config, elicited by the scene's action spec and received by the
+      game master params; one of ``story_action.ACTION_MODES``.
     model_config: identity of the model choice; the API key is dropped
       before the config is recorded.
 
   Returns:
       The run-config dictionary with the schema version, the full story
       data, scene and beat dictionaries, character and game-master prefab
-      params, both total limits, the mode, the director parameters
-      (scoring configuration) and the model identity.
+      params, both total limits, the mode, the action mode, the director
+      parameters (scoring configuration) and the model identity.
 
   Raises:
-      ValueError: if the mode is unknown or the story is invalid.
+      ValueError: if the mode or the action mode is unknown, or the
+      story is invalid.
   """
   if mode not in MODES:
     raise ValueError(f'unknown mode {mode!r}; expected one of {MODES}.')
+  story_action.validate_action_mode(action_mode)
   problems = story_config.validate(story)
   if problems:
     raise ValueError('invalid story configuration: ' + '; '.join(problems))
@@ -533,7 +611,7 @@ def make_run_config(
   scene = scene_lib.SceneSpec(
       scene_type=scene_lib.SceneTypeSpec(
           name='故事主线',
-          action_spec=story_config.make_speech_action_spec(),
+          action_spec=story_config.make_scene_action_spec(action_mode),
       ),
       participants=tuple(character.name for character in story.characters),
       num_rounds=total_turn_limit,
@@ -560,10 +638,11 @@ def make_run_config(
       'scene_dicts': [story_scene.scene_to_dict(scene)],
       'beat_dicts': [beat.to_dict() for beat in outline],
       'entity_params': entity_params,
-      'gm_params': make_gm_params(story),
+      'gm_params': make_gm_params(story, action_mode=action_mode),
       'total_turn_limit': total_turn_limit,
       'total_model_attempt_limit': total_model_attempt_limit,
       'mode': mode,
+      'action_mode': action_mode,
       'director_params': director_params,
       'model_config': _public_model_identity(model_config),
   }
@@ -860,6 +939,7 @@ def _reject_configured_mismatch(
     total_turn_limit: int,
     total_model_attempt_limit: int,
     mode: str,
+    action_mode: str | None = None,
 ) -> None:
   """Rejects CLI parameters that disagree with the saved run config.
 
@@ -868,10 +948,13 @@ def _reject_configured_mismatch(
     total_turn_limit: the requested turn limit.
     total_model_attempt_limit: the requested attempt limit.
     mode: the requested mode.
+    action_mode: the requested action contract, or None when omitted;
+      an omitted mode always keeps the saved one.
 
   Raises:
     ValueError: if any requested value differs from the saved one; a
-      resume must never silently raise a budget or switch stages.
+      resume must never silently raise a budget, switch stages or
+      switch the action contract mid-story.
   """
   if total_turn_limit != run_config['total_turn_limit']:
     raise ValueError(
@@ -887,6 +970,11 @@ def _reject_configured_mismatch(
   if mode != run_config['mode']:
     raise ValueError(
         f'mode mismatch: checkpoint holds {run_config["mode"]!r}, got {mode!r}.'
+    )
+  if action_mode is not None and action_mode != run_config['action_mode']:
+    raise ValueError(
+        'action_mode mismatch: checkpoint holds'
+        f' {run_config["action_mode"]!r}, got {action_mode!r}.'
     )
 
 
@@ -961,6 +1049,7 @@ def _write_outputs(
   summary = {
       **dataclasses.asdict(result),
       'mode': run_config['mode'],
+      'action_mode': run_config['action_mode'],
       'total_turn_limit': run_config['total_turn_limit'],
       'total_model_attempt_limit': run_config['total_model_attempt_limit'],
       'model_config': run_config['model_config'],
@@ -1003,6 +1092,7 @@ def run(
     total_turn_limit: int | None = None,
     total_model_attempt_limit: int | None = None,
     mode: str = MODE_BEATS_ONLY,
+    action_mode: str | None = None,
     model_config: Mapping[str, Any] | None = None,
     run_config: Mapping[str, Any] | None = None,
 ) -> RunResult:
@@ -1028,6 +1118,13 @@ def run(
       configuration plus an EmotionalStance commitment and a cached
       RelationshipsToOthers view on every character, with the acting
       character's emotion collected into the story turns.
+    action_mode: the action contract of the characters; None (the
+      default) means speech_only on a first run without a run config
+      and keeps the checkpointed contract on resume. An explicitly
+      passed mode is used to build a first run's config, is ignored
+      when a run config is supplied, and must match the checkpointed
+      contract on resume — a contradiction raises before any model
+      request.
     model_config: identity of a live model (api_type, model_name,
       api_key); a first run without it uses the prompt stub. On a first
       run the model actually in effect defines the archived identity:
@@ -1039,8 +1136,9 @@ def run(
       resume the identity must match the checkpoint and only the
       api_key carries over.
     run_config: optional prebuilt run config for a first run (used by
-      tests and higher-level drivers); when given, its limits and mode
-      are authoritative and the limit/mode parameters are ignored.
+      tests and higher-level drivers); when given, its limits, mode and
+      action mode are authoritative and the limit/mode/action-mode
+      parameters are ignored.
 
   Returns:
     The run's result record; summary.json, script.fountain and
@@ -1048,8 +1146,10 @@ def run(
 
   Raises:
     ValueError: on resume validation failures (missing or mismatched
-      checkpoint, mismatched limits, mode or model identity,
-      budget-exhausted summary) or when starting over an existing run.
+      checkpoint, mismatched limits, mode, action mode or model
+      identity, budget-exhausted summary, unknown run config schema),
+      when starting over an existing run, or when the requested mode or
+      action mode is unknown.
   """
   os.makedirs(state_dir, exist_ok=True)
   checkpoint_path = os.path.join(state_dir, 'checkpoint.json')
@@ -1065,10 +1165,11 @@ def run(
   config: dict[str, Any]
   if resume:
     envelope = _load_envelope(checkpoint_path)
-    config = envelope['run_config']
-    # The original total limits are authoritative on resume: an
-    # explicitly passed different value is rejected, never silently
-    # applied to raise the budget.
+    config = _normalize_run_config(envelope['run_config'])
+    # The original total limits and the recorded action contract are
+    # authoritative on resume: an explicitly passed different value is
+    # rejected, never silently applied to raise the budget or switch
+    # the contract mid-story.
     _reject_configured_mismatch(
         config,
         total_turn_limit=(
@@ -1082,6 +1183,7 @@ def run(
             else config['total_model_attempt_limit']
         ),
         mode=mode,
+        action_mode=action_mode,
     )
     _reject_budget_exhausted_summary(summary_path)
     used_at_start = envelope['used_model_attempts']
@@ -1099,12 +1201,19 @@ def run(
           total_turn_limit=total_turn_limit or 24,
           total_model_attempt_limit=total_model_attempt_limit or 400,
           mode=mode,
+          action_mode=(
+              action_mode
+              if action_mode is not None
+              else story_action.ACTION_MODE_SPEECH_ONLY
+          ),
           model_config=model_config,
       )
     else:
-      # A supplied run config is authoritative; the limit and mode
-      # parameters of this call are ignored on a first run.
-      config = dict(run_config)
+      # A supplied run config is authoritative; the limit, mode and
+      # action-mode parameters of this call are ignored on a first run,
+      # and the compatibility normalization works on a copy so the
+      # caller's object is never modified.
+      config = _normalize_run_config(run_config)
 
   if resume:
     # The checkpointed identity is authoritative; only this invocation's
@@ -1333,6 +1442,12 @@ def main(argv: Sequence[str]) -> None:
       total_turn_limit=_FLAGS.total_turn_limit,
       total_model_attempt_limit=_FLAGS.total_model_attempt_limit,
       mode=_FLAGS.mode,
+      # Flag presence, not the flag's value, distinguishes an explicit
+      # --action_mode from an omitted one: an omitted flag reaches run()
+      # as None so the entry-point defaults decide.
+      action_mode=(
+          _FLAGS.action_mode if _FLAGS['action_mode'].present else None
+      ),
       model_config=model_config,
   )
   print(
