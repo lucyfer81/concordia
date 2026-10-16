@@ -1890,6 +1890,48 @@ class ActionModeRunTest(_StateDirTestCase):
         run_lib.run(speech_dir, resume=True, action_mode='speech_and_action')
     maker.assert_not_called()
 
+  def test_schema2_missing_action_mode_is_rejected(self):
+    # Schema 2 records the action contract explicitly: silently
+    # defaulting a missing key to speech_only made the checkpoint
+    # record a mode the built simulation did not use (the game master
+    # reads gm_params['action_mode']). A missing key is rejected before
+    # any model request and before the first checkpoint is written.
+    config = self._json_fixture(total_turn_limit=2)
+    del config['action_mode']
+    directory = self._dir('schema2-missing')
+    with mock.patch.object(
+        run_lib, 'make_language_model', wraps=run_lib.make_language_model
+    ) as maker:
+      with self.assertRaisesRegex(ValueError, 'action_mode'):
+        run_lib.run(directory, run_config=config)
+    maker.assert_not_called()
+    self.assertFalse(os.path.exists(os.path.join(directory, 'checkpoint.json')))
+
+  def test_schema2_contradicting_nested_action_modes_are_rejected(self):
+    # A schema-2 config whose nested parts imply a different contract
+    # than the recorded top-level action_mode would run and record
+    # different modes: the game master's contract and the scene's
+    # elicitation prompt are checked against the recorded mode whenever
+    # they name a canonical one.
+    gm_case = self._json_fixture(total_turn_limit=2)
+    gm_case['gm_params']['action_mode'] = 'speech_only'
+    scene_case = self._json_fixture(total_turn_limit=2)
+    scene_case['scene_dicts'][0]['scene_type']['action_spec'][
+        'call_to_action'
+    ] = story_config.make_speech_action_spec().call_to_action
+    for label, config in (('gm', gm_case), ('scene', scene_case)):
+      with self.subTest(label=label):
+        directory = self._dir(f'schema2-{label}-mismatch')
+        with mock.patch.object(
+            run_lib, 'make_language_model', wraps=run_lib.make_language_model
+        ) as maker:
+          with self.assertRaisesRegex(ValueError, 'action_mode'):
+            run_lib.run(directory, run_config=config)
+        maker.assert_not_called()
+        self.assertFalse(
+            os.path.exists(os.path.join(directory, 'checkpoint.json'))
+        )
+
   def test_schema1_checkpoint_really_resumes_as_speech_only(self):
     # Construct a complete schema-1 checkpoint: two genuinely committed
     # turns of simulation state under the old contract, an old

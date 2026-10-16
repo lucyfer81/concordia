@@ -279,20 +279,27 @@ _SEMANTIC_RULES = """## Rules
    utterance, not proof of the claims it contains. A request, accusation,
    proposal, threat, intention or alleged past action must not become an
    established fact or executed action merely because it is spoken.
-2. Player characters choose only through their own authored speech. Narration
-   must not invent any player's voluntary action, confession, promise, consent,
-   agreement, signature, evidence handover, movement or additional dialogue.
-   An involuntary visible reaction may be described without inferring consent.
+2. Player characters' voluntary choices are their own. Narration must not
+   invent any player's voluntary action, confession, promise, consent,
+   agreement, signature, evidence handover, movement or additional
+   dialogue. The only exception is the current speaker's own action: an
+   action they explicitly proposed this turn and that was adjudicated in
+   the resolution evidence, together with its authorized result, is an
+   allowed fact source for the narration (rule 7 governs it). An
+   involuntary visible reaction may be described without inferring
+   consent.
 3. GM-only knowledge is not public knowledge. Do not reveal a character's
    private information through narration or another character's invented
    speech. A character may voluntarily disclose their own secret in their
    original speech only if this also respects their hard constraint. Do not
    reject mere unverified accusations or denials that remain attributed speech.
-4. Respect every character's hard constraint, immutable facts, world rules and
-   committed public events. Public knowledge is grounded only in initial public
-   facts, committed public events and attributed original speech. GM-only
-   constraints are not public evidence. Candidate events and future beats are
-   not evidence.
+4. Respect every character's hard constraint, immutable facts, world rules
+   and committed public events. Public knowledge is grounded only in
+   initial public facts, committed public events, attributed original
+   speech, and the adjudicated result of the current speaker's own
+   explicitly proposed action recorded in the resolution evidence.
+   GM-only constraints are not public evidence. Candidate events and
+   future beats are not evidence.
 5. Any new NPC or environmental event must use an explicitly whitelisted means,
    grounded in the world and history. An empty whitelist permits no new event.
    Whitelisting never authorizes player choices or otherwise forbidden leaks.
@@ -557,9 +564,12 @@ def _parse_dual_track(
   Raises:
     StoryOutputError: if the response is not valid JSON, is not an object
       whose key set is exactly {'resolved_event', 'stage_directions'},
-      has non-string field values, or, when the turn had speech, drops
-      the speaker or changes the original speech (whitespace-only
-      rendering differences are tolerated).
+      has non-string field values, or, when the turn had non-empty
+      speech, drops the speaker or changes the original speech
+      (whitespace-only rendering differences are tolerated). A pure
+      action turn (empty speech) carries no dialogue to preserve: its
+      draft is narration only, so no speaker is extracted and no name is
+      required of the draft.
   """
   try:
     payload = json.loads(
@@ -583,12 +593,15 @@ def _parse_dual_track(
         'Both fields of the dual-track output must be strings, got: '
         f'{response!r}'
     )
-  if original_speech is not None:
+  if original_speech:
     # NOTE: these substring checks are cheap structural guards against
     # dialogue rewrites and speaker loss. They cannot prove that the
     # resolution respected character agency in the deeper semantic sense.
-    # The independent model review is also fallible; live scenario acceptance
-    # remains necessary.
+    # The independent model review is also fallible; live scenario
+    # acceptance remains necessary. They apply only when the turn had
+    # speech: a pure action turn's draft is narration and need not name
+    # the speaker, whose adjudicated result is guarded by the dedicated
+    # non-empty-track and non-empty-canonical checks instead.
     if active_player_name not in resolved_event:
       raise StoryOutputError(
           f'The resolved event lost the speaker {active_player_name!r}: '

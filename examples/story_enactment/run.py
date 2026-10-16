@@ -90,6 +90,20 @@ MODE_DIRECTOR = 'director'
 MODE_CHARACTER_DEPTH = 'character_depth'
 MODES = ('beats_only', 'tension_observe', 'director', 'character_depth')
 
+# Canonical scene elicitation prompts and the action contract each one
+# names. A scene action spec whose call to action is exactly one of
+# these canonical texts elicits that contract; any other text is a
+# customized prompt that names no canonical mode, so it is never
+# mistaken for one during consistency validation.
+_CANONICAL_CALL_TO_ACTION_MODES = {
+    story_config.make_speech_and_action_action_spec().call_to_action: (
+        story_action.ACTION_MODE_SPEECH_AND_ACTION
+    ),
+    story_config.make_speech_action_spec().call_to_action: (
+        story_action.ACTION_MODE_SPEECH_ONLY
+    ),
+}
+
 # Appendix-C character-depth parameters: the emotion palette offered to
 # the characters' EmotionalStance and the relationship refresh cadence.
 _EMOTION_OPTIONS = ('平静', '焦虑', '愤怒', '悲伤', '希望', '羞愧')
@@ -501,6 +515,50 @@ def _merge_resume_model_config(
   return effective
 
 
+def _validate_action_mode_consistency(
+    run_config: Mapping[str, Any],
+) -> None:
+  """Checks a schema-2 config's nested action contracts against its mode.
+
+  The recorded top-level ``action_mode`` is the contract the checkpoint
+  and the collector trust, while the game master actually reads
+  ``gm_params['action_mode']`` and the characters are elicited through
+  the scene action specs. A config whose nested parts name a different
+  contract would run one mode while recording another, so each nested
+  contract that canonically names a mode must agree with the recorded
+  one. Values that name no canonical contract (e.g. a customized scene
+  call to action, or a ``gm_params`` without the key) cannot be inferred
+  and are left alone.
+
+  Args:
+    run_config: the schema-2 run config, with a validated
+      ``action_mode``.
+
+  Raises:
+    ValueError: if a nested action contract contradicts the recorded
+      action mode.
+  """
+  mode = run_config['action_mode']
+  gm_mode = (run_config.get('gm_params') or {}).get('action_mode')
+  if gm_mode is not None and gm_mode != mode:
+    raise ValueError(
+        'action_mode mismatch inside run config: top-level holds'
+        f' {mode!r}, gm_params holds {gm_mode!r}.'
+    )
+  for index, scene in enumerate(run_config.get('scene_dicts') or ()):
+    spec = ((scene.get('scene_type') or {}).get('action_spec')) or {}
+    call_to_action = spec.get('call_to_action')
+    if not isinstance(call_to_action, str):
+      # Not a canonical elicitation text: no contract to compare.
+      continue
+    implied = _CANONICAL_CALL_TO_ACTION_MODES.get(call_to_action)
+    if implied is not None and implied != mode:
+      raise ValueError(
+          'action_mode mismatch inside run config: scene'
+          f' {index} elicits {implied!r}, top-level holds {mode!r}.'
+      )
+
+
 def _normalize_run_config(
     run_config: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -513,8 +571,12 @@ def _normalize_run_config(
   are filled with their read defaults on the copy; the source record
   itself is never relabeled or rewritten, and the nested dictionaries
   the defaults may modify are copied so the caller's object stays
-  untouched. Turns and archives produced after normalization carry the
-  effective values.
+  untouched. Schema-2 configs record the action contract explicitly: a
+  missing ``action_mode`` (or one contradicted by the nested game-master
+  or scene contracts) is rejected here, before any model request, so the
+  checkpoint can never record a mode the built simulation does not use.
+  Turns and archives produced after normalization carry the effective
+  values.
 
   Args:
     run_config: the run config to normalize.
@@ -523,8 +585,10 @@ def _normalize_run_config(
     The normalized copy of the run config.
 
   Raises:
-    ValueError: if the schema version is unknown or a recorded action
-      mode does not name a known mode.
+    ValueError: if the schema version is unknown, a recorded action
+      mode does not name a known mode, a schema-2 config lacks its
+      action mode, or a schema-2 config's nested action contract
+      contradicts the recorded mode.
   """
   version = run_config.get('schema_version')
   if version not in _KNOWN_RUN_CONFIG_SCHEMAS:
@@ -535,10 +599,17 @@ def _normalize_run_config(
   config = dict(run_config)
   if 'action_mode' in config:
     story_action.validate_action_mode(config['action_mode'])
-  else:
+  elif version == 1:
     # Schema 1 predates the action contract: such runs elicited pure
     # speech, so their effective action mode is speech_only.
     config['action_mode'] = story_action.ACTION_MODE_SPEECH_ONLY
+  else:
+    raise ValueError(
+        'schema-2 run config is missing the required action_mode key;'
+        ' the action contract must be recorded explicitly.'
+    )
+  if version != 1:
+    _validate_action_mode_consistency(config)
   # Old configs may predate the director's intervention switches; the
   # filled defaults match the prefab's own, so this only makes the
   # effective values explicit, it changes no behavior.

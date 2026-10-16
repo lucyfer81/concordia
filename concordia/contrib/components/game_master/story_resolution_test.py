@@ -372,6 +372,45 @@ class ActionResolutionTest(unittest.TestCase):
     stage = director.set_validated_resolution.call_args.args[1]
     self.assertIn('The lock holds.', stage)
 
+  def test_rules_allow_adjudicated_own_action_as_fact_source(self):
+    # The rule set must not contradict itself: the old rule 2 said
+    # characters choose only through their own authored speech and rule
+    # 4's fact sources omitted the adjudicated action result, while rule
+    # 7 requires narrating that result — a faithful reviewer had to
+    # mis-reject legal turns. The unified rules allow exactly the
+    # current speaker's own explicitly proposed, adjudicated action and
+    # its result, and keep the others'-autonomy and secret boundaries.
+    payload = json.dumps({
+        'resolved_event': (
+            'Alice: I hid the letter under the stairs. The lock holds.'
+        ),
+        'stage_directions': 'The lock holds.',
+    })
+    _, _, model = self._run(
+        payload,
+        speech='I hid the letter under the stairs.',
+        action_intent=_ACTION_INTENT,
+        evidence={'action_result': _ACTION_RESULT, 'intervention': None},
+    )
+    generation, review = [
+        call.kwargs['prompt'] for call in model.sample_text.call_args_list
+    ]
+    for prompt in (generation, review):
+      flat = ' '.join(prompt.split())
+      self.assertNotIn('choose only through their own authored speech', flat)
+      # The allowance: the speaker's own proposed, adjudicated action.
+      self.assertIn('an action they explicitly proposed this turn', flat)
+      # Rule 4 names the adjudicated own-action result a fact source.
+      self.assertIn(
+          "adjudicated result of the current speaker's own explicitly"
+          ' proposed action',
+          flat,
+      )
+      # The boundaries survive: others' autonomy and untouched secrets.
+      self.assertIn('must not invent any player', flat)
+      self.assertIn("other players' new choices", flat)
+      self.assertIn('secrets no one accessed', flat)
+
   def test_missing_action_result_is_rejected(self):
     # The intent is a proposal, never an outcome: without the core's
     # adjudicated result the step must fail before generation. The
@@ -617,6 +656,66 @@ class ActionResolutionTest(unittest.TestCase):
     director.set_validated_resolution.assert_called_once_with(
         'The lock holds.', 'The lock holds.'
     )
+
+  def test_pure_action_draft_without_names_completes(self):
+    # A legal pure-action result is plain narration that need not name
+    # the character: the speaker and dialogue-fidelity guards apply only
+    # to turns with speech, so a nameless draft must complete instead of
+    # failing with a lost speaker before the semantic review.
+    narration = 'The strongbox door is still locked.'
+    payload = json.dumps({
+        'resolved_event': narration,
+        'stage_directions': narration,
+    })
+    result, director, model = self._run(
+        payload,
+        speech='',
+        action_intent=_ACTION_INTENT,
+        evidence={'action_result': _ACTION_RESULT, 'intervention': None},
+    )
+    self.assertEqual(result, narration)
+    director.set_validated_resolution.assert_called_once_with(
+        narration, narration
+    )
+    # The turn still passes the full review: exactly one review call.
+    self.assertEqual(model.sample_text.call_count, 2)
+
+  def test_pure_action_guards_stay_strong_without_names(self):
+    # Skipping the speaker checks for pure-action turns loosens nothing
+    # else: the empty-stage guard (the adjudicated result must be
+    # narrated) fires before the review, and a draft with neither track
+    # still collapses to the empty-canonical rejection.
+    empty_stage = json.dumps({
+        'resolved_event': 'The strongbox door is still locked.',
+        'stage_directions': '   \n ',
+    })
+    director, model, chain, step = self._make(
+        speech='',
+        responses=[empty_stage, _APPROVAL],
+        action_intent=_ACTION_INTENT,
+        evidence={'action_result': _ACTION_RESULT, 'intervention': None},
+    )
+    with self.assertRaisesRegex(
+        story_resolution.StoryOutputError, 'stage-directions track'
+    ):
+      step(chain, 'Alice tries the lock.', 'Alice')
+    self.assertEqual(model.sample_text.call_count, 1)
+    director.set_validated_resolution.assert_not_called()
+
+    empty_canonical = json.dumps({
+        'resolved_event': '',
+        'stage_directions': '',
+    })
+    director, model, chain, step = self._make(
+        speech='',
+        responses=[empty_canonical, _APPROVAL],
+    )
+    with self.assertRaisesRegex(
+        story_resolution.StoryOutputError, 'canonical event is empty'
+    ):
+      step(chain, 'Alice tries the lock.', 'Alice')
+    self.assertEqual(model.sample_text.call_count, 2)
+    director.set_validated_resolution.assert_not_called()
 
   def test_empty_canonical_in_turn_is_rejected(self):
     # A story turn in progress must resolve to a non-empty canonical
