@@ -18,13 +18,24 @@ This module owns the execution boundary of the story enactment example.
 A first run builds the run config and the ``Simulation``, injects the
 public premise into the game master (which never counts as a story
 step), saves the empty story-turn file plus the initial checkpoint
-envelope with ``committed_turn_id = 0``, and then plays with the
-collector's step callback as the only save boundary. A resumed run
-rebuilds a new ``Simulation`` from the config recorded in the envelope,
-restores component state with ``load_from_checkpoint``, restores the
-budget guard from the envelope's saved attempt count with the ORIGINAL
-total limits, trims the story-turn log to the committed boundary, and
-continues with ``play(premise='', max_steps=remaining_turns)``.
+envelope with ``committed_turn_id = 0``, archives the invocation in
+``run_manifest.json`` before the first model request, and then plays
+with the collector's step callback as the only save boundary. A resumed
+run rebuilds a new ``Simulation`` from the config recorded in the
+envelope, restores component state with ``load_from_checkpoint``,
+restores the budget guard from the envelope's saved attempt count with
+the ORIGINAL total limits, trims the story-turn log to the committed
+boundary, and continues with ``play(premise='', max_steps=remaining)``.
+
+Every invocation — first run, resume, zero-step resume, budget stop,
+error and caught interruption alike — ends by finalizing its archive:
+the cumulative usage sidecar plus one immutable
+``process_summaries/<invocation_id>.json`` holding that process's own
+timing, usage deltas and private failure diagnostics. Paths that
+return a ``RunResult(reason='error')`` keep returning it; a
+propagating ``BaseException`` still propagates after its summary is
+archived. ``SIGKILL`` or a power loss cannot guarantee this finalization
+runs, so such exits keep whatever the last committed checkpoint holds.
 
 Budget paths follow spec section 11.3. Exhaustion BEFORE a resolution
 commits propagates out of ``play`` and is recorded here as
@@ -48,8 +59,10 @@ Example:
 
 from collections.abc import Callable, Mapping, Sequence
 import dataclasses
+import datetime
 import json
 import os
+import sys
 import time
 from typing import Any
 
@@ -82,6 +95,17 @@ RUN_CONFIG_SCHEMA = 2
 # the action contract and is normalized on a copy (spec section 9).
 _KNOWN_RUN_CONFIG_SCHEMAS = (1, RUN_CONFIG_SCHEMA)
 
+# Sidecar record of a process's final cumulative model usage. The story
+# checkpoint keeps the committed turn boundary, so it cannot carry the
+# attempts a turn that failed mid-flight already consumed; this record
+# does, and a resume restores the budget from the true cumulative total.
+_PROCESS_USAGE_FILENAME = 'process_usage.json'
+
+# Termination reason of an invocation that ends by a catchable
+# interruption (KeyboardInterrupt, SimulatedInterruption, SystemExit):
+# the summary is still archived, then the original exception propagates.
+REASON_INTERRUPTED = 'interrupted'
+
 # Stage switches of the plan; stage 2 adds the tension_observe and
 # director modes, stage 3 adds character_depth.
 MODE_BEATS_ONLY = 'beats_only'
@@ -109,11 +133,15 @@ _CANONICAL_CALL_TO_ACTION_MODES = {
 _EMOTION_OPTIONS = ('平静', '焦虑', '愤怒', '悲伤', '希望', '羞愧')
 _RELATIONSHIPS_REFRESH_INTERVAL = 3
 
-# Appendix-C default scoring configuration of the drama director.
+# Appendix-C default scoring configuration of the drama director. The
+# repetition intervention stays off by default: only the director and
+# character_depth modes turn it on (spec sections 7.2 and 8).
 _DEFAULT_DIRECTOR_PARAMS = {
     'eval_interval': 2,
     'scoring_window': 8,
     'tolerance': 1,
+    'repetition_push_enabled': False,
+    'repetition_check_interval': 3,
 }
 # beats_only keeps the exact stage-1 model-call pattern: eval_interval=0
 # disables scoring, so no story turn falls on a scoring step.
@@ -126,11 +154,15 @@ _TENSION_OBSERVE_DIRECTOR_PARAMS = {
 }
 # The director mode enables feedback: deviating scores generate
 # directives drawn from the story's allowed environment events, with
-# the appendix-C cooldown between executions.
+# the appendix-C cooldown between executions. It also enables the
+# repetition intervention (spec 7.2) with the appendix-C interval;
+# both switches stay individually overridable in the recorded params.
 _DIRECTOR_MODE_DIRECTOR_PARAMS = {
     **_DEFAULT_DIRECTOR_PARAMS,
     'cooldown_turns': 3,
     'feedback_enabled': True,
+    'repetition_push_enabled': True,
+    'repetition_check_interval': 3,
 }
 
 # Names of the two prefabs inside the run's Config.
@@ -394,8 +426,22 @@ def make_gm_params(
           '裁决者不得代替任何玩家作这些选择，也不得将请求、指控、计划、'
           '谎言或他人的陈述直接当作已经发生的行动或客观真相。'
       ),
-      '环境事件只能从以下选项中选择：'
-      + '；'.join(story.allowed_environment_events),
+  )
+  constraints += (
+      (
+          '导演主动发起的新 NPC 或环境事件只能从以下选项中选择，不得引入范围外事件：'
+          + '；'.join(story.allowed_environment_events)
+      ),
+      (
+          '已合法登场的 NPC 对当前角色明确交互的公开直接回应另受'
+          '配置的 NPC 回应规则（npc_response_rules）约束：它是该动作的'
+          '直接后果，不算导演新事件，也不得借此授予 GM-only 知识、'
+          '物证、电话号码、机构认证或法律结论。只有适用的 NPC 回应规则'
+          '已授权该 NPC 在当前交互中的公开回应时，才可在授权范围内'
+          '给出有依据的有限回应或拒绝；规则未逐句规定答案不等于禁止'
+          '所有回应。规则为空、没有适用规则或触发条件未满足时，不得'
+          '通过这条动作后果通道生成 NPC 回应，不得替任何玩家配合或承诺。'
+      ),
   )
   constraints += tuple(
       f'角色底线（始终有效）：{character.name}：{character.hard_constraint}'
@@ -427,6 +473,7 @@ def make_gm_params(
           for character in story.characters
       },
       'allowed_environment_events': list(story.allowed_environment_events),
+      'npc_response_rules': list(story.npc_response_rules),
       'world_constraints': list(constraints),
       'immutable_facts': list(story.immutable_facts),
   }
@@ -445,6 +492,35 @@ def _public_model_identity(
   identity.setdefault('api_type', 'stub')
   identity.setdefault('model_name', 'prompt_stub')
   return identity
+
+
+def _runtime_secret_texts(
+    model_config: Mapping[str, Any] | None,
+) -> tuple[str, ...]:
+  """Returns the credential values this process must redact from text.
+
+  Dropping credential dictionary fields is not enough: a provider
+  exception can quote the API key back inside its message, and that
+  message reaches the archives through ``error_message`` and the
+  process summary. Every non-empty credential value known to this
+  process is collected here — with no length exemption — and replaced
+  wherever it occurs; only the secret's own occurrences change, so
+  committed dialogue and story facts stay byte-identical.
+
+  Args:
+    model_config: the effective model configuration of the invocation.
+
+  Returns:
+    The credential values to redact, longest first.
+  """
+  secrets = {
+      value
+      for key, value in (model_config or {}).items()
+      if key.lower() in provenance.CREDENTIAL_KEYS
+      and isinstance(value, str)
+      and value
+  }
+  return tuple(sorted(secrets, key=len, reverse=True))
 
 
 def _actual_model_identity(
@@ -526,9 +602,9 @@ def _validate_action_mode_consistency(
   the scene action specs. A config whose nested parts name a different
   contract would run one mode while recording another, so each nested
   contract that canonically names a mode must agree with the recorded
-  one. Values that name no canonical contract (e.g. a customized scene
-  call to action, or a ``gm_params`` without the key) cannot be inferred
-  and are left alone.
+  one. A missing game-master mode uses the prefab's ``speech_only``
+  default. Customized scene calls to action that name no canonical
+  contract cannot be inferred and are left alone.
 
   Args:
     run_config: the schema-2 run config, with a validated
@@ -539,8 +615,10 @@ def _validate_action_mode_consistency(
       action mode.
   """
   mode = run_config['action_mode']
-  gm_mode = (run_config.get('gm_params') or {}).get('action_mode')
-  if gm_mode is not None and gm_mode != mode:
+  gm_mode = (run_config.get('gm_params') or {}).get(
+      'action_mode', story_action.ACTION_MODE_SPEECH_ONLY
+  )
+  if gm_mode != mode:
     raise ValueError(
         'action_mode mismatch inside run config: top-level holds'
         f' {mode!r}, gm_params holds {gm_mode!r}.'
@@ -612,10 +690,24 @@ def _normalize_run_config(
     _validate_action_mode_consistency(config)
   # Old configs may predate the director's intervention switches; the
   # filled defaults match the prefab's own, so this only makes the
-  # effective values explicit, it changes no behavior.
+  # effective values explicit, it changes no behavior. A missing
+  # repetition switch always reads as disabled — including a resumed
+  # director-mode run from before the switch existed — so the mode
+  # never silently enables the new intervention (spec section 9).
   director_params = dict(config.get('director_params', {}))
   director_params.setdefault('feedback_enabled', False)
   director_params.setdefault('cooldown_turns', 3)
+  director_params.setdefault('repetition_push_enabled', False)
+  interval = director_params.setdefault('repetition_check_interval', 3)
+  if (
+      not isinstance(interval, int)
+      or isinstance(interval, bool)
+      or (interval < 1)
+  ):
+    raise ValueError(
+        'repetition_check_interval must be a positive integer, got'
+        f' {interval!r}.'
+    )
   config['director_params'] = director_params
   return config
 
@@ -1004,6 +1096,76 @@ def _load_envelope(checkpoint_path: str) -> dict[str, Any]:
   return envelope
 
 
+def _write_process_usage(
+    state_dir: str,
+    *,
+    budget_guard: budget_wrapper.BudgetGuardLanguageModel,
+    retry_stats: retry_stats_wrapper.RetryStatsLanguageModel,
+) -> None:
+  """Atomically records the process's final cumulative model usage.
+
+  Written by the invocation finalizer on every exit path — including
+  failed and interrupted runs — so a resume never replays a failed
+  turn's already-consumed attempts for free (the story checkpoint keeps
+  only the committed boundary's counts).
+
+  Args:
+    state_dir: the run's state directory.
+    budget_guard: the budget guard holding the cumulative attempt count.
+    retry_stats: the retry-statistics wrapper holding the cumulative
+      API retry count.
+  """
+  collector._atomic_write_text(  # pylint: disable=protected-access
+      os.path.join(state_dir, _PROCESS_USAGE_FILENAME),
+      json.dumps(
+          {
+              'used_model_attempts': budget_guard.used_attempts,
+              'used_api_retries': retry_stats.used_retries,
+          },
+          ensure_ascii=False,
+          indent=2,
+      ),
+  )
+
+
+def _load_process_usage(
+    usage_path: str,
+    *,
+    attempt_limit: int,
+) -> dict[str, int] | None:
+  """Loads the process-usage sidecar record of a state directory.
+
+  Args:
+    usage_path: path of the usage record.
+    attempt_limit: the run's original total attempt limit, bounding the
+      record's attempt count.
+
+  Returns:
+    The record with 'used_model_attempts' and 'used_api_retries', or
+    None when no record exists yet.
+
+  Raises:
+    ValueError: if the record exists but is unreadable or its counts
+      are out of range.
+  """
+  if not os.path.exists(usage_path):
+    return None
+  try:
+    with open(usage_path, encoding='utf-8') as handle:
+      usage = json.load(handle)
+  except json.JSONDecodeError as e:
+    raise ValueError(f'corrupt process usage record {usage_path!r}: {e}') from e
+  used = usage.get('used_model_attempts')
+  retries = usage.get('used_api_retries')
+  if not isinstance(used, int) or not 0 <= used <= attempt_limit:
+    raise ValueError(f'process usage attempt count out of range: {used!r}.')
+  if not isinstance(retries, int) or not 0 <= retries <= used:
+    raise ValueError(
+        f'process usage API retry count out of range: {retries!r}.'
+    )
+  return {'used_model_attempts': used, 'used_api_retries': retries}
+
+
 def _reject_configured_mismatch(
     run_config: Mapping[str, Any],
     *,
@@ -1104,11 +1266,14 @@ def _write_outputs(
     run_config: Mapping[str, Any],
     turn_log: collector.StoryTurnLog,
     committed_turn_id: int,
+    secret_texts: tuple[str, ...] = (),
 ) -> None:
   """Writes summary.json and the FDX, Fountain and plain-text exports.
 
   Only story turns confirmed by the latest full checkpoint are
-  rendered; an uncommitted tail never reaches the exports.
+  rendered; an uncommitted tail never reaches the exports. Exception
+  messages (``error_message``) are scrubbed of this process's runtime
+  credential values before they are archived here.
 
   Args:
     state_dir: the run's state directory.
@@ -1116,16 +1281,20 @@ def _write_outputs(
     run_config: the run's configuration.
     turn_log: the story-turn log to read confirmed records from.
     committed_turn_id: the highest confirmed turn id.
+    secret_texts: runtime credential values to redact from text.
   """
-  summary = {
-      **dataclasses.asdict(result),
-      'mode': run_config['mode'],
-      'action_mode': run_config['action_mode'],
-      'total_turn_limit': run_config['total_turn_limit'],
-      'total_model_attempt_limit': run_config['total_model_attempt_limit'],
-      'model_config': run_config['model_config'],
-      'story_title': run_config['story']['title'],
-  }
+  summary = provenance.scrub_credentials(
+      {
+          **dataclasses.asdict(result),
+          'mode': run_config['mode'],
+          'action_mode': run_config['action_mode'],
+          'total_turn_limit': run_config['total_turn_limit'],
+          'total_model_attempt_limit': run_config['total_model_attempt_limit'],
+          'model_config': run_config['model_config'],
+          'story_title': run_config['story']['title'],
+      },
+      secret_texts=secret_texts,
+  )
   collector._atomic_write_text(  # pylint: disable=protected-access
       os.path.join(state_dir, 'summary.json'),
       json.dumps(summary, ensure_ascii=False, indent=2),
@@ -1153,6 +1322,188 @@ def _write_outputs(
       os.path.join(state_dir, 'script.txt'),
       renderer.render_plain_text(records, scene_display),
   )
+
+
+def _uncommitted_resolution_or_none(
+    diagnostics: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+  """Filters empty diagnostics into a null uncommitted-resolution field.
+
+  Args:
+    diagnostics: the director's current resolution diagnostics (a deep
+      copy), or None when they could not be read.
+
+  Returns:
+    None when no uncommitted attempt left any evidence — no adjudicated
+    action result, no intervention candidate, no recorded trace — else
+    the diagnostics dictionary as the summary's private field.
+  """
+  if diagnostics is None:
+    return None
+  if (
+      diagnostics.get('action_result') is None
+      and diagnostics.get('intervention') is None
+      and not diagnostics.get('history')
+  ):
+    return None
+  return dict(diagnostics)
+
+
+def _finalize_invocation(
+    state_dir: str,
+    checkpoint_path: str,
+    *,
+    invocation_id: str,
+    invocation_clock_start: float,
+    director: drama_director.DramaDirector,
+    budget_guard: budget_wrapper.BudgetGuardLanguageModel,
+    retry_stats: retry_stats_wrapper.RetryStatsLanguageModel,
+    resume: bool,
+    committed_turn_id_at_start: int,
+    used_model_attempts_at_start: int,
+    used_api_retries_at_start: int,
+    total_turn_limit: int,
+    total_model_attempt_limit: int,
+    result_reason: str | None,
+    original_exception: BaseException | None,
+    caught_exception: BaseException | None,
+    secret_texts: tuple[str, ...] = (),
+) -> None:
+  """Archives the invocation's process summary and usage on every path.
+
+  Runs on success, budget stop, error result and propagating
+  interruption alike. Each finalization step is guarded individually so
+  one failure never skips the others; with an original exception in
+  flight, a finalization failure is reported on stderr and must not
+  mask it, while without one it is raised as a clear error.
+
+  Args:
+    state_dir: the run's state directory.
+    checkpoint_path: path of the checkpoint envelope.
+    invocation_id: the id archived before the first model request.
+    invocation_clock_start: monotonic start of this invocation.
+    director: the run's drama director (transient diagnostics source).
+    budget_guard: the budget guard holding cumulative attempts.
+    retry_stats: the retry wrapper holding cumulative API retries.
+    resume: whether this invocation resumed a checkpoint.
+    committed_turn_id_at_start: committed boundary at invocation start.
+    used_model_attempts_at_start: cumulative attempts at start.
+    used_api_retries_at_start: cumulative API retries at start.
+    total_turn_limit: original total story-turn budget.
+    total_model_attempt_limit: original total model-attempt budget.
+    result_reason: the returned RunResult's reason, when returning.
+    original_exception: the exception in flight, else None.
+    caught_exception: a play exception converted into a result, if any.
+    secret_texts: runtime credential values to redact from the summary.
+  """
+  errors: list[BaseException] = []
+
+  # The transient diagnostics must be captured first — a deep copy —
+  # before any later step could observe or clear them.
+  try:
+    diagnostics = director.get_current_resolution_diagnostics()
+  except BaseException as e:  # pylint: disable=broad-except
+    errors.append(e)
+    diagnostics = None
+  try:
+    _write_process_usage(
+        state_dir, budget_guard=budget_guard, retry_stats=retry_stats
+    )
+  except BaseException as e:  # pylint: disable=broad-except
+    errors.append(e)
+  committed_end = committed_turn_id_at_start
+  try:
+    committed_end = (
+        collector._read_committed_turn_id(  # pylint: disable=protected-access
+            checkpoint_path
+        )
+        or 0
+    )
+  except BaseException as e:  # pylint: disable=broad-except
+    errors.append(e)
+  entry: Mapping[str, Any] = {}
+  try:
+    entry = provenance.read_invocation(state_dir, invocation_id)
+  except BaseException as e:  # pylint: disable=broad-except
+    errors.append(e)
+
+  if original_exception is not None:
+    reason = (
+        REASON_INTERRUPTED
+        if not isinstance(original_exception, Exception)
+        else story_terminator.REASON_ERROR
+    )
+    recorded_exception: BaseException | None = original_exception
+  else:
+    reason = result_reason or story_terminator.REASON_ERROR
+    recorded_exception = caught_exception
+  used_attempts_end = budget_guard.used_attempts
+  used_retries_end = retry_stats.used_retries
+  try:
+    provenance.write_process_summary(
+        state_dir,
+        invocation_id=invocation_id,
+        # The scrub also redacts this process's runtime credential
+        # values from the exception message and the diagnostics texts.
+        summary=provenance.scrub_credentials(
+            {
+                'schema_version': 1,
+                'invocation_id': invocation_id,
+                'resume': resume,
+                'source_version': entry.get('source_version'),
+                'started_at_utc': entry.get('started_at_utc'),
+                'finished_at_utc': (
+                    datetime.datetime.now(datetime.timezone.utc).isoformat()
+                ),
+                # This invocation only, measured on the monotonic clock;
+                # it is not the whole experiment's accumulated time.
+                'process_wall_time_seconds': (
+                    time.monotonic() - invocation_clock_start
+                ),
+                'reason': reason,
+                'exception': (
+                    None
+                    if recorded_exception is None
+                    else {
+                        'type': type(recorded_exception).__name__,
+                        'message': str(recorded_exception),
+                    }
+                ),
+                'committed_turn_id_at_start': committed_turn_id_at_start,
+                'committed_turn_id_at_end': committed_end,
+                'used_model_attempts_at_start': used_model_attempts_at_start,
+                'used_model_attempts_at_end': used_attempts_end,
+                'attempts_used_this_process': (
+                    used_attempts_end - used_model_attempts_at_start
+                ),
+                'used_api_retries_at_start': used_api_retries_at_start,
+                'used_api_retries_at_end': used_retries_end,
+                'api_retries_used_this_process': (
+                    used_retries_end - used_api_retries_at_start
+                ),
+                'total_turn_limit': total_turn_limit,
+                'total_model_attempt_limit': total_model_attempt_limit,
+                # Private failure evidence of the uncommitted turn, never
+                # broadcast to characters, observations or scripts.
+                'uncommitted_resolution': _uncommitted_resolution_or_none(
+                    diagnostics
+                ),
+            },
+            secret_texts=secret_texts,
+        ),
+    )
+  except BaseException as e:  # pylint: disable=broad-except
+    errors.append(e)
+
+  if errors:
+    if original_exception is not None:
+      print(
+          'process summary archival failed (original exception still'
+          f' propagates): {errors!r}',
+          file=sys.stderr,
+      )
+    else:
+      raise RuntimeError('process summary archival failed.') from errors[0]
 
 
 def run(
@@ -1212,8 +1563,10 @@ def run(
       parameters are ignored.
 
   Returns:
-    The run's result record; summary.json, script.fountain and
-      script.txt are written next to the state files.
+    The run's result record; summary.json, the script exports, the
+      usage sidecar and one immutable
+      ``process_summaries/<invocation_id>.json`` are written next to
+      the state files on every exit path of the invocation.
 
   Raises:
     ValueError: on resume validation failures (missing or mismatched
@@ -1221,6 +1574,10 @@ def run(
       identity, budget-exhausted summary, unknown run config schema),
       when starting over an existing run, or when the requested mode or
       action mode is unknown.
+    RuntimeError: when the invocation was archived but its final
+      archival (usage sidecar or process summary) fails on a path that
+      would otherwise return normally; a propagating original exception
+      is never masked by such a failure.
   """
   os.makedirs(state_dir, exist_ok=True)
   checkpoint_path = os.path.join(state_dir, 'checkpoint.json')
@@ -1259,6 +1616,31 @@ def run(
     _reject_budget_exhausted_summary(summary_path)
     used_at_start = envelope['used_model_attempts']
     api_retries_at_start = envelope.get('used_api_retries', 0)
+    # A previous process may have consumed attempts beyond this
+    # checkpoint's boundary (a turn that failed mid-flight); the sidecar
+    # usage record restores the true cumulative total without moving
+    # the story boundary the checkpoint holds.
+    usage = _load_process_usage(
+        os.path.join(state_dir, _PROCESS_USAGE_FILENAME),
+        attempt_limit=config['total_model_attempt_limit'],
+    )
+    if usage is not None:
+      used_at_start = max(used_at_start, usage['used_model_attempts'])
+      api_retries_at_start = max(
+          api_retries_at_start, usage['used_api_retries']
+      )
+    # The per-invocation summaries are a usage record of their own: a
+    # summary survives even when the sidecar's write failed, and one
+    # that cannot be validated refuses the resume here rather than
+    # letting a stale checkpoint count silently re-grant attempts a
+    # failed process already consumed.
+    recorded = provenance.restore_recorded_usage(
+        state_dir, attempt_limit=config['total_model_attempt_limit']
+    )
+    used_at_start = max(used_at_start, recorded['used_model_attempts'])
+    api_retries_at_start = max(
+        api_retries_at_start, recorded['used_api_retries']
+    )
     committed_start = envelope['committed_turn_id']
     saved_state = envelope['simulation_state']
   else:
@@ -1297,6 +1679,9 @@ def run(
     effective_model_config = (
         dict(model_config) if model_config is not None else None
     ) or dict(config['model_config'])
+  # The runtime credential values of the effective model are redacted
+  # from every archived text (exception messages, diagnostics traces).
+  secret_texts = _runtime_secret_texts(effective_model_config)
   provider, retryable = make_language_model(
       effective_model_config, disable_language_model=disable_language_model
   )
@@ -1395,12 +1780,13 @@ def run(
   director_state: Mapping[str, Any] = director.get_state()
   parse_retries_at_start = int(director_state.get('scoring_parse_retries', 0))
 
-  provenance.archive_invocation(
+  invocation_id = provenance.archive_invocation(
       state_dir,
       run_config=config,
       committed_turn_id=committed_start,
       resume=resume,
   )
+  invocation_clock_start = time.monotonic()
 
   base_callback = collector.make_step_callback(
       simulation=checkpoint_source,
@@ -1426,75 +1812,114 @@ def run(
     base_callback(step_data)
     step_marks.append(time.monotonic())
 
-  play_start = time.monotonic()
-  if not stop_before_play:
-    try:
-      # No auto checkpoint_path/get_state_callback: the collector's
-      # callback is the only save boundary.
-      simulation.play(
-          premise='',
-          max_steps=max_steps,
-          step_callback=timed_callback,
-      )
-    except budget_wrapper.BudgetExhaustedError as e:
-      exception_reason = story_terminator.REASON_BUDGET_LIMIT
-      budget_error = str(e)
-    except Exception as e:  # pylint: disable=broad-except
-      exception_reason = story_terminator.REASON_ERROR
-      error_message = f'{type(e).__name__}: {e}'
-    # BaseException (e.g. a simulated crash) propagates untouched.
-  wall_time = time.monotonic() - play_start
+  caught_exception: BaseException | None = None
+  propagating_exception: BaseException | None = None
+  result: RunResult | None = None
+  try:
+    play_start = time.monotonic()
+    if not stop_before_play:
+      try:
+        # No auto checkpoint_path/get_state_callback: the collector's
+        # callback is the only save boundary.
+        simulation.play(
+            premise='',
+            max_steps=max_steps,
+            step_callback=timed_callback,
+        )
+      except budget_wrapper.BudgetExhaustedError as e:
+        caught_exception = e
+        exception_reason = story_terminator.REASON_BUDGET_LIMIT
+        budget_error = str(e)
+      except Exception as e:  # pylint: disable=broad-except
+        caught_exception = e
+        exception_reason = story_terminator.REASON_ERROR
+        error_message = f'{type(e).__name__}: {e}'
+      # BaseException (e.g. a simulated crash or KeyboardInterrupt) is
+      # not converted here; the finalizer below still archives a summary
+      # and then the original exception propagates untouched.
+    wall_time = time.monotonic() - play_start
 
-  committed = collector._read_committed_turn_id(  # pylint: disable=protected-access
-      checkpoint_path
-  )
-  if committed is None:
-    committed = 0
-  final_director_state: Mapping[str, Any] = director.get_state()
-  director_budget_stopped = final_director_state['budget_stopped']
-  if director_budget_stopped and budget_error is None:
-    budget_error = (
-        'post-resolution budget stop after committed turn '
-        f'{committed} (attempt budget of {attempt_limit}).'
+    committed = collector._read_committed_turn_id(  # pylint: disable=protected-access
+        checkpoint_path
     )
-  component_reason = _component_termination_reason(simulation)
-  reason = story_terminator.resolve_final_reason(
-      exception_reason,
-      component_reason or None,
-      committed,
-      turn_limit,
-  )
-  used_scoring_parse_retries = int(
-      final_director_state['scoring_parse_retries']
-  )
-  result = RunResult(
-      reason=reason,
-      committed_turn_id=committed,
-      budget_exhausted=budget_error is not None,
-      budget_error=budget_error,
-      error_message=error_message,
-      attempts_used_this_process=guard.used_attempts - used_at_start,
-      used_model_attempts=guard.used_attempts,
-      api_retries_used_this_process=(
-          retry_stats.used_retries - api_retries_at_start
-      ),
-      used_api_retries=retry_stats.used_retries,
-      scoring_parse_retries_used_this_process=(
-          used_scoring_parse_retries - parse_retries_at_start
-      ),
-      used_scoring_parse_retries=used_scoring_parse_retries,
-      wall_time_seconds=wall_time,
-      step_durations=_step_durations(step_marks, play_start),
-      token_usage=None,
-  )
-  _write_outputs(
-      state_dir,
-      result=result,
-      run_config=config,
-      turn_log=turn_log,
-      committed_turn_id=committed,
-  )
-  return result
+    if committed is None:
+      committed = 0
+    final_director_state: Mapping[str, Any] = director.get_state()
+    director_budget_stopped = final_director_state['budget_stopped']
+    if director_budget_stopped and budget_error is None:
+      budget_error = (
+          'post-resolution budget stop after committed turn '
+          f'{committed} (attempt budget of {attempt_limit}).'
+      )
+    component_reason = _component_termination_reason(simulation)
+    reason = story_terminator.resolve_final_reason(
+        exception_reason,
+        component_reason or None,
+        committed,
+        turn_limit,
+    )
+    used_scoring_parse_retries = int(
+        final_director_state['scoring_parse_retries']
+    )
+    result = RunResult(
+        reason=reason,
+        committed_turn_id=committed,
+        budget_exhausted=budget_error is not None,
+        budget_error=budget_error,
+        error_message=error_message,
+        attempts_used_this_process=guard.used_attempts - used_at_start,
+        used_model_attempts=guard.used_attempts,
+        api_retries_used_this_process=(
+            retry_stats.used_retries - api_retries_at_start
+        ),
+        used_api_retries=retry_stats.used_retries,
+        scoring_parse_retries_used_this_process=(
+            used_scoring_parse_retries - parse_retries_at_start
+        ),
+        used_scoring_parse_retries=used_scoring_parse_retries,
+        wall_time_seconds=wall_time,
+        step_durations=_step_durations(step_marks, play_start),
+        token_usage=None,
+    )
+    _write_outputs(
+        state_dir,
+        result=result,
+        run_config=config,
+        turn_log=turn_log,
+        committed_turn_id=committed,
+        secret_texts=secret_texts,
+    )
+    return result
+  except BaseException as e:  # pylint: disable=broad-except
+    propagating_exception = e
+    raise
+  finally:
+    # Finalization runs on every exit path after the invocation was
+    # archived: it persists the true cumulative usage (the checkpoint
+    # keeps only the committed boundary) and publishes the immutable
+    # per-process summary. Each step is individually guarded, an
+    # in-flight original exception is never masked, and without one an
+    # archival failure is a clear error. SIGKILL or a power loss can
+    # still skip this entirely — no summary is fabricated then.
+    _finalize_invocation(
+        state_dir,
+        checkpoint_path,
+        invocation_id=invocation_id,
+        invocation_clock_start=invocation_clock_start,
+        director=director,
+        budget_guard=guard,
+        retry_stats=retry_stats,
+        resume=resume,
+        committed_turn_id_at_start=committed_start,
+        used_model_attempts_at_start=used_at_start,
+        used_api_retries_at_start=api_retries_at_start,
+        total_turn_limit=turn_limit,
+        total_model_attempt_limit=attempt_limit,
+        result_reason=result.reason if result is not None else None,
+        original_exception=propagating_exception,
+        caught_exception=caught_exception,
+        secret_texts=secret_texts,
+    )
 
 
 def main(argv: Sequence[str]) -> None:

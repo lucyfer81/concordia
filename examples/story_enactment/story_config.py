@@ -39,10 +39,15 @@ _SPEECH_CALL_TO_ACTION = (
     '没有新事实时也不要编造证据或声称他人已经同意。'
 )
 
-# Speech-and-action prompt (design doc section 3): the character outputs
+# Speech-and-action prompt (design doc section 4): the character outputs
 # a strict JSON object with their own dialogue and their own current
 # action attempt. The action intent never prewrites outcomes, object
 # contents, other characters' decisions, or already-completed actions.
+# A1 guidance: distinguish executing / waiting on a condition / refusing,
+# describe the attempt itself without prewriting success or others'
+# cooperation, and do not escalate procedure every turn. The output
+# contract and the stub-routing fingerprints (the "{name} 现在说什么、
+# 做什么" phrasing and the JSON field names) are unchanged.
 _SPEECH_AND_ACTION_CALL_TO_ACTION = (
     '根据你已知的信息，{name} 现在说什么、做什么？只输出一个 JSON 对象，'
     '且仅包含两个字符串字段："speech" 为 {name} 现在的对白正文'
@@ -51,7 +56,16 @@ _SPEECH_AND_ACTION_CALL_TO_ACTION = (
     '对白不含角色名、引号包裹、他人台词、旁白或推理过程；'
     '行动意图只描述此刻自己尝试的动作，不预写成功结果、物件内容、'
     '他人的决定或过去已完成的动作。'
-    '回应最近公开的新信息，保持自己的目标、底线和表达风格；'
+    '根据你实际收到的观察，回应尚未解决的问题；若决定行动，'
+    '选择自己本轮可以尝试的一步，描述尝试本身。'
+    '区分正在执行、等待条件和明确拒绝：等待时说清缺少谁的什么回应'
+    '或哪个尚未满足的条件；已观察到条件满足时，不要无理由重新提出'
+    '同一前置条件，可以继续行动、改变方案或明确拒绝。'
+    '符合自身目标和底线的等待、保留意见与拒绝仍然允许。'
+    '不必每轮新增核验、登记或签认步骤；"准备核验"只是准备，'
+    '不等于查看自己可访问的文书；必要的程序必须有当前问题作为依据。'
+    '自己的疑问得到回应后，选择接受、追问其中具体缺口、改换方案或拒绝。'
+    '不把对白中的将来承诺写成已执行动作。'
     '没有新事实时不要编造证据或声称他人已经同意。只输出该 JSON 对象。'
 )
 
@@ -139,6 +153,13 @@ class StoryConfig:
     characters: the cast of the story.
     conflict_start: the public conflict that opens the story.
     allowed_endings: the endings the enactment may reach.
+    npc_response_rules: GM-only content authorization for public direct
+      responses of NPCs that already legally entered the story; each
+      rule names the NPC, its entrance basis, the interaction trigger,
+      the allowed responses, knowledge limits and the public scope. An
+      empty tuple keeps the old boundary (no NPC responses beyond the
+      existing director paths); the rules are authorization to generate
+      within scope, not established facts and not a broadcast.
   """
 
   title: str
@@ -152,6 +173,7 @@ class StoryConfig:
   characters: tuple[CharacterInfo, ...]
   conflict_start: str
   allowed_endings: tuple[str, ...]
+  npc_response_rules: tuple[str, ...] = ()
 
   def to_dict(self) -> dict[str, Any]:
     """Returns a JSON-friendly dictionary view of this configuration.
@@ -172,6 +194,7 @@ class StoryConfig:
         'characters': [c.to_dict() for c in self.characters],
         'conflict_start': self.conflict_start,
         'allowed_endings': list(self.allowed_endings),
+        'npc_response_rules': list(self.npc_response_rules),
     }
 
   @classmethod
@@ -183,7 +206,18 @@ class StoryConfig:
 
     Returns:
       The decoded configuration.
+
+    Raises:
+      ValueError: if ``npc_response_rules`` is present but is not a list
+        or tuple of non-empty strings.
     """
+    raw_npc_rules = d.get('npc_response_rules', ())
+    if not isinstance(raw_npc_rules, (list, tuple)) or any(
+        not isinstance(rule, str) or not rule.strip() for rule in raw_npc_rules
+    ):
+      raise ValueError(
+          'npc_response_rules must be a list or tuple of non-empty strings'
+      )
     return cls(
         title=d['title'],
         location=d['location'],
@@ -196,6 +230,7 @@ class StoryConfig:
         characters=tuple(CharacterInfo.from_dict(c) for c in d['characters']),
         conflict_start=d['conflict_start'],
         allowed_endings=tuple(d['allowed_endings']),
+        npc_response_rules=tuple(raw_npc_rules),
     )
 
 
@@ -264,6 +299,14 @@ def validate(config: StoryConfig) -> list[str]:
       )
   if not config.allowed_environment_events:
     problems.append('allowed_environment_events must not be empty')
+  if not isinstance(config.npc_response_rules, (list, tuple)):
+    problems.append('npc_response_rules must be a list or tuple')
+  else:
+    for rule in config.npc_response_rules:
+      if not isinstance(rule, str) or not rule.strip():
+        problems.append(
+            f'npc_response_rules must be non-empty strings, got: {rule!r}'
+        )
   return problems
 
 
@@ -404,6 +447,17 @@ def make_example_config() -> StoryConfig:
               '并就保留老宅和林雪的照护权益达成具体安排。'
           ),
           '僵局散场：争执无解，众人不欢而散，遗嘱交由法庭裁决。',
+      ),
+      npc_response_rules=(
+          (
+              '邻居（隔壁邻居）：仅在其已因白名单敲门事件合法登场之后，'
+              '才可作为已登场 NPC 回应；当当前角色实际隔门告知暂不需要帮助时，'
+              '邻居可公开表示听到了、愿意在被请求时提供普通帮助，'
+              '或按该告知离开；不披露屋内秘密，不作法律认证，'
+              '不替屋内任何玩家同意，不制造证据；'
+              '仅"准备告知"不算已经说出，不触发邻居按告知作出反应；'
+              '该回应对在场所有场景参与者公开，不要求固定台词或必定合作。'
+          ),
       ),
   )
 

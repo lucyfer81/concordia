@@ -19,9 +19,10 @@ one fixed string and always the first choice, this stub routes by
 prompt semantics: the shared speech call to action returns a
 per-character dialogue line, the speech-and-action contract call
 returns strict JSON preserving the authored speech verbatim, the
-dual-track resolution request returns valid JSON derived from the
-resolution evidence carried by the current prompt, and the basic
-entity's perception questions receive short fixed answers. Text
+final narrator-track request returns a single-field
+stage-directions JSON derived from the resolution evidence carried
+by the current prompt, and the basic entity's perception questions
+receive short fixed answers. Text
 routing keys on the LAST `Question:`/`Exercise:` block of the prompt,
 so earlier question blocks embedded in a component's context (e.g. the
 perception questions quoted inside the action prompt) never hijack the
@@ -32,7 +33,7 @@ id so no beat is completed by default. Every prompt is recorded for
 later assertions.
 
 The stub doubles as the deterministic verification instrument of the
-propagation tests: its dual-track output narrates only the
+propagation tests: its stage-directions output narrates only the
 core-adjudicated action result and the intervention candidate carried
 by the current prompt's marked evidence section, never configuration
 values or anything earlier calls generated, so tests can prove that
@@ -55,14 +56,12 @@ _SPEECH_CALL_MARK = '现在说什么'
 _SPEECH_ACTION_CALL_MARK = '现在说什么、做什么'
 _SPEAKER_IN_CALL = re.compile(r'根据你已知的信息，(.+?) 现在说什么')
 
-# Fingerprints and field patterns of the dual-track resolution prompt
-# built by `concordia.contrib.components.game_master.story_resolution`.
-_DUAL_TRACK_MARK = 'Output a JSON object with exactly two string fields'
+# Fingerprint of the final narrator-track output instruction built by
+# `concordia.contrib.components.game_master.story_resolution`.
+_FINAL_OUTPUT_MARK = 'Output a JSON object with exactly one string field'
 _REVIEW_MARK = (
     'Evaluate all rules above. Output only a JSON object with exactly'
 )
-_CURRENT_SPEAKER = re.compile(r'## Current speaker\n(.+)')
-_ORIGINAL_SPEECH = re.compile(r'## Original speech \(verbatim\)\n(.*)')
 
 # Heading marking the JSON data section that final-generation prompts
 # carry next to their evidence (the turn's speech, action intent,
@@ -150,6 +149,44 @@ def read_evidence_section(text: str) -> dict[str, Any] | None:
   return payload if isinstance(payload, dict) else None
 
 
+def _intervention_narration_fact(intervention: Mapping[str, Any]) -> str:
+  r"""Extracts only the new fact of an intervention candidate.
+
+  A test instrument modeling legal narration, never production
+  parsing: the recorded `candidate_after` may embed the original
+  event (the speech line) as a same-line suffix, an appended line, or
+  the core repetition helper's numbered merge
+  (`1. <original>\n2. <event>`). The narration fact is what remains
+  after removing the original-event portion, so the stub's narrator
+  track never repeats the dialogue.
+
+  Args:
+    intervention: the decoded intervention candidate.
+
+  Returns:
+    The new-fact text (edge whitespace stripped; this is the stub
+    deriving its own narration, not rewriting a model response), or
+    '' when the candidate carries no text.
+  """
+  candidate_after = intervention.get('candidate_after')
+  if not isinstance(candidate_after, str) or not candidate_after:
+    return ''
+  candidate_before = intervention.get('candidate_before')
+  fact = candidate_after
+  if isinstance(candidate_before, str) and candidate_before:
+    if fact.startswith(candidate_before):
+      fact = fact[len(candidate_before) :]
+    else:
+      before_lines = {line.strip() for line in candidate_before.split('\n')}
+      kept = []
+      for line in fact.split('\n'):
+        unnumbered = re.sub(r'^\d+\.\s*', '', line)
+        if unnumbered.strip() not in before_lines:
+          kept.append(unnumbered)
+      fact = '\n'.join(kept)
+  return fact.strip()
+
+
 class PromptStubModel(language_model.LanguageModel):
   """Deterministic stub routing story prompts to canned outputs.
 
@@ -171,6 +208,7 @@ class PromptStubModel(language_model.LanguageModel):
       review_response: str = '{"valid": true, "reason": "scripted approval"}',
       action_intents: Mapping[str, str] | None = None,
       action_result: str = '',
+      stage_omissions: Collection[str] = (),
       repetition_answer: str | None = None,
       push_events: str = '',
       push_merged: str = '',
@@ -183,7 +221,7 @@ class PromptStubModel(language_model.LanguageModel):
         when the speech call to action addresses that character.
       default_line: line spoken for characters not in the mapping.
       stage_directions: fixed background narration appended after the
-        evidence-derived facts in both tracks of a resolution; the
+        evidence-derived facts in the stage-directions track; the
         propagation tests set it to ''.
       choice_answer: option text chosen for choice prompts without a
         configured beat-completion answer.
@@ -200,20 +238,29 @@ class PromptStubModel(language_model.LanguageModel):
         field of the speech-and-action JSON contract call; the speech
         field still comes from `dialogue_lines`.
       action_result: answer to the core attempt_to_result question
-        only. It never enters final generation directly: dual-track
-        output narrates the action result carried by the current
-        prompt's evidence section, never this configuration value.
+        only. It never enters final generation directly: the
+        stage-directions output narrates the action result carried by
+        the current prompt's evidence section, never this
+        configuration value.
+      stage_omissions: substrings deleted from the adjudicated action
+        result when the stub narrates it in the stage-directions track
+        — the F12 probe of a narration that drops the offending
+        sentence while the raw outcome keeps it. Everything else stays
+        evidence-derived.
       repetition_answer: yes/no option text answered for the core
         repetition-detector choice question when it is the prompt's
         last choice question.
       push_events: single plausible event (one line, no trailing
         newline) answering the repetition push's suggestion question;
         one legal suggestion keeps the core helper's `random.choice`
-        deterministic.
-      push_merged: suffix appended to the actual numbered candidate
+        deterministic. Configuring it also enables the merge answer,
+        which quotes the actual numbered candidate (preserving the real
+        action result) and appends `push_merged` as an optional suffix.
+      push_merged: optional suffix appended after the quoted candidate
         when answering the repetition push's merge question. It is a
-        test fusion template only: the final dual-track output includes
-        the intervention fact solely from the current prompt's evidence.
+        test fusion template only: the final stage-directions output
+        includes the intervention fact solely from the current
+        prompt's evidence.
       scoring_answer: answer to the drama director's tension-scoring
         question.
     """
@@ -226,6 +273,7 @@ class PromptStubModel(language_model.LanguageModel):
     self._review_response = review_response
     self._action_intents = dict(action_intents or {})
     self._action_result = action_result
+    self._stage_omissions = tuple(stage_omissions)
     self._repetition_answer = repetition_answer
     self._push_events = push_events
     self._push_merged = push_merged
@@ -309,15 +357,15 @@ class PromptStubModel(language_model.LanguageModel):
       return self._default_line
     if _REVIEW_MARK in block:
       return self._review_response
-    if _DUAL_TRACK_MARK in block:
-      return self._dual_track_output(block)
+    if _FINAL_OUTPUT_MARK in block:
+      return self._stage_directions_output(block)
     if _SCORING_MARK in block and self._scoring_answer:
       return self._scoring_answer
     if _ATTEMPT_RESULT_MARK in block and self._action_result:
       return self._action_result
     if _PUSH_SUGGEST_MARK in block and self._push_events:
       return self._push_events
-    if _PUSH_MERGE_MARK in block and self._push_merged:
+    if _PUSH_MERGE_MARK in block and self._push_events:
       return self._merge_output(block)
     if _SPEECH_ACTION_CALL_MARK in block:
       return self._action_contract_output(block)
@@ -376,80 +424,47 @@ class PromptStubModel(language_model.LanguageModel):
       return f'{given.group(1)}\n{self._push_merged}'
     return given.group(1)
 
-  def _dual_track_output(self, prompt: str) -> str:
-    """Builds a valid dual-track JSON preserving the speech verbatim.
+  def _stage_directions_output(self, prompt: str) -> str:
+    """Builds the single-field stage-directions JSON of one final turn.
 
-    Beyond the speech, both tracks narrate only what the current
-    prompt's marked evidence section actually carries: the
-    core-adjudicated action result and the intervention candidate's
-    post-merge text. Nothing is read from configuration or from what
-    earlier calls generated, so propagation tests can trust the output
-    as a faithful record of the evidence passed in. The evidence facts
-    also occupy the stage-directions track because the canonical event
-    is assembled from the speech and the approved narrator track alone:
-    only through that track can adjudicated facts reach the public
-    event, and the draft event and the track then narrate the same
-    facts, as the two-track consistency rule requires.
+    The narration carries only NEW facts the current prompt's marked
+    evidence section actually holds — the core-adjudicated action
+    result and the intervention candidate's new fact, with the
+    candidate's original-event portion (the speech line) removed —
+    plus the configured background suffix. Nothing is read from
+    configuration beyond the background, and nothing from what
+    earlier calls generated, so propagation tests can trust the
+    output as a faithful record of the evidence passed in. The stub
+    never emits dialogue, a speaker line or a `resolved_event`, and
+    never re-narrates the candidate's original event: the canonical
+    event is assembled by the production step, and duplicating the
+    speech into the narrator track would violate the no-repetition
+    rule a scripted-approving reviewer cannot catch.
 
     Args:
       prompt: the last question block of the final-generation prompt.
 
     Returns:
-      The dual-track JSON object as a string.
+      The single-field JSON object as a string.
     """
     evidence = read_evidence_section(prompt)
-    speaker_match = _CURRENT_SPEAKER.search(prompt)
-    speaker = speaker_match.group(1) if speaker_match else ''
-    parts = (
-        self._evidence_narration_parts(evidence) if evidence is not None else []
-    )
-    if evidence is not None and isinstance(evidence.get('speech'), str):
-      # The JSON data section is authoritative: unlike the verbatim-
-      # speech heading, JSON decoding cannot truncate multi-paragraph
-      # dialogue at the first line.
-      speech = evidence['speech']
-    else:
-      speech_match = _ORIGINAL_SPEECH.search(prompt)
-      speech = speech_match.group(1) if speech_match else ''
-    if not speech or speech == '(none)':
-      resolved = f'{speaker} 沉默片刻。'
-    else:
-      resolved = f'{speaker}: {speech}'
-    for part in parts:
-      resolved += '\n' + part
-    stage_tracks = list(parts)
+    parts: list[str] = []
+    if evidence is not None:
+      action_result = evidence.get('action_result')
+      if isinstance(action_result, str) and action_result:
+        narrated = action_result
+        for omission in self._stage_omissions:
+          narrated = narrated.replace(omission, '')
+        if narrated.strip():
+          parts.append(narrated)
+      intervention = evidence.get('intervention')
+      if isinstance(intervention, Mapping):
+        fact = _intervention_narration_fact(intervention)
+        if fact:
+          parts.append(fact)
     if self._stage_directions:
-      resolved += '\n' + self._stage_directions
-      stage_tracks.append(self._stage_directions)
+      parts.append(self._stage_directions)
     return json.dumps(
-        {
-            'resolved_event': resolved,
-            'stage_directions': '\n'.join(stage_tracks),
-        },
+        {'stage_directions': '\n'.join(parts)},
         ensure_ascii=False,
     )
-
-  @staticmethod
-  def _evidence_narration_parts(
-      evidence: Mapping[str, Any],
-  ) -> list[str]:
-    """Collects the narratable facts of one evidence object.
-
-    Args:
-      evidence: the decoded evidence section.
-
-    Returns:
-      The non-empty adjudicated action result and intervention
-      candidate text, in that order; missing or non-string fields
-      contribute nothing.
-    """
-    parts = []
-    action_result = evidence.get('action_result')
-    if isinstance(action_result, str) and action_result:
-      parts.append(action_result)
-    intervention = evidence.get('intervention')
-    if isinstance(intervention, Mapping):
-      candidate_after = intervention.get('candidate_after')
-      if isinstance(candidate_after, str) and candidate_after:
-        parts.append(candidate_after)
-    return parts

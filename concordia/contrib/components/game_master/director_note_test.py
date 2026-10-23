@@ -16,9 +16,9 @@
 
 The directive pipeline is exercised through the real entity lifecycle
 (observe/act/update) with a resolution act that runs the actual story
-thought chain (director note followed by the dual-track final output).
-The language model is a semantic stub routing on the last question
-block, mirroring ``examples.story_enactment.testing_stubs``.
+thought chain (director note followed by the single-field final
+output). The language model is a semantic stub routing on the last
+question block, mirroring ``examples.story_enactment.testing_stubs``.
 """
 
 import json
@@ -78,9 +78,7 @@ _SCORING_MARK = 'Respond with a single integer from 1 to 10'
 _DIRECTIVE_MARK = 'Write one short director instruction'
 _COMPLICATION_MARK = 'Suggest five plausible in-story complications'
 _MERGE_MARK = 'Merge the candidate event and the complication'
-_DUAL_TRACK_MARK = 'Output a JSON object with exactly two string fields'
-_CURRENT_SPEAKER = re.compile(r'## Current speaker\n(.+)')
-_ORIGINAL_SPEECH = re.compile(r'## Original speech \(verbatim\)\n(.*)')
+_FINAL_OUTPUT_MARK = 'Output a JSON object with exactly one string field'
 _LAST_BLOCK_OPENER = re.compile(r'^(?:Question|Exercise): ', re.M)
 _CHOICE_LINE = re.compile(r'^  \(([^)]+)\) (Yes|No)$', re.M)
 
@@ -91,6 +89,59 @@ def _last_question_block(prompt: str) -> str:
   if not matches:
     return ''
   return prompt[matches[-1].start() :]
+
+
+def _read_evidence_section(prompt: str) -> dict[str, object] | None:
+  """Reads the marked JSON resolution-evidence section, if present."""
+  mark = '## Resolution evidence (data)'
+  index = prompt.find(mark)
+  if index < 0:
+    return None
+  remainder = prompt[index + len(mark) :]
+  start = remainder.find('{')
+  if start < 0:
+    return None
+  try:
+    payload, _ = json.JSONDecoder().raw_decode(remainder[start:])
+  except json.JSONDecodeError:
+    return None
+  return payload if isinstance(payload, dict) else None
+
+
+def _intervention_fact(intervention: dict[str, object]) -> str:
+  """Extracts only the new fact of an intervention candidate.
+
+  A test instrument modeling legal narration, never production
+  parsing (it mirrors the example stub's helper locally because contrib
+  must not import examples): the recorded `candidate_after` may embed
+  the original event (the speech line) as a same-line suffix, an
+  appended line or the core repetition helper's numbered merge. The
+  narration fact is what remains after removing the original-event
+  portion, so the stub's narrator track never repeats the dialogue.
+
+  Args:
+    intervention: the decoded intervention candidate.
+
+  Returns:
+    The new-fact text, or '' when the candidate carries no text.
+  """
+  candidate_after = intervention.get('candidate_after')
+  if not isinstance(candidate_after, str) or not candidate_after:
+    return ''
+  candidate_before = intervention.get('candidate_before')
+  fact = candidate_after
+  if isinstance(candidate_before, str) and candidate_before:
+    if fact.startswith(candidate_before):
+      fact = fact[len(candidate_before) :]
+    else:
+      before_lines = {line.strip() for line in candidate_before.split('\n')}
+      kept = []
+      for line in fact.split('\n'):
+        unnumbered = re.sub(r'^\d+\.\s*', '', line)
+        if unnumbered.strip() not in before_lines:
+          kept.append(unnumbered)
+      fact = '\n'.join(kept)
+  return fact.strip()
 
 
 class _DirectorFlowModel(mock_model.MockModel):
@@ -117,7 +168,7 @@ class _DirectorFlowModel(mock_model.MockModel):
       complications: str = '\n'.join(_COMPLICATION_LINES),
       fused_event: str = _FUSED_EVENT,
       complication_error: Exception | None = None,
-      invalid_dual_track_from: int | None = None,
+      invalid_final_output_from: int | None = None,
       semantic_review_response: str = '{"valid": true, "reason": ""}',
   ):
     super().__init__('unused')
@@ -127,9 +178,9 @@ class _DirectorFlowModel(mock_model.MockModel):
     self._complications = complications
     self._fused_event = fused_event
     self._complication_error = complication_error
-    self._invalid_dual_track_from = invalid_dual_track_from
+    self._invalid_final_output_from = invalid_final_output_from
     self.semantic_review_response = semantic_review_response
-    self._dual_track_calls = 0
+    self._final_output_calls = 0
     self.text_prompts: list[str] = []
     self.choice_calls = 0
 
@@ -145,15 +196,15 @@ class _DirectorFlowModel(mock_model.MockModel):
       return self._complications
     if _MERGE_MARK in block:
       return self._fused_event
-    if _DUAL_TRACK_MARK in block:
-      call_index = self._dual_track_calls
-      self._dual_track_calls += 1
+    if _FINAL_OUTPUT_MARK in block:
+      call_index = self._final_output_calls
+      self._final_output_calls += 1
       if (
-          self._invalid_dual_track_from is not None
-          and call_index >= self._invalid_dual_track_from
+          self._invalid_final_output_from is not None
+          and call_index >= self._invalid_final_output_from
       ):
         return 'not valid json'
-      return self._dual_track_output(prompt)
+      return self._stage_directions_output(prompt)
     if _DIRECTIVE_MARK in block:
       return self._instruction
     if _SCORING_MARK in block:
@@ -168,17 +219,31 @@ class _DirectorFlowModel(mock_model.MockModel):
     letter = next(key for key, value in choices.items() if value == wanted)
     return responses.index(letter), letter, {}
 
-  def _dual_track_output(self, prompt: str) -> str:
-    speaker = _CURRENT_SPEAKER.search(prompt)
-    speech = _ORIGINAL_SPEECH.search(prompt)
-    speaker_name = speaker.group(1) if speaker else ''
-    speech_text = speech.group(1) if speech else ''
-    if not speech_text or speech_text == '(none)':
-      resolved = f'{speaker_name} stays silent.'
-    else:
-      resolved = f'{speaker_name}: {speech_text}'
+  def _stage_directions_output(self, prompt: str) -> str:
+    """Builds the single-field stage-directions JSON of one final turn.
+
+    Test instrumentation mirroring the example stub: the narration is
+    derived from the current prompt's evidence alone (the
+    core-adjudicated action result and the intervention candidate's
+    new fact), never from a fixture carrying the expected event.
+
+    Args:
+      prompt: the final-generation prompt.
+
+    Returns:
+      The single-field JSON object as a string.
+    """
+    parts = []
+    evidence = _read_evidence_section(prompt)
+    if evidence is not None:
+      action_result = evidence.get('action_result')
+      if isinstance(action_result, str) and action_result:
+        parts.append(action_result)
+      intervention = evidence.get('intervention')
+      if isinstance(intervention, dict):
+        parts.append(_intervention_fact(intervention))
     return json.dumps(
-        {'resolved_event': resolved, 'stage_directions': ''},
+        {'stage_directions': '\n'.join(part for part in parts if part)},
         ensure_ascii=False,
     )
 
@@ -200,7 +265,7 @@ class _ChainResolutionAct(entity_component.ActingComponent):
   """Runs the real story thought chain on RESOLVE acts.
 
   The chain mirrors the prefab wiring: the director-note step followed
-  by the dual-track final-output step, both operating on one fresh
+  by the single-field final-output step, both operating on one fresh
   interactive document per resolution.
   """
 
@@ -350,6 +415,42 @@ class FusionStepTest(unittest.TestCase):
     self.assertIn('verbatim', merge_prompt)
     self.assertIn('a storm cuts the power', merge_prompt)
 
+  def test_prompts_focus_added_content_on_new_events_only(self):
+    # Run4 design 5.3: the suggestion and fusion prompts say the added
+    # content focuses on the chosen whitelisted event and its visible
+    # consequences, never unchanged-state summaries ("still arguing")
+    # or announced attitude changes. The fused return value passes
+    # through verbatim: no programmatic sentence trimming exists.
+    model = _DirectorFlowModel()
+    director, gm = _make_director(model)
+    _complete_turn(gm, 'I hid the letter.')
+    before = len(model.text_prompts)
+    self.assertEqual(_step_call(model, director), _FUSED_EVENT)
+    complication_prompt, merge_prompt = model.text_prompts[before:]
+    for prompt in (complication_prompt, merge_prompt):
+      self.assertIn('chosen whitelisted event', prompt)
+      self.assertIn('visible consequences', prompt)
+      self.assertIn('unchanged-state summaries', prompt)
+      self.assertIn('changed their attitude', prompt)
+    self.assertIn('verbatim', merge_prompt)
+
+  def test_prompts_prefer_progress_over_novelty_stacking(self):
+    # A4 (design 7.2): both fusion questions ground the suggestion in
+    # the concrete unresolved blockage of the committed history instead
+    # of stacking another interruption or verification chore for
+    # novelty, and never instruct a player to change their goal,
+    # confess, cooperate or pick a specific ending.
+    model = _DirectorFlowModel()
+    director, gm = _make_director(model)
+    _complete_turn(gm, 'I hid the letter.')
+    before = len(model.text_prompts)
+    self.assertEqual(_step_call(model, director), _FUSED_EVENT)
+    complication_prompt, merge_prompt = model.text_prompts[before:]
+    for prompt in (complication_prompt, merge_prompt):
+      self.assertIn('concrete unresolved blockage', prompt)
+      self.assertIn('never instruct a player to change their goal', prompt)
+      self.assertIn('verification or registration chore', prompt)
+
   def test_step_marks_directive_integrating(self):
     model = _DirectorFlowModel()
     director, gm = _make_director(model)
@@ -415,8 +516,12 @@ class ConsumptionTest(unittest.TestCase):
     self.assertEqual(state['directive']['executed_at_turn'], 2)
     diagnostics = director.get_last_story_turn()['director_diagnostics']
     self.assertEqual(diagnostics['directive_at_start']['status'], 'pending')
+    # Consumption is confirmed in the pending commit of the validated
+    # turn, no longer inside set_validated_resolution: the directive is
+    # still integrating right after the validated resolution, and the
+    # projected committed state lands in directive_after_turn.
     self.assertEqual(
-        diagnostics['directive_after_resolution']['status'], 'consumed'
+        diagnostics['directive_after_resolution']['status'], 'integrating'
     )
     self.assertEqual(diagnostics['directive_after_turn']['executed_at_turn'], 2)
     self.assertTrue(diagnostics['cooldown_active'])
@@ -436,7 +541,7 @@ class ConsumptionTest(unittest.TestCase):
   def test_story_output_error_leaves_directive_unconsumed(self):
     # The first resolution validates; the second (which fuses the
     # directive) returns an invalid final output.
-    model = _DirectorFlowModel(invalid_dual_track_from=1)
+    model = _DirectorFlowModel(invalid_final_output_from=1)
     director, gm = _make_director(model)
     _complete_turn(gm, 'I hid the letter.')
     gm.observe('[putative_event] Alice: What was that noise?')
@@ -481,6 +586,140 @@ class ConsumptionTest(unittest.TestCase):
             director.get_state()['directive']['status'], 'integrating'
         )
         self.assertIsNone(director.get_state()['last_directive_executed_turn'])
+
+  def test_rejection_then_same_instance_retry_refuses_again(self):
+    # 融合后复核拒绝：本轮不提交、指令不被消费。同一实例直接重试
+    # 同一轮时，新 putative event 把指令恢复为 pending，融合重新进
+    # 行，本轮随后正常提交并恰好消费一次。
+    model = _DirectorFlowModel()
+    director, gm = _make_director(model)
+    _complete_turn(gm, 'I hid the letter.')
+    self.assertEqual(director.get_state()['directive']['status'], 'pending')
+    model.semantic_review_response = 'invalid'
+    gm.observe('[putative_event] Alice: What was that noise?')
+    with self.assertRaises(story_resolution.StoryOutputError):
+      gm.act(_RESOLVE_SPEC)
+    complication_calls = len([
+        p
+        for p in model.text_prompts
+        if _COMPLICATION_MARK in _last_question_block(p)
+    ])
+    merge_calls = len([
+        p for p in model.text_prompts if _MERGE_MARK in _last_question_block(p)
+    ])
+    # 同实例同轮重试：新 putative event 恢复 pending，融合不再卡死。
+    gm.observe('[putative_event] Alice: What was that noise?')
+    pending = director.get_pending_directive()
+    self.assertIsNotNone(pending)
+    self.assertEqual(pending['status'], 'pending')
+    model.semantic_review_response = '{"valid": true, "reason": ""}'
+    result = gm.act(_RESOLVE_SPEC)
+    gm.observe(f'[event] {result}')
+    # 重试轮确实重新融合（complication 与 merge 各一次）。
+    self.assertEqual(
+        len([
+            p
+            for p in model.text_prompts
+            if _COMPLICATION_MARK in _last_question_block(p)
+        ]),
+        complication_calls + 1,
+    )
+    self.assertEqual(
+        len([
+            p
+            for p in model.text_prompts
+            if _MERGE_MARK in _last_question_block(p)
+        ]),
+        merge_calls + 1,
+    )
+    state = director.get_state()
+    self.assertEqual(state['directive']['status'], 'consumed')
+    self.assertEqual(state['directive']['executed_at_turn'], 2)
+    self.assertEqual(state['last_directive_executed_turn'], 2)
+    self.assertEqual(director.get_last_story_turn()['turn_id'], 2)
+
+  def test_records_candidate_without_consuming_directive(self):
+    # The note step records the tension candidate (before/after/trace)
+    # as soon as the fusion runs, but consuming the directive awaits
+    # the validated commit: right after the validated final output the
+    # directive is still integrating and no execution is recorded.
+    model = _DirectorFlowModel()
+    director, gm = _make_director(model)
+    _complete_turn(gm, 'I hid the letter.')
+    self.assertEqual(director.get_state()['directive']['status'], 'pending')
+    gm.observe('[putative_event] Alice: What was that noise?')
+    result = gm.act(_RESOLVE_SPEC)
+    state = director.get_state()
+    self.assertEqual(state['directive']['status'], 'integrating')
+    self.assertIsNone(state['last_directive_executed_turn'])
+    evidence = director.get_current_resolution_evidence()
+    self.assertEqual(
+        evidence['intervention'],
+        {
+            'reason': 'tension',
+            'candidate_before': 'Alice: What was that noise?',
+            'candidate_after': _FUSED_EVENT,
+        },
+    )
+    # The candidate trace stays in the private resolution diagnostics.
+    diagnostics = director.get_current_resolution_diagnostics()
+    self.assertEqual(diagnostics['stage'], 'intervention_tension')
+    self.assertIn(
+        'Suggest five plausible in-story complications', diagnostics['trace']
+    )
+    gm.observe(f'[event] {result}')
+    state = director.get_state()
+    self.assertEqual(state['directive']['status'], 'consumed')
+    self.assertEqual(state['last_directive_executed_turn'], 2)
+    self.assertEqual(
+        state['last_intervention'], {'turn_id': 2, 'reason': 'tension'}
+    )
+    # The committed turn archives the candidate and its trace.
+    turn = director.get_last_story_turn()
+    diagnostics = turn['director_diagnostics']
+    self.assertEqual(
+        diagnostics['intervention'],
+        {
+            'reason': 'tension',
+            'candidate_before': 'Alice: What was that noise?',
+            'candidate_after': _FUSED_EVENT,
+        },
+    )
+    stages = [
+        record['stage'] for record in diagnostics['resolution_diagnostics']
+    ]
+    self.assertIn('intervention_tension', stages)
+    self.assertNotIn('trace', diagnostics['intervention'])
+    self.assertNotIn('Suggest five plausible', turn['resolved_event'])
+
+  def test_rejected_final_does_not_consume_tension_candidate(self):
+    # A rejected final output leaves the fused candidate and the review
+    # failure simultaneously retrievable: the candidate trace is not
+    # overwritten by the later failure record.
+    model = _DirectorFlowModel()
+    director, gm = _make_director(model)
+    _complete_turn(gm, 'I hid the letter.')
+    committed = director.get_last_story_turn()
+    model.semantic_review_response = 'invalid'
+    gm.observe('[putative_event] Alice: What was that noise?')
+    with self.assertRaises(story_resolution.StoryOutputError):
+      gm.act(_RESOLVE_SPEC)
+    state = director.get_state()
+    self.assertEqual(state['directive']['status'], 'integrating')
+    self.assertIsNone(state['last_directive_executed_turn'])
+    self.assertIsNone(state['last_intervention'])
+    self.assertEqual(director.get_last_story_turn(), committed)
+    diagnostics = director.get_current_resolution_diagnostics()
+    self.assertEqual(diagnostics['stage'], 'semantic_review')
+    stages = [record['stage'] for record in diagnostics['history']]
+    self.assertEqual(stages, ['intervention_tension', 'semantic_review'])
+    candidate_trace = diagnostics['history'][0]['trace']
+    self.assertIn(
+        'Suggest five plausible in-story complications', candidate_trace
+    )
+    self.assertIn(
+        'Story resolution semantic review', diagnostics['history'][1]['trace']
+    )
 
 
 class CooldownTest(unittest.TestCase):

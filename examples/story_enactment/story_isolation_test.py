@@ -309,6 +309,23 @@ class InformationIsolationTest(unittest.TestCase):
           self.assertNotIn(character.hard_constraint, prompt)
           self.assertNotIn(character.hard_constraint, _memories_text(sim, name))
 
+  def test_action_spec_carries_no_hidden_facts_or_endings(self):
+    # 设计 4：角色只读自己的合法观察与私人设定；ActionSpec 是共享
+    # 召唤语，不得携带导演节拍、张力、允许结局或他人秘密。
+    prompt = story_config.make_scene_action_spec(
+        'speech_and_action'
+    ).call_to_action
+    config = story_config.make_example_config()
+    for character in config.characters:
+      if character.secret:
+        self.assertNotIn(character.secret, prompt)
+    for fact in config.gm_only_facts:
+      self.assertNotIn(fact, prompt)
+    for ending in config.allowed_endings:
+      self.assertNotIn(ending, prompt)
+    self.assertNotIn('张力', prompt)
+    self.assertNotIn('beat', prompt)
+
   def test_gm_truth_conditions_resolutions_only(self):
     config = story_config.make_example_config()
     sim, agent_model, gm_model = _build_simulation(config, ('林雪', '王婶'))

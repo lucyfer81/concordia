@@ -36,7 +36,7 @@ ACTION_MODES = (ACTION_MODE_SPEECH_ONLY, ACTION_MODE_SPEECH_AND_ACTION)
 ACTION_JSON_KEYS = frozenset({'speech', 'action_intent'})
 
 # Markdown code fences around the JSON object: stripped before decoding,
-# mirroring the tolerance of the dual-track output parser.
+# mirroring the tolerance of the stage-directions output parser.
 _FENCE_START = re.compile(r'^```[a-zA-Z0-9]*\s*')
 _FENCE_END = re.compile(r'\s?```\s*$')
 

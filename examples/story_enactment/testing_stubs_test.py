@@ -17,11 +17,11 @@
 The stub is the deterministic verification instrument of the story
 enactment example: propagation tests assert that core-adjudicated
 action results and intervention facts actually flow into final
-generation, so the stub must derive its dual-track output from the
-evidence carried by the CURRENT prompt, never from stale configuration
-or from what an earlier call generated. Stage-A tests pin the routing
-and the decode instrument in isolation; the stage-B joint tests run
-the REAL production final/review prompts from
+generation, so the stub must derive its stage-directions output from
+the evidence carried by the CURRENT prompt, never from stale
+configuration or from what an earlier call generated. Stage-A tests
+pin the routing and the decode instrument in isolation; the stage-B
+joint tests run the REAL production final/review prompts from
 ``story_resolution.make_final_output_step`` through the stub, proving
 the marked evidence section the production code emits is the one the
 stub reads.
@@ -98,8 +98,7 @@ def _final_prompt(
       '{}\n'
       '\n'
       '## Output\n'
-      'Output a JSON object with exactly two string fields:\n'
-      '- "resolved_event": the full canonical event.\n'
+      'Output a JSON object with exactly one string field:\n'
       '- "stage_directions": visible outcomes only.\n'
       'Output only the JSON object, no other text.\n'
       'Answer: '
@@ -187,10 +186,10 @@ class PromptStubActionTest(unittest.TestCase):
   def test_final_output_uses_supplied_action_evidence(self):
     # Two final prompts differing ONLY in the actual evidence (the
     # adjudicated ACTION_SUCCEEDED vs ACTION_FAILED result) must yield
-    # different dual-track outputs, each containing only its own actual
-    # result. The stub's `action_result` configuration serves the core
-    # attempt question alone: without current evidence it must not
-    # conjure any result into the final output.
+    # different stage-directions outputs, each containing only its own
+    # actual result. The stub's `action_result` configuration serves
+    # the core attempt question alone: without current evidence it
+    # must not conjure any result into the final output.
     stub = _RecordingStub(
         action_result=_CONFIG_ONLY_RESULT,
         stage_directions='',
@@ -202,17 +201,21 @@ class PromptStubActionTest(unittest.TestCase):
     failed = json.loads(
         stub.sample_text(_final_prompt(speech, action_result=_FAILED_RESULT))
     )
-    self.assertNotEqual(succeeded['resolved_event'], failed['resolved_event'])
-    self.assertIn(_SUCCEEDED_RESULT, succeeded['resolved_event'])
-    self.assertNotIn(_FAILED_RESULT, succeeded['resolved_event'])
-    self.assertIn(_FAILED_RESULT, failed['resolved_event'])
-    self.assertNotIn(_SUCCEEDED_RESULT, failed['resolved_event'])
-    for resolved in (succeeded['resolved_event'], failed['resolved_event']):
-      self.assertNotIn('CONFIG_ONLY', resolved)
-    # A stage-1 prompt without any evidence section conjures nothing
-    # from configuration alone.
+    self.assertEqual(set(succeeded), {'stage_directions'})
+    self.assertNotEqual(
+        succeeded['stage_directions'], failed['stage_directions']
+    )
+    self.assertIn(_SUCCEEDED_RESULT, succeeded['stage_directions'])
+    self.assertNotIn(_FAILED_RESULT, succeeded['stage_directions'])
+    self.assertIn(_FAILED_RESULT, failed['stage_directions'])
+    self.assertNotIn(_SUCCEEDED_RESULT, failed['stage_directions'])
+    for stage in (succeeded['stage_directions'], failed['stage_directions']):
+      self.assertNotIn('CONFIG_ONLY', stage)
+    # A prompt without adjudicated evidence conjures nothing from
+    # configuration alone.
     legacy = json.loads(stub.sample_text(_final_prompt(speech)))
-    self.assertNotIn('CONFIG_ONLY', legacy['resolved_event'])
+    self.assertEqual(legacy['stage_directions'], '')
+    self.assertNotIn('CONFIG_ONLY', legacy['stage_directions'])
     # The configured answer still serves the core attempt_to_result
     # question itself.
     attempt_prompt = (
@@ -226,8 +229,9 @@ class PromptStubActionTest(unittest.TestCase):
   def test_push_is_not_emitted_without_current_intervention(self):
     # The first two turns carry no intervention evidence, so the preset
     # push events configured for the core repetition helper must never
-    # surface in the final dual-track output: not through configuration
-    # alone, and not through what the push's own model calls generated.
+    # surface in the final stage-directions output: not through
+    # configuration alone, and not through what the push's own model
+    # calls generated.
     stub = _RecordingStub(
         repetition_answer='Yes',
         push_events=_PRESET_PUSH_EVENT,
@@ -252,13 +256,46 @@ class PromptStubActionTest(unittest.TestCase):
               _final_prompt(speech, action_result=_SUCCEEDED_RESULT)
           )
       )
-      self.assertIn(_SUCCEEDED_RESULT, final['resolved_event'])
-      self.assertIn(speech, final['resolved_event'])
-      self.assertNotIn('预设新事件', final['resolved_event'])
-      self.assertNotIn('敲门声', final['resolved_event'])
+      self.assertIn(_SUCCEEDED_RESULT, final['stage_directions'])
+      self.assertNotIn('预设新事件', final['stage_directions'])
+      self.assertNotIn('敲门声', final['stage_directions'])
     # Two text calls drive the push (suggestion and merge) and one more
     # answers the final prompt, per turn.
     self.assertEqual(len(stub.text_answers), 6)
+
+  def test_stage_extracts_only_the_new_intervention_fact(self):
+    # Review finding 2 regression: the recorded `candidate_after` may
+    # embed the candidate's original event (the speech line) as a
+    # same-line suffix, an appended line, or the core repetition
+    # helper's numbered merge. The stub's narrator track must carry
+    # only the NEW fact: re-narrating the speech would duplicate the
+    # dialogue in the canonical event, a violation the fixed-approving
+    # reviewer can never catch.
+    speech = '遗嘱的封印从未核验。'
+    before = f'林雪: {speech}'
+    shapes = (
+        ('same-line suffix', f'{before} 雷雨骤紧。', '雷雨骤紧。'),
+        ('appended line', f'{before}\n雷雨骤紧。', '雷雨骤紧。'),
+        (
+            'numbered merge',
+            f'1. {before}\n2. 管家冒雨送信。\n雷声更近',
+            '管家冒雨送信。\n雷声更近',
+        ),
+    )
+    for label, candidate_after, expected in shapes:
+      with self.subTest(label):
+        stub = testing_stubs.PromptStubModel(stage_directions='')
+        prompt = _final_prompt(
+            speech,
+            intervention={
+                'candidate_before': before,
+                'candidate_after': candidate_after,
+            },
+        )
+        stage = json.loads(stub.sample_text(prompt))['stage_directions']
+        self.assertEqual(stage, expected)
+        self.assertNotIn(speech, stage)
+        self.assertNotIn('林雪: ', stage)
 
 
 class PromptStubRoutingTest(unittest.TestCase):
@@ -323,6 +360,93 @@ class PromptStubRoutingTest(unittest.TestCase):
         stub.sample_choice(completion_last, ['A', 'B']), (1, 'B', {})
     )
 
+  def test_real_core_push_prompts_route_end_to_end(self):
+    # Joint test with the REAL core helper: one real repetition
+    # judgment choice, one suggestion question and one merge question
+    # route to the configured stub answers, the merge quotes the actual
+    # numbered candidate (never a configuration value), and an
+    # established-history block (a scoring question and an answered
+    # beat-completion choice) never hijacks any of them.
+    push_event = '管家冒雨送来一封没有署名的信。'
+    merge_suffix = '堂外的雷声更近了。'
+    stub = testing_stubs.PromptStubModel(
+        repetition_answer='Yes',
+        push_events=push_event,
+        push_merged=merge_suffix,
+        scoring_answer='5',
+        completion_answers={'b1': 'No'},
+    )
+    candidate = '林雪: 遗嘱的封印从未核验。'
+    history = (
+        'Question: Respond with a single integer from 1 to 10 and nothing'
+        ' else.\nAnswer: 5\n'
+        'Current beat "b1": 开场\n'
+        'Question: 节拍 b1 的完成条件是否已经出现？\n'
+        '  (A) Yes\n  (B) No\nAnswer: (A)\n'
+    )
+    document = interactive_document.InteractiveDocument(stub)
+    document.statement(history)
+    merged = event_resolution_lib.maybe_inject_narrative_push(
+        document, candidate, '林雪'
+    )
+    self.assertEqual(len(stub.choice_prompts), 1)
+    self.assertIn('repetitive?', stub.choice_prompts[0])
+    self.assertIn(history, stub.choice_prompts[0])
+    self.assertEqual(len(stub.text_prompts), 2)
+    suggestion, merge = stub.text_prompts
+    self.assertIn('Suggest five plausible events', suggestion)
+    self.assertIn(push_event, merged)
+    self.assertIn(candidate, merged)
+    self.assertIn(merge_suffix, merged)
+    self.assertIn(f'1. {candidate}', merge)
+    self.assertIn(f'2. {push_event}', merge)
+    # A negative judgment returns the candidate unchanged after exactly
+    # one choice call, with no suggestion or merge questions asked.
+    fresh = testing_stubs.PromptStubModel(repetition_answer='No')
+    document = interactive_document.InteractiveDocument(fresh)
+    document.statement(history)
+    unchanged = event_resolution_lib.maybe_inject_narrative_push(
+        document, candidate, '林雪'
+    )
+    self.assertEqual(unchanged, candidate)
+    self.assertEqual(len(fresh.choice_prompts), 1)
+    self.assertEqual(fresh.text_prompts, [])
+    # The scoring route is not captured by the repetition configuration
+    # when the scoring question is the actual last question.
+    self.assertEqual(
+        testing_stubs.PromptStubModel(scoring_answer='5').sample_text(
+            'Question: Respond with a single integer from 1 to 10 and'
+            ' nothing else.\nAnswer: '
+        ),
+        '5',
+    )
+
+  def test_stage_omissions_remove_configured_sentences(self):
+    stub = testing_stubs.PromptStubModel(
+        stage_directions='',
+        stage_omissions=('露出烧灼纸灰残片。',),
+    )
+    evidence = {
+        'speech': '我先看看那个花瓶。',
+        'action_intent': '取下花瓶。',
+        'action_result': (
+            '取下花瓶。 Because of that, 花瓶碎裂，露出烧灼纸灰残片。'
+        ),
+        'intervention': None,
+    }
+    prompt = (
+        'Exercise: Output a JSON object with exactly one string field:\n'
+        '- "stage_directions": visible outcomes only.\n'
+        f'{testing_stubs.EVIDENCE_SECTION_MARK}\n'
+        f'{json.dumps(evidence, ensure_ascii=False)}\n'
+        'Output only the JSON object, no other text.'
+    )
+    response = stub.sample_text(prompt)
+    self.assertEqual(
+        json.loads(response)['stage_directions'],
+        '取下花瓶。 Because of that, 花瓶碎裂，',
+    )
+
 
 class RealFinalPromptJointTest(unittest.TestCase):
   """Stage B: the stub against the real production final/review prompts."""
@@ -369,7 +493,7 @@ class RealFinalPromptJointTest(unittest.TestCase):
     # The real production prompt's marked evidence section is the one
     # the stub reads: ACTION_SUCCEEDED and ACTION_FAILED evidence yield
     # different canonical events, each carrying only its own actual
-    # result, and the adjudicated result reaches the stored dual-track
+    # result, and the adjudicated result reaches the stored validated
     # resolution through the approved narrator track.
     succeeded, director, stub_a = self._run_final_step(
         action_result=_SUCCEEDED_RESULT

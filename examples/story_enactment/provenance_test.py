@@ -106,5 +106,149 @@ class ProvenanceTest(unittest.TestCase):
     self.assertEqual(self._read(), before)
 
 
+class SourceArchiveTest(unittest.TestCase):
+  """The adapter sources of the run chain are archived verbatim.
+
+  Unlike ``ProvenanceTest`` these checks run against the real repository
+  sources (no patched root), so they pin the modules the Phase B/C/D
+  adapters added to the enactment chain.
+  """
+
+  def test_new_adapters_have_content_and_hashes(self):
+    with tempfile.TemporaryDirectory() as directory:
+      provenance.archive_invocation(
+          directory,
+          run_config={},
+          committed_turn_id=0,
+          resume=False,
+      )
+      manifest = json.loads(
+          (Path(directory) / 'run_manifest.json').read_text(
+              encoding='utf-8', errors='replace'
+          )
+      )
+      snapshot = manifest['invocations'][0]['source_snapshot']
+      for relative in (
+          'concordia/contrib/components/game_master/story_action.py',
+          (
+              'concordia/contrib/components/game_master/'
+              'story_action_adjudication.py'
+          ),
+          'concordia/contrib/components/game_master/repetition_push.py',
+          # The final reason resolution closing every invocation.
+          'concordia/contrib/components/game_master/story_terminator.py',
+      ):
+        source = (provenance._SOURCE_ROOT / relative).read_bytes()  # pylint: disable=protected-access
+        entry = snapshot[relative]
+        self.assertTrue(entry['text'].strip(), relative)
+        self.assertEqual(
+            entry['sha256'], hashlib.sha256(source).hexdigest(), relative
+        )
+        self.assertEqual(
+            entry['text'], source.decode('utf-8', errors='replace'), relative
+        )
+
+
+class RecordedUsageTest(unittest.TestCase):
+  """Summaries are a budget-relevant usage record of their own."""
+
+  def setUp(self):
+    super().setUp()
+    self.directory = self.enterContext(tempfile.TemporaryDirectory())
+
+  def _write_summary(self, invocation_id: str, **counters):
+    provenance.write_process_summary(
+        self.directory,
+        invocation_id=invocation_id,
+        summary={
+            'schema_version': 1,
+            'invocation_id': invocation_id,
+            **counters,
+        },
+    )
+
+  def test_max_across_summaries_restores_true_cumulative_usage(self):
+    # No summaries directory yet: nothing recorded beyond a checkpoint.
+    self.assertEqual(
+        provenance.restore_recorded_usage(self.directory, attempt_limit=30),
+        {'used_model_attempts': 0, 'used_api_retries': 0},
+    )
+    self._write_summary(
+        'a', used_model_attempts_at_end=15, used_api_retries_at_end=0
+    )
+    self._write_summary(
+        'b', used_model_attempts_at_end=24, used_api_retries_at_end=2
+    )
+    self.assertEqual(
+        provenance.restore_recorded_usage(self.directory, attempt_limit=30),
+        {'used_model_attempts': 24, 'used_api_retries': 2},
+    )
+    # Unpublished temporary files are not summaries.
+    (Path(self.directory) / 'process_summaries' / '.summary-tmp').write_text(
+        'partial', encoding='utf-8'
+    )
+    self.assertEqual(
+        provenance.restore_recorded_usage(self.directory, attempt_limit=30),
+        {'used_model_attempts': 24, 'used_api_retries': 2},
+    )
+
+  def test_undeterminable_usage_refuses_instead_of_falling_back(self):
+    cases = (
+        ('corrupt.json', 'not json'),
+        ('no-counters.json', '{"schema_version": 1}'),
+        (
+            'over-limit.json',
+            (
+                '{"schema_version": 1, "used_model_attempts_at_end": 99,'
+                ' "used_api_retries_at_end": 0}'
+            ),
+        ),
+        (
+            'bad-retries.json',
+            (
+                '{"schema_version": 1, "used_model_attempts_at_end": 5,'
+                ' "used_api_retries_at_end": 6}'
+            ),
+        ),
+    )
+    for name, text in cases:
+      with self.subTest(name=name):
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        summaries = Path(directory) / 'process_summaries'
+        summaries.mkdir()
+        (summaries / name).write_text(text, encoding='utf-8')
+        with self.assertRaises(ValueError):
+          provenance.restore_recorded_usage(directory, attempt_limit=30)
+
+  def test_archived_invocation_without_summary_refuses(self):
+    # An invocation that declared a summary but never published one (a
+    # failed or killed finalization) leaves its consumption
+    # undeterminable: zero is not a valid reading, so the restore
+    # refuses regardless of whether the summaries directory exists.
+    directory = self.enterContext(tempfile.TemporaryDirectory())
+    provenance.archive_invocation(
+        directory, run_config={}, committed_turn_id=0, resume=False
+    )
+    with self.assertRaisesRegex(ValueError, 'cannot be determined'):
+      provenance.restore_recorded_usage(directory, attempt_limit=30)
+
+    # Legacy entries predate invocation ids and summary declarations;
+    # they demand nothing and stay resumable from their checkpoint.
+    manifest_path = Path(directory) / 'run_manifest.json'
+    manifest = json.loads(
+        manifest_path.read_text(encoding='utf-8', errors='replace')
+    )
+    for entry in manifest['invocations']:
+      entry.pop('invocation_id', None)
+      entry.pop('summary_path', None)
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8'
+    )
+    self.assertEqual(
+        provenance.restore_recorded_usage(directory, attempt_limit=30),
+        {'used_model_attempts': 0, 'used_api_retries': 0},
+    )
+
+
 if __name__ == '__main__':
   unittest.main()

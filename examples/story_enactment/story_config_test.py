@@ -119,7 +119,7 @@ class StoryConfigTest(unittest.TestCase):
         generation = [
             p
             for p in stub.text_prompts
-            if 'Output a JSON object with exactly two string fields' in p
+            if 'Output a JSON object with exactly one string field' in p
         ]
         review = [
             p
@@ -150,6 +150,76 @@ class StoryConfigTest(unittest.TestCase):
       )
 
 
+class NpcResponseRulesConfigTest(unittest.TestCase):
+  """Design 5.2: optional NPC response rules on StoryConfig."""
+
+  def test_example_config_has_public_neighbor_rule(self):
+    rules = story_config.make_example_config().npc_response_rules
+    self.assertTrue(rules)
+    joined = '\n'.join(rules)
+    self.assertIn('隔壁邻居', joined)
+    self.assertIn('白名单敲门事件合法登场', joined)
+    self.assertIn('不披露屋内秘密', joined)
+    self.assertIn('仅"准备告知"不算已经说出', joined)
+
+  def test_roundtrip_keeps_rules_and_default_is_empty(self):
+    config = story_config.make_example_config()
+    d = config.to_dict()
+    self.assertIn('npc_response_rules', d)
+    self.assertEqual(story_config.StoryConfig.from_dict(d), config)
+    empty = dataclasses.replace(config, npc_response_rules=())
+    self.assertEqual(empty.to_dict()['npc_response_rules'], [])
+
+  def test_old_dict_missing_key_reads_empty(self):
+    d = story_config.make_example_config().to_dict()
+    del d['npc_response_rules']
+    config = story_config.StoryConfig.from_dict(d)
+    self.assertEqual(config.npc_response_rules, ())
+
+  def test_validate_rejects_bad_rule_structures(self):
+    config = story_config.make_example_config()
+    for bad in (
+        '邻居规则',
+        {'邻居可回应': '不是规则序列'},
+        None,
+        42,
+        ['  '],
+        [42],
+        ['邻居可回应', None],
+    ):
+      with self.subTest(bad=bad):
+        # 直接构造 dataclass 也要验证；类型注解不是运行期校验。
+        invalid = dataclasses.replace(config, npc_response_rules=bad)
+        problems = ' '.join(story_config.validate(invalid))
+        self.assertIn('npc_response_rules', problems)
+
+  def test_from_dict_rejects_before_tuple_conversion(self):
+    base = story_config.make_example_config().to_dict()
+    for bad in (
+        '邻居规则',
+        {'邻居可回应': '不是规则序列'},
+        None,
+        42,
+        ['  '],
+        [42],
+        ['邻居可回应', None],
+    ):
+      with self.subTest(bad=bad):
+        with self.assertRaisesRegex(ValueError, 'npc_response_rules'):
+          story_config.StoryConfig.from_dict(
+              {**base, 'npc_response_rules': bad}
+          )
+
+  def test_from_dict_accepts_list_tuple_and_empty_sequences(self):
+    base = story_config.make_example_config().to_dict()
+    for raw in ([], (), ['邻居的公开回应规则'], ('邻居的公开回应规则',)):
+      with self.subTest(raw=raw):
+        loaded = story_config.StoryConfig.from_dict(
+            {**base, 'npc_response_rules': raw}
+        )
+        self.assertEqual(loaded.npc_response_rules, tuple(raw))
+
+
 class ActionSpecModeTest(unittest.TestCase):
 
   def test_speech_only_spec_requests_dialogue_only(self):
@@ -160,6 +230,32 @@ class ActionSpecModeTest(unittest.TestCase):
     spec = story_config.make_scene_action_spec('speech_and_action')
     for fragment in ('JSON', 'speech', 'action_intent', '两者不能同时为空'):
       self.assertIn(fragment, spec.call_to_action)
+
+  def test_speech_and_action_spec_guides_one_completable_step(self):
+    spec = story_config.make_scene_action_spec('speech_and_action')
+    prompt = spec.call_to_action
+    # A1（设计 4）：执行/等待/拒绝区分与不预写结果。
+    for fragment in (
+        '区分正在执行、等待条件和明确拒绝',
+        '缺少谁的什么回应或哪个尚未满足的条件',
+        '不要无理由重新提出同一前置条件',
+        '不预写成功结果',
+        '两者不能同时为空',
+    ):
+      self.assertIn(fragment, prompt)
+    # 程序克制：不必每轮新增程序步骤；"准备"只授权准备。
+    self.assertIn('不必每轮新增核验、登记或签认步骤', prompt)
+    self.assertIn('"准备核验"只是准备', prompt)
+    # 将来承诺不写成已执行。
+    self.assertIn('不把对白中的将来承诺写成已执行动作', prompt)
+    # stub 路由指纹保持（testing_stubs 依赖）。
+    self.assertIn('现在说什么、做什么', prompt)
+    self.assertRegex(prompt, r'根据你已知的信息，.+? 现在说什么')
+
+  def test_speech_only_spec_stays_dialogue_only(self):
+    spec = story_config.make_scene_action_spec('speech_only')
+    self.assertNotIn('action_intent', spec.call_to_action)
+    self.assertNotIn('区分正在执行', spec.call_to_action)
 
   def test_unknown_mode_raises(self):
     with self.assertRaises(ValueError):

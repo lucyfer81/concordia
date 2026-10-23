@@ -19,9 +19,10 @@ The game master follows the scene-based assembly of the
 components of `concordia.contrib.components.game_master`: a
 `DramaDirector` advances the story through its beats and periodically
 scores the dramatic tension of the recent events, event resolution
-produces the dual-track output that separates player speech (agency)
-from stage directions (narrator authority), and a `SceneOrStoryTerminator`
-stops the run when either the scene schedule or the story itself ends.
+produces the final narrator-track output that separates player speech
+(agency) from stage directions (narrator authority), and a
+`SceneOrStoryTerminator` stops the run when either the scene schedule
+or the story itself ends.
 Every resolution is conditioned on the current beat, the world constraints,
 and all character constraints, with a separate model review before
 publication.
@@ -30,9 +31,15 @@ In `speech_and_action` mode (the `action_mode` prefab param, defaulting
 to pure speech) the resolution chain first adjudicates the current
 character's own action attempt through the core `attempt_to_result`
 helper; its true return value is recorded as resolution evidence that
-the director-note step, the final dual-track generation and the
-semantic review all consume, so only adjudicated outcomes — never
-unadjudicated intents — reach the public event.
+the director-note step, the single-field stage-directions final
+generation and the semantic review all consume, so only adjudicated
+outcomes — never unadjudicated intents — reach the public event.
+
+Configured public NPC response rules (the `npc_response_rules` prefab
+param, design section 5.2) are validated at build time and forwarded as
+inert data to the adjudication and final-output factories: authorized
+NPC responses are generated within the configured scope by the same
+single core adjudication call, adding no model calls.
 """
 
 from collections.abc import Mapping, Sequence
@@ -47,6 +54,7 @@ from concordia.components.game_master import event_resolution as thought_chains_
 from concordia.contrib.components.game_master import director_note
 from concordia.contrib.components.game_master import drama_director
 from concordia.contrib.components.game_master import observation_queue
+from concordia.contrib.components.game_master import repetition_push
 from concordia.contrib.components.game_master import story_action
 from concordia.contrib.components.game_master import story_action_adjudication
 from concordia.contrib.components.game_master import story_resolution
@@ -103,6 +111,19 @@ class GameMaster(prefab_lib.Prefab):
           'cooldown_turns': 3,
           'feedback_enabled': False,
           'allowed_environment_events': (),
+          # GM-only content authorization for public direct responses of
+          # already-introduced NPCs (design section 5.2); validated at
+          # build and forwarded to the adjudication and final output
+          # factories. Empty keeps the old boundary.
+          'npc_response_rules': (),
+          # Repetition intervention (spec section 7.2): with the switch
+          # enabled, every `repetition_check_interval`-th story turn the
+          # resolution chain may run the core narrative-push helper on
+          # the current candidate; the interval must be a positive
+          # integer. The switch defaults off, so pre-existing configs
+          # keep their behavior until they opt in.
+          'repetition_push_enabled': False,
+          'repetition_check_interval': 3,
           # World constraints shown to the game master in every resolution.
           'world_constraints': (),
           # All player names and their hard constraints (GM-only).
@@ -253,11 +274,35 @@ class GameMaster(prefab_lib.Prefab):
     )
     story_action.validate_action_mode(action_mode)
 
+    # Design 5.2: the NPC response rules are validated here, before any
+    # component is wired and thus before any model call, so a
+    # misconfigured run fails loudly at build time. A bare string is a
+    # common configuration mistake and is rejected whole, as is any
+    # non-sequence; blank or non-string elements are rejected per
+    # element.
+    raw_npc_rules = self.params.get('npc_response_rules', ())
+    if isinstance(raw_npc_rules, str) or not isinstance(
+        raw_npc_rules, (list, tuple)
+    ):
+      raise ValueError(
+          'npc_response_rules must be a sequence of non-empty strings,'
+          f' got {raw_npc_rules!r}.'
+      )
+    npc_response_rules = tuple(raw_npc_rules)
+    for rule in npc_response_rules:
+      if not isinstance(rule, str) or not rule.strip():
+        raise ValueError(
+            'npc_response_rules must be a sequence of non-empty'
+            f' strings, got element {rule!r}.'
+        )
+
     # The drama director advances the story through its beats; its pre-act
     # value exposes the current beat to every resolution prompt. The
-    # scoring and feedback configuration comes from the JSON-safe prefab
-    # params.
+    # scoring, feedback and repetition configuration comes from the
+    # JSON-safe prefab params.
     drama_director_key = drama_director.DEFAULT_DRAMA_DIRECTOR_COMPONENT_KEY
+    repetition_push_enabled = self.params.get('repetition_push_enabled', False)
+    repetition_check_interval = self.params.get('repetition_check_interval', 3)
     director = drama_director.DramaDirector(
         model=model,
         beats=beats,
@@ -274,6 +319,8 @@ class GameMaster(prefab_lib.Prefab):
         character_constraints=self.params.get('character_constraints', {}),
         world_constraints=self.params.get('world_constraints', ()),
         action_mode=action_mode,
+        repetition_push_enabled=repetition_push_enabled,
+        repetition_check_interval=repetition_check_interval,
     )
 
     world_constraints = actor_components.constant.Constant(
@@ -286,16 +333,32 @@ class GameMaster(prefab_lib.Prefab):
     # action attempt through the core `attempt_to_result` helper, whose
     # true return value the later steps consume as resolution evidence;
     # weave in any pending director directive (identity when none is
-    # pending); finally ask for the dual-track output (verbatim speech
-    # plus stage directions) that respects the immutable facts. Turns
-    # without an action intent skip the adjudication model call.
+    # pending); on an eligible turn run the repetition push through the
+    # core `maybe_inject_narrative_push` helper on its own document
+    # (identity when the director's gate is closed — the gate keeps a
+    # turn to at most one intervention path); finally ask for the
+    # single-field stage-directions output that respects the immutable
+    # facts, with the verbatim speech entering the canonical event by
+    # assembly. Turns without an action intent skip the adjudication
+    # model call; the repetition step uses the same budget- and
+    # retry-wrapped model as the rest of the chain.
     remove_prefix = thought_chains_lib.RemoveSpecificText(
         substring_to_remove='Putative event to resolve: '
     )
+    # The adjudication is conditioned on the initial public facts and,
+    # via the DisplayEvents pre-act value (bound here, never serialized
+    # into params), the retrieved public history — isolation must not shrink
+    # the history to the director's scoring window (design 4.1).
     adjudication_step = story_action_adjudication.make_action_adjudication_step(
-        director
+        director,
+        public_facts=self.params.get('public_facts', ()),
+        public_history=display_events.get_pre_act_value,
+        npc_response_rules=npc_response_rules,
     )
     director_note_step = director_note.make_director_note_step(director)
+    repetition_push_step = repetition_push.make_repetition_push_step(
+        director, model
+    )
     final_output_step = story_resolution.make_final_output_step(
         director,
         immutable_facts=self.params.get('immutable_facts', ()),
@@ -305,7 +368,9 @@ class GameMaster(prefab_lib.Prefab):
         allowed_environment_events=self.params.get(
             'allowed_environment_events', ()
         ),
+        npc_response_rules=npc_response_rules,
         public_facts=self.params.get('public_facts', ()),
+        public_history=display_events.get_pre_act_value,
     )
 
     event_resolution_key = (
@@ -317,6 +382,7 @@ class GameMaster(prefab_lib.Prefab):
             remove_prefix,
             adjudication_step,
             director_note_step,
+            repetition_push_step,
             final_output_step,
         ),
         components=[

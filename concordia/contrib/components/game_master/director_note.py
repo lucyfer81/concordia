@@ -17,7 +17,7 @@
 When the drama director holds a pending directive (generated because
 the story's tension deviated from the current beat's target range), the
 event-resolution chain weaves the directive into the candidate event
-before the dual-track final output is produced. The step follows the
+before the final narrator-track output is produced. The step follows the
 two-stage pattern of ``maybe_inject_narrative_push`` in
 ``concordia.components.game_master.event_resolution`` (plan appendix B,
 prompt P4): first the model proposes plausible in-story complications
@@ -75,6 +75,10 @@ def make_director_note_step(
       # No pending directive: identity, with zero model calls.
       return candidate_event
     director.mark_directive_integrating()
+    # The candidate is recorded only inside a story turn; standalone
+    # invocations of the step (outside the resolve cycle) keep the
+    # identity of the director's transient evidence.
+    in_turn = director.get_current_original_speech() is not None
     complications = chain.open_question(
         question=_complication_question(directive['content'], director),
         max_tokens=1500,
@@ -89,11 +93,17 @@ def make_director_note_step(
       director.mark_directive_failed(
           'the model proposed no valid complication candidate'
       )
+      if in_turn:
+        director.record_resolution_diagnostics(
+            stage='intervention_tension',
+            trace=chain.view().text(),
+            error='the model proposed no valid complication candidate',
+        )
       return candidate_event
     # The first valid candidate is used; a random pick would introduce
     # unsaved state that a checkpoint resume could not reproduce.
     chosen = candidates[0]
-    return chain.open_question(
+    merged = chain.open_question(
         question=_merge_question(
             candidate_event=candidate_event,
             chosen_complication=chosen,
@@ -103,6 +113,17 @@ def make_director_note_step(
         max_tokens=1500,
         terminators=(),
     )
+    if in_turn:
+      # Record the fused candidate (before/after/trace) without
+      # consuming anything: consumption awaits the validated commit
+      # (spec section 7.2).
+      director.record_intervention_candidate(
+          reason='tension',
+          candidate_before=candidate_event,
+          candidate_after=merged,
+          trace=chain.view().text(),
+      )
+    return merged
 
   return step
 
@@ -136,6 +157,30 @@ _AGENCY_AND_NOVELTY = (
     ' A proposed command or accusation does not establish its outcome.'
 )
 
+# Run4 design 5.3: candidates focus on the new event itself, so the
+# reviewer never has to rescue a legal omission of unchanged background
+# the producer should not have appended in the first place. Guidance
+# only — the fused return value is never trimmed programmatically.
+_CANDIDATE_FOCUS = (
+    ' Focus the added content on the chosen whitelisted event and its'
+    ' visible consequences. Do not append unchanged-state summaries'
+    ' such as "still arguing" or "still no agreement", and do not'
+    ' announce that a character changed their attitude or position.'
+)
+
+# A4 (design 7.2): suggestions target actionable progress tied to the
+# existing blockage, not novelty stacking. Guidance only — the fused
+# return value is never rewritten programmatically and no candidate is
+# re-drawn or re-ranked.
+_PROGRESS_FOCUS = (
+    ' Prefer a complication that addresses a concrete unresolved'
+    ' blockage or unanswered question visible in the committed public'
+    ' history. Do not stack another interruption, verification or'
+    ' registration chore onto unresolved ones merely for novelty, and'
+    ' never instruct a player to change their goal, confess, cooperate,'
+    ' or pick a specific ending.'
+)
+
 
 def _complication_question(
     directive_content: str,
@@ -157,6 +202,8 @@ def _complication_question(
       ' return an empty response.\n'
       'Only NPC or environmental events; never assume any player '
       'character voluntarily does anything.\n'
+      f'{_CANDIDATE_FOCUS}\n'
+      f'{_PROGRESS_FOCUS}\n'
       f'{_AGENCY_AND_NOVELTY}\n'
       'GM-only boundaries (never disclose these): '
       f'{_private_boundaries(director)}\n'
@@ -191,7 +238,8 @@ def _merge_question(
       f' speaker\n{active_player_name}\n\n## Constraints\nMerge the candidate'
       " event and the complication into one event.\nPreserve the player's"
       ' dialogue verbatim. Do not add any voluntary action\nfor any player'
-      ' character. Do not contradict immutable facts.\nImmutable facts:'
+      ' character. Do not contradict immutable'
+      f' facts.\n{_CANDIDATE_FOCUS}\n{_PROGRESS_FOCUS}\nImmutable facts:'
       f' {_join(director.immutable_facts)}\n{_AGENCY_AND_NOVELTY}\nGM-only'
       f' boundaries (never disclose these): {_private_boundaries(director)}\n##'
       f' Committed public history\n{_public_history(director)}\nAllowed means'

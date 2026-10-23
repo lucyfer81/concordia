@@ -15,6 +15,7 @@
 """Tests for the story-enactment game master and character prefabs."""
 
 import json
+import re
 from typing import Any, cast
 from unittest import mock
 
@@ -27,6 +28,7 @@ from concordia.components.game_master import event_resolution as event_resolutio
 from concordia.contrib.components.agent import emotional_stance
 from concordia.contrib.components.agent import relationships as relationships_lib
 from concordia.contrib.components.game_master import drama_director as drama_director_lib
+from concordia.contrib.components.game_master import story_action_adjudication
 from concordia.contrib.components.game_master import story_resolution
 from concordia.contrib.components.game_master import story_terminator as story_terminator_lib
 from concordia.contrib.prefabs.entity import story_character
@@ -77,18 +79,31 @@ _BEAT_DICTS = (
     },
 )
 
-# Valid dual-track JSON for the final resolution step: it preserves the
-# mock player's speech verbatim (the mock model's default response).
 _SPEECH = 'Quick brown fox jumps over a lazy dog'
-_DUAL_TRACK_RESPONSE = (
-    '{"resolved_event": "Alice: ' + _SPEECH + '", "stage_directions": ""}'
-)
+# Valid single-field JSON for the final resolution step: the mock
+# player's speech is assembled by the production step, not the model.
+_STAGE_RESPONSE = json.dumps({'stage_directions': ''})
 
 # Fingerprints of the core adjudication question (asked by the core
 # `attempt_to_result` helper) and of the director-note fusion questions.
 _ATTEMPT_QUESTION_MARK = 'What happens as a result of the attempted action?'
+# Fingerprint of the final output step's single-field JSON instruction.
+_FINAL_OUTPUT_MARK = 'Output a JSON object with exactly one string field'
 _ADJUDICATION_CONTEXT_MARK = '# Action adjudication (current turn only)'
 _COMPLICATION_MARK = 'Suggest five plausible in-story complications'
+
+# Fingerprints of the core repetition helper's questions and of the
+# repetition adapter's independent-document context.
+_REPETITION_MARK = (
+    'Is the story traced out by the above list of events repetitive?'
+)
+_SUGGEST_MARK = 'Suggest five plausible events'
+_MERGE_MARK = 'How does 2 modify'
+_REPETITION_CONTEXT_MARK = '# Repetition check (current turn candidate)'
+_HISTORY_MARK = '## Committed public events (oldest first)'
+_CANDIDATE_MARK = '## Current candidate (not yet committed)'
+_MERGE_GIVEN_RE = re.compile(r'Given:\n(.*?)\n\nHow does 2 modify', re.S)
+_EVIDENCE_MARK = '## Resolution evidence (data)'
 
 # A valid speech-and-action JSON contract the mock player returns.
 _ACTION_INTENT = 'Alice walks to the window and checks the latch.'
@@ -99,16 +114,12 @@ _CORE_ATTEMPT_ANSWER = 'The latch is loose; the window stays shut.'
 # The core helper's true return value: its causal-statement glue plus
 # the attempt answer.
 _CORE_RESULT = f'{_ACTION_INTENT} Because of that, {_CORE_ATTEMPT_ANSWER}'
-# Valid dual-track JSON for the speech-and-action chain: narrating the
-# core-adjudicated result in the stage-directions track is required
+# Valid single-field JSON for the speech-and-action chain: narrating
+# the core-adjudicated result in the stage-directions track is required
 # (the canonical event is assembled from speech and approved stage
 # directions only), mirroring the example stub's evidence-driven draft.
-_ACTION_DUAL_TRACK_RESPONSE = json.dumps(
-    {
-        'resolved_event': f'Alice: {_SPEECH}\n{_CORE_RESULT}',
-        'stage_directions': _CORE_RESULT,
-    },
-    ensure_ascii=False,
+_ACTION_STAGE_RESPONSE = json.dumps(
+    {'stage_directions': _CORE_RESULT}, ensure_ascii=False
 )
 
 
@@ -142,6 +153,42 @@ def _read_evidence(prompt: str) -> dict:
   start = remainder.find('{')
   payload, _ = json.JSONDecoder().raw_decode(remainder[start:])
   return payload
+
+
+def _intervention_fact(intervention: dict[str, Any]) -> str:
+  """Extracts only the new fact of an intervention candidate.
+
+  A test instrument modeling legal narration, never production
+  parsing (it mirrors the example stub's helper locally because
+  contrib must not import examples): the recorded `candidate_after`
+  may embed the original event (the speech line) as a numbered merge
+  line, so the narration fact is what remains after removing the
+  original-event portion and the stub's narrator track never repeats
+  the dialogue.
+
+  Args:
+    intervention: the decoded intervention candidate.
+
+  Returns:
+    The new-fact text, or '' when the candidate carries no text.
+  """
+  candidate_after = intervention.get('candidate_after')
+  if not isinstance(candidate_after, str) or not candidate_after:
+    return ''
+  candidate_before = intervention.get('candidate_before')
+  fact = candidate_after
+  if isinstance(candidate_before, str) and candidate_before:
+    if fact.startswith(candidate_before):
+      fact = fact[len(candidate_before) :]
+    else:
+      before_lines = {line.strip() for line in candidate_before.split('\n')}
+      kept = []
+      for line in fact.split('\n'):
+        unnumbered = re.sub(r'^\d+\.\s*', '', line)
+        if unnumbered.strip() not in before_lines:
+          kept.append(unnumbered)
+      fact = '\n'.join(kept)
+  return fact.strip()
 
 
 class _PromptRecordingModel(mock_model.MockModel):
@@ -442,7 +489,7 @@ class StoryGameMasterPrefabTest(absltest.TestCase):
 
   def test_real_act_resolution_prompt_contains_beat_and_constraints(self):
     players = [_build_character(name) for name in _PLAYERS]
-    model = _PromptRecordingModel(_DUAL_TRACK_RESPONSE)
+    model = _PromptRecordingModel(_STAGE_RESPONSE)
     gm = _build_game_master(
         model,
         players,
@@ -455,14 +502,10 @@ class StoryGameMasterPrefabTest(absltest.TestCase):
     )
     environment = sequential.Sequential()
     environment.run_loop(game_masters=[gm], entities=players, max_steps=1)
-    # The final dual-track output step must see the current beat and the
+    # The final single-field output step must see the current beat and the
     # world constraints in its prompt, proving the resolution chain is
     # conditioned on the drama director and the constraints component.
-    resolution_prompts = [
-        p
-        for p in model.prompts
-        if 'Output a JSON object with exactly two string fields' in p
-    ]
+    resolution_prompts = [p for p in model.prompts if _FINAL_OUTPUT_MARK in p]
     self.assertTrue(resolution_prompts)
     prompt = resolution_prompts[-1]
     self.assertIn('The rehearsal begins (beat b1)', prompt)
@@ -483,7 +526,7 @@ class StoryGameMasterPrefabTest(absltest.TestCase):
   def test_semantic_rejection_never_broadcasts_or_commits_or_consumes(self):
     players = [_build_character(name) for name in _PLAYERS]
     model = _PromptRecordingModel(
-        _DUAL_TRACK_RESPONSE,
+        _STAGE_RESPONSE,
         review='{"valid": false, "reason": "Invented joint agreement."}',
     )
     gm = _build_game_master(model, players)
@@ -527,7 +570,8 @@ class StoryActionModeWiringTest(absltest.TestCase):
   The action contract is observable only through behavior: with
   ``speech_and_action`` the built game master decodes the player's JSON
   contract, adjudicates the character's own action attempt through the
-  core helper before the director note and the final dual-track output,
+  core helper before the director note and the final stage-directions
+  output,
   and the core's true return value reaches both later prompts through
   the resolution evidence. The default build stays pure speech.
   """
@@ -536,14 +580,14 @@ class StoryActionModeWiringTest(absltest.TestCase):
     players = [_build_character(name) for name in _PLAYERS]
     with self.assertRaises(ValueError):
       _build_game_master(
-          _PromptRecordingModel(_DUAL_TRACK_RESPONSE),
+          _PromptRecordingModel(_STAGE_RESPONSE),
           players,
           action_mode='telepathy',
       )
 
   def test_default_build_is_speech_only_without_adjudication_calls(self):
     players = [_build_character(name) for name in _PLAYERS]
-    model = _PromptRecordingModel(_DUAL_TRACK_RESPONSE)
+    model = _PromptRecordingModel(_STAGE_RESPONSE)
     gm = _build_game_master(model, players)
     sequential.Sequential().run_loop(
         game_masters=[gm], entities=players, max_steps=1
@@ -567,7 +611,7 @@ class StoryActionModeWiringTest(absltest.TestCase):
         _build_character(name, response=_CONTRACT_RESPONSE) for name in _PLAYERS
     ]
     model = _PromptRecordingModel(
-        _ACTION_DUAL_TRACK_RESPONSE, attempt=_CORE_ATTEMPT_ANSWER
+        _ACTION_STAGE_RESPONSE, attempt=_CORE_ATTEMPT_ANSWER
     )
     gm = _build_game_master(
         model,
@@ -599,10 +643,14 @@ class StoryActionModeWiringTest(absltest.TestCase):
     self.assertLen(adjudication_prompts, 1)
     adjudication = adjudication_prompts[0]
     self.assertIn('## Current speaker\nAlice', adjudication)
-    self.assertIn(f'## Original speech (verbatim)\n{_SPEECH}', adjudication)
     self.assertIn(
-        "## The speaker's own attempted action (adjudicate only this)\n"
-        + _ACTION_INTENT,
+        '## Original speech (verbatim, data)\n'
+        + json.dumps(_SPEECH, ensure_ascii=False),
+        adjudication,
+    )
+    self.assertIn(
+        "## The speaker's own attempted action (adjudicate only this, data)\n"
+        + json.dumps(_ACTION_INTENT, ensure_ascii=False),
         adjudication,
     )
     self.assertIn('## Adjudication rules', adjudication)
@@ -619,17 +667,13 @@ class StoryActionModeWiringTest(absltest.TestCase):
         adjudication,
     )
 
-    final_prompts = [
-        p
-        for p in model.prompts
-        if 'Output a JSON object with exactly two string fields' in p
-    ]
+    final_prompts = [p for p in model.prompts if _FINAL_OUTPUT_MARK in p]
     reviews = [
         p for p in model.prompts if '# Story resolution semantic review' in p
     ]
     self.assertLen(final_prompts, 1)
     self.assertLen(reviews, 1)
-    # Chain order: adjudication, then the final dual-track generation,
+    # Chain order: adjudication, then the final stage-directions generation,
     # then the review (the director note is the identity without a
     # pending directive, so it contributes no prompt).
     self.assertLess(
@@ -653,7 +697,7 @@ class StoryActionModeWiringTest(absltest.TestCase):
         _build_character(name, response=_CONTRACT_RESPONSE) for name in _PLAYERS
     ]
     model = _PromptRecordingModel(
-        _ACTION_DUAL_TRACK_RESPONSE, attempt=_CORE_ATTEMPT_ANSWER
+        _ACTION_STAGE_RESPONSE, attempt=_CORE_ATTEMPT_ANSWER
     )
     gm = _build_game_master(model, players, action_mode='speech_and_action')
     director = gm.get_component(
@@ -678,11 +722,7 @@ class StoryActionModeWiringTest(absltest.TestCase):
     merge = next(
         p for p in model.prompts if '## Chosen complication to weave in' in p
     )
-    final = next(
-        p
-        for p in model.prompts
-        if 'Output a JSON object with exactly two string fields' in p
-    )
+    final = next(p for p in model.prompts if _FINAL_OUTPUT_MARK in p)
     review = next(
         p for p in model.prompts if '# Story resolution semantic review' in p
     )
@@ -692,6 +732,405 @@ class StoryActionModeWiringTest(absltest.TestCase):
     # The directive fused by the note is committed as consumed with the
     # validated resolution of the same turn.
     self.assertEqual(director.get_state()['directive']['status'], 'consumed')
+
+  _OLD_SHOWN_FACT = '周律师早在众人面前展示过遗嘱封套。'
+
+  def test_adjudication_isolated_from_upstream_beat_and_conversation(self):
+    # The isolated adjudication document carries no upstream beat
+    # instruction, no conversation window and no world-constraints
+    # component section, while its own conditioning — speaker, initial
+    # public facts, GM-only boundaries, the shared authorization rules
+    # and the DisplayEvents history — stays complete (design 4.1). The
+    # final generation keeps its existing shared-document context.
+    players = [
+        _build_character(name, response=_CONTRACT_RESPONSE) for name in _PLAYERS
+    ]
+    model = _PromptRecordingModel(
+        _ACTION_STAGE_RESPONSE, attempt=_CORE_ATTEMPT_ANSWER
+    )
+    gm = _build_game_master(
+        model,
+        players,
+        action_mode='speech_and_action',
+        player_names=list(_PLAYERS),
+        public_facts=('Both players saw the sealed envelope.',),
+    )
+    sequential.Sequential().run_loop(
+        game_masters=[gm], entities=players, max_steps=1
+    )
+    adjudication = next(
+        p for p in model.prompts if _ATTEMPT_QUESTION_MARK in _last_block(p)
+    )
+    self.assertNotIn('(beat b1)', adjudication)
+    self.assertNotIn('Conversation', adjudication)
+    self.assertNotIn('\nWorld constraints', adjudication)
+    self.assertIn('## Current speaker\nAlice', adjudication)
+    self.assertIn('## Initial public facts', adjudication)
+    self.assertIn('Both players saw the sealed envelope.', adjudication)
+    self.assertIn('## Public history (data)', adjudication)
+    self.assertIn(
+        story_action_adjudication.AGENCY_AND_EVIDENCE_RULES, adjudication
+    )
+    final = next(p for p in model.prompts if _FINAL_OUTPUT_MARK in p)
+    self.assertIn('(beat b1)', final)
+
+  def test_display_history_beyond_director_window_reaches_all_prompts(self):
+    # Design 8.1: a committed display fact outside the director's
+    # stored window but within DisplayEvents' retrieval range must
+    # reach the actual adjudication, generation and review prompts —
+    # via the marked history data section, not the window bullets —
+    # and generation with review must read the identical history
+    # frozen at step entry.
+    players = [
+        _build_character(name, response=_CONTRACT_RESPONSE) for name in _PLAYERS
+    ]
+    model = _PromptRecordingModel(
+        _ACTION_STAGE_RESPONSE, attempt=_CORE_ATTEMPT_ANSWER
+    )
+    scoring_window = 8
+    gm = _build_game_master(
+        model,
+        players,
+        action_mode='speech_and_action',
+        player_names=list(_PLAYERS),
+        scoring_window=scoring_window,
+        public_facts=('Both players saw the sealed envelope.',),
+    )
+    # Seed the GM memory with 24 committed events: the shown-envelope
+    # fact sits at position 1, outside the director's stored window
+    # (the last max(scoring_window, 20) events) but well within
+    # DisplayEvents' retrieval. Use the actual configured window.
+    memory = gm.get_component('__memory__')
+    for i in range(24):
+      text = self._OLD_SHOWN_FACT if i == 1 else f'第{i}轮排练照常进行。'
+      memory.add(f'[event] {text}')
+    director = gm.get_component(
+        drama_director_lib.DEFAULT_DRAMA_DIRECTOR_COMPONENT_KEY,
+        type_=drama_director_lib.DramaDirector,
+    )
+    state = dict(director.get_state())
+    window = max(scoring_window, 20)
+    state['recent_events'] = [
+        f'第{i}轮排练照常进行。' for i in range(max(0, 24 - window), 24)
+    ]
+    director.set_state(state)
+    sequential.Sequential().run_loop(
+        game_masters=[gm], entities=players, max_steps=1
+    )
+    adjudication = next(
+        p for p in model.prompts if _ATTEMPT_QUESTION_MARK in _last_block(p)
+    )
+    final = next(p for p in model.prompts if _FINAL_OUTPUT_MARK in p)
+    review = next(
+        p for p in model.prompts if '# Story resolution semantic review' in p
+    )
+
+    def read_history(prompt: str) -> str:
+      mark = '## Public history (data)'
+      index = prompt.index(mark) + len(mark)
+      start = prompt.index('"', index)
+      value, _ = json.JSONDecoder().raw_decode(prompt[start:])
+      return value
+
+    for prompt in (adjudication, final, review):
+      self.assertIn(self._OLD_SHOWN_FACT, prompt)
+      self.assertIn('## Public history (data)', prompt)
+    # The old fact arrives via the history data section, never as a
+    # director-window entry, and the director window itself stays.
+    mark = '## Committed public events (oldest first)'
+    window_data = adjudication.split(mark, 1)[1].lstrip()
+    decoded_window, _ = json.JSONDecoder().raw_decode(window_data)
+    self.assertNotIn(self._OLD_SHOWN_FACT, decoded_window)
+    self.assertIn('第16轮排练照常进行。', adjudication)
+    self.assertIn(self._OLD_SHOWN_FACT, read_history(final))
+    self.assertEqual(read_history(adjudication), read_history(final))
+    self.assertEqual(read_history(final), read_history(review))
+
+  def test_history_getter_is_wired_in_build_not_params(self):
+    # The public-history getter is bound at build time to the built
+    # DisplayEvents instance; the serializable params keep no callable
+    # and no new config field exists (design 4.1).
+    params = {
+        'name': 'story rules',
+        'scene_dicts': _SCENE_DICTS,
+        'beat_dicts': _BEAT_DICTS,
+        'public_facts': ('Both players saw the sealed envelope.',),
+    }
+    prefab = story_dramaturgic.GameMaster(params=params)
+    prefab.entities = [_build_character(name) for name in _PLAYERS]
+    _build_prefab(prefab)
+    json.dumps(prefab.params)
+    self.assertNotIn('public_history', prefab.params)
+
+
+class NpcResponseRulesWiringTest(absltest.TestCase):
+  """Design 5.2: rules validated at build and forwarded to both factories."""
+
+  _RULE = (
+      'Neighbor: after the whitelisted knock, may publicly acknowledge'
+      ' a through-the-door announcement; no secrets, no certification,'
+      " no consent on players' behalf, no evidence."
+  )
+
+  def test_bad_structure_rejected_at_build_before_any_model_call(self):
+    players = [_build_character(name) for name in _PLAYERS]
+    for bad in (('   ',), (42,), '一条被误写成裸字符串的邻居规则'):
+      with self.subTest(bad=bad):
+        prefab = story_dramaturgic.GameMaster(
+            params={
+                'scene_dicts': _SCENE_DICTS,
+                'beat_dicts': _BEAT_DICTS,
+                'action_mode': 'speech_and_action',
+                'npc_response_rules': bad,
+            }
+        )
+        prefab.entities = players
+        with self.assertRaisesRegex(ValueError, 'npc_response_rules'):
+          prefab.build(
+              model=mock_model.MockModel(),
+              memory_bank=associative_memory.AssociativeMemoryBank(
+                  sentence_embedder=_embedder
+              ),
+          )
+
+  def test_rules_reach_adjudication_generation_and_review_prompts(self):
+    players = [
+        _build_character(name, response=_CONTRACT_RESPONSE) for name in _PLAYERS
+    ]
+    model = _PromptRecordingModel(
+        _ACTION_STAGE_RESPONSE, attempt=_CORE_ATTEMPT_ANSWER
+    )
+    gm = _build_game_master(
+        model,
+        players,
+        action_mode='speech_and_action',
+        npc_response_rules=(self._RULE,),
+    )
+    sequential.Sequential().run_loop(
+        game_masters=[gm], entities=players, max_steps=1
+    )
+    adjudication = next(
+        p for p in model.prompts if _ATTEMPT_QUESTION_MARK in _last_block(p)
+    )
+    final = next(p for p in model.prompts if _FINAL_OUTPUT_MARK in p)
+    review = next(
+        p for p in model.prompts if '# Story resolution semantic review' in p
+    )
+    for prompt in (adjudication, final, review):
+      self.assertIn(self._RULE, prompt)
+      self.assertIn(
+          story_action_adjudication.PUBLIC_NPC_RESPONSE_SEMANTICS, prompt
+      )
+    # Compare the GM model's call counts per task type against an
+    # independent control run with the same config and empty rules, not
+    # only the totals; the characters use their own models, so their
+    # calls never touch this model. The control must build fresh
+    # players, model and GM — no reuse of committed component state.
+    # With equal totals and exactly one call of each of the three task
+    # types, there is no room for any independent NPC call; this wiring
+    # probe does not infer from the scripted reviewer whether empty
+    # rules allow an NPC response.
+    control_players = [
+        _build_character(name, response=_CONTRACT_RESPONSE) for name in _PLAYERS
+    ]
+    control_model = _PromptRecordingModel(
+        _ACTION_STAGE_RESPONSE, attempt=_CORE_ATTEMPT_ANSWER
+    )
+    control_gm = _build_game_master(
+        control_model,
+        control_players,
+        action_mode='speech_and_action',
+        npc_response_rules=(),
+    )
+    sequential.Sequential().run_loop(
+        game_masters=[control_gm], entities=control_players, max_steps=1
+    )
+    self.assertEqual(len(model.prompts), len(control_model.prompts))
+
+    def task_type_counts(prompts):
+      return (
+          sum(1 for p in prompts if _ATTEMPT_QUESTION_MARK in _last_block(p)),
+          sum(1 for p in prompts if _FINAL_OUTPUT_MARK in p),
+          sum(1 for p in prompts if '# Story resolution semantic review' in p),
+      )
+
+    counts = task_type_counts(model.prompts)
+    self.assertEqual(counts, (1, 1, 1))
+    self.assertEqual(counts, task_type_counts(control_model.prompts))
+
+  def test_default_empty_rules_keep_old_boundary_and_json_safe_params(self):
+    players = [_build_character(name) for name in _PLAYERS]
+    prefab = story_dramaturgic.GameMaster(
+        params={
+            'scene_dicts': _SCENE_DICTS,
+            'beat_dicts': _BEAT_DICTS,
+        }
+    )
+    prefab.entities = players
+    _build_prefab(prefab)
+    json.dumps(prefab.params)
+    self.assertEqual(prefab.params.get('npc_response_rules', ()), ())
+
+
+class StoryRepetitionWiringTest(absltest.TestCase):
+  """The repetition-push step wired into the real RESOLVE chain.
+
+  The director state is restored to the start of turn three (the
+  interval's check turn) before one real engine step, so the chain
+  order — director note (identity without a directive), repetition
+  push, final stage-directions output, review — is observable on the actual
+  prompts, and the committed turn records the executed intervention.
+  """
+
+  _PUSH_EVENT = 'A courier knocks with an unexpected letter.'
+  _MERGE_SUFFIX = 'Thunder startles the candles out.'
+
+  class _RepetitionModel(_PromptRecordingModel):
+    """Routes the real core repetition and final prompts."""
+
+    def __init__(self):
+      super().__init__(_STAGE_RESPONSE)
+      self.choice_prompts: list[str] = []
+
+    def sample_choice(self, prompt, responses, *, seed=None):
+      del seed
+      self.choice_prompts.append(prompt)
+      block = _last_block(prompt)
+      if _REPETITION_MARK in block:
+        wanted = 'Yes'
+      else:
+        wanted = 'No'
+      pairs = re.findall(r'^  \(([^)]+)\) (.+)$', block, re.M)
+      letter = next(k for k, option in pairs if option.strip() == wanted)
+      return responses.index(letter), letter, {}
+
+    def sample_text(self, prompt, **kwargs):
+      del kwargs
+      self.prompts.append(prompt)
+      if '# Story resolution semantic review' in prompt:
+        return self.review
+      block = _last_block(prompt)
+      if _SUGGEST_MARK in block:
+        # One suggestion keeps the core's random.choice deterministic.
+        return StoryRepetitionWiringTest._PUSH_EVENT
+      if _MERGE_MARK in block:
+        given = _MERGE_GIVEN_RE.search(block)
+        assert given is not None
+        return f'{given.group(1)}\n{StoryRepetitionWiringTest._MERGE_SUFFIX}'
+      if _FINAL_OUTPUT_MARK in block:
+        return self._evidence_stage_directions(prompt)
+      return self._response
+
+    def _evidence_stage_directions(self, prompt: str) -> str:
+      evidence = _read_evidence(prompt)
+      intervention = evidence.get('intervention')
+      stage = _intervention_fact(intervention) if intervention else ''
+      return json.dumps({'stage_directions': stage}, ensure_ascii=False)
+
+  def _build_with_repetition(self, model, **overrides):
+    params = {
+        'scene_dicts': _SCENE_DICTS,
+        'beat_dicts': _BEAT_DICTS,
+        'world_constraints': _WORLD_CONSTRAINTS,
+        'immutable_facts': _IMMUTABLE_FACTS,
+        'player_names': list(_PLAYERS),
+        'eval_interval': 0,
+        'feedback_enabled': True,
+        'repetition_push_enabled': True,
+        'repetition_check_interval': 3,
+    }
+    params.update(overrides)
+    prefab = story_dramaturgic.GameMaster(params=params)
+    prefab.entities = [_build_character(name) for name in _PLAYERS]
+    gm = prefab.build(
+        model=model,
+        memory_bank=associative_memory.AssociativeMemoryBank(
+            sentence_embedder=_embedder
+        ),
+    )
+    director = gm.get_component(
+        drama_director_lib.DEFAULT_DRAMA_DIRECTOR_COMPONENT_KEY,
+        type_=drama_director_lib.DramaDirector,
+    )
+    state = dict(director.get_state())
+    state['story_turn'] = 2
+    state['recent_events'] = ['Alice: one', 'Alice: two']
+    director.set_state(state)
+    return gm, director
+
+  def test_repetition_sits_between_director_note_and_final_output(self):
+    model = self._RepetitionModel()
+    gm, director = self._build_with_repetition(model)
+    players = [_build_character(name) for name in _PLAYERS]
+    sequential.Sequential().run_loop(
+        game_masters=[gm], entities=players, max_steps=1
+    )
+    # The core repetition judgment ran once on its own document.
+    repetition = [p for p in model.choice_prompts if _REPETITION_MARK in p]
+    self.assertLen(repetition, 1)
+    self.assertIn(_REPETITION_CONTEXT_MARK, repetition[0])
+    self.assertIn(_HISTORY_MARK, repetition[0])
+    self.assertIn('- Alice: one', repetition[0])
+    self.assertIn(_CANDIDATE_MARK, repetition[0])
+    suggestion = next(p for p in model.prompts if _SUGGEST_MARK in p)
+    merge = next(p for p in model.prompts if _MERGE_MARK in p)
+    final = next(p for p in model.prompts if _FINAL_OUTPUT_MARK in p)
+    review = next(p for p in model.prompts if '# Story resolution' in p)
+    # The repetition questions precede the final generation; the
+    # director note contributed nothing (no pending directive).
+    self.assertLess(model.prompts.index(suggestion), model.prompts.index(final))
+    self.assertFalse(any(_COMPLICATION_MARK in p for p in model.prompts))
+    # The merged candidate traveled through the evidence into the final
+    # generation and the review, and the committed turn records the
+    # executed repetition intervention with the shared baseline.
+    merged = f'1. Alice: {_SPEECH}\n2. {self._PUSH_EVENT}\n{self._MERGE_SUFFIX}'
+    for prompt in (final, review):
+      evidence = _read_evidence(prompt)
+      self.assertEqual(evidence['intervention']['reason'], 'repetition')
+      self.assertEqual(evidence['intervention']['candidate_after'], merged)
+    state = director.get_state()
+    self.assertEqual(state['repetition_check_count'], 1)
+    self.assertEqual(state['repetition_execution_count'], 1)
+    self.assertEqual(
+        state['last_intervention'], {'turn_id': 3, 'reason': 'repetition'}
+    )
+    turn = director.get_last_story_turn()
+    self.assertTrue(turn['director_diagnostics']['repetition']['executed'])
+    self.assertIn(self._PUSH_EVENT, turn['stage_directions'])
+    # Review note 2: the stub extracts only the candidate's new fact, so
+    # the narrator track never repeats the dialogue and the canonical
+    # event carries the speech exactly once — a violation no
+    # fixed-approving reviewer could catch.
+    self.assertNotIn(_SPEECH, turn['stage_directions'])
+    self.assertEqual(turn['resolved_event'].count(f'Alice: {_SPEECH}'), 1)
+
+  def test_disabled_switch_runs_no_repetition_calls(self):
+    model = self._RepetitionModel()
+    gm, director = self._build_with_repetition(
+        model, repetition_push_enabled=False
+    )
+    players = [_build_character(name) for name in _PLAYERS]
+    sequential.Sequential().run_loop(
+        game_masters=[gm], entities=players, max_steps=1
+    )
+    self.assertFalse(any(_REPETITION_MARK in p for p in model.choice_prompts))
+    self.assertFalse(any(_SUGGEST_MARK in p for p in model.prompts))
+    state = director.get_state()
+    self.assertEqual(state['repetition_check_count'], 0)
+    self.assertIsNone(state['last_intervention'])
+
+  def test_non_positive_interval_rejected_at_build(self):
+    players = [_build_character(name) for name in _PLAYERS]
+    for interval in (0, -1):
+      with self.subTest(interval=interval):
+        with self.assertRaises(ValueError):
+          _build_game_master(
+              mock_model.MockModel(),
+              players,
+              feedback_enabled=True,
+              repetition_push_enabled=True,
+              repetition_check_interval=interval,
+          )
 
 
 if __name__ == '__main__':

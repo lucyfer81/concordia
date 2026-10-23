@@ -21,14 +21,31 @@ demonstrated by
   story through dramaturgic beats. It follows the scene-based assembly of the
   core `dialogic_and_dramaturgic` prefab and swaps in the story-enactment
   components: a `DramaDirector` (fed scene and beat dictionaries plus the
-  scoring configuration), a `director_note` fusion step, dual-track
-  `story_resolution`, and a `SceneOrStoryTerminator`. Resolutions are
+  scoring, feedback and repetition configuration), an optional
+  action-adjudication step, a `director_note` fusion step, a `repetition_push`
+  step (gated by the director's committed repetition state),
+  single-field stage-directions `story_resolution`, and a
+  `SceneOrStoryTerminator`. Resolutions are
   conditioned on the beat, the world constraints (game-master-only facts and
   secrets), and the immutable facts. GM-only `character_constraints` maps all
   player names to their hard constraints; `public_facts` distinguishes initial
   public background from hidden truth. The final output and its independent
   semantic review receive these constraints and the environment whitelist in
-  every mode. Players receive only their own private brief and public events.
+  every mode. The `npc_response_rules` parameter — validated at build time
+  as a sequence of non-empty strings, with an empty default that preserves
+  the old authorization boundary — forwards the story's public-NPC
+  response authorization to both the action-adjudication and the
+  final-output factories. Inside `build`, the DisplayEvents pre-act value
+  (`display_events.get_pre_act_value`) is bound as the public-history
+  getter of both the action-adjudication and final-output steps, so the
+  adjudication's isolation from the upstream chain does not shrink the
+  history to the director's scoring window; no new serializable
+  configuration field is added (getters never enter `params`). Players
+  receive only their own private brief and public
+  events. Failed-turn resolution diagnostics (intervention candidates,
+  traces, review rejections) stay in the director's transient state and
+  the example's private per-invocation process summaries — never in
+  player observations or script exports.
 - `entity/story_character.py` — a story character prefab built on the basic
   three-question actor: it delegates to the core `basic.Entity` prefab via
   `extra_components`, layering a `CharacterBrief` constant of the character's

@@ -44,7 +44,20 @@ model is asked for a one-sentence instruction moving the tension back
 toward the range, constrained to NPC/environmental means only. The
 directive is stored as pending, bound to its beat, executed at most once
 by the `director_note` resolution step, and only marked consumed after
-the dual-track final output validates successfully.
+the final narrator-track output validates successfully.
+
+Stage 3 adds the repetition intervention (spec section 7.2): every
+`repetition_check_interval`-th story turn, when feedback and the
+repetition switch are enabled, the story still runs, no tension
+directive is in flight and the shared execution cooldown has passed, the
+resolution chain may call the core narrative-push helper on the current
+candidate. Repetition and tension share one intervention path per turn
+(the pending directive wins) and one execution baseline: a candidate is
+only a proposal, and the executed flag, execution counters,
+`last_intervention` and the shared cooldown move exclusively through the
+pending-commit path, i.e. only after the final review validated the
+resolution and `update` promoted the commit. A helper that returns the
+candidate unchanged records a check only, never an execution.
 """
 
 from collections.abc import Mapping, Sequence
@@ -286,6 +299,8 @@ class DramaDirector(
       character_constraints: Mapping[str, str] | None = None,
       world_constraints: Sequence[str] = (),
       action_mode: str = story_action.ACTION_MODE_SPEECH_ONLY,
+      repetition_push_enabled: bool = False,
+      repetition_check_interval: int = 3,
   ):
     """Initializes the director.
 
@@ -305,10 +320,11 @@ class DramaDirector(
       tolerance: Slack around a beat's target tension range; scores
         within `lower - tolerance` and `upper + tolerance` (inclusive)
         do not deviate.
-      cooldown_turns: Number of story turns after a directive executes
-        during which no new directive may be generated.
+      cooldown_turns: Number of story turns after an intervention
+        executes during which no new intervention may be generated.
       feedback_enabled: Whether tension deviations generate director
-        directives; the tension-observation mode records scores only.
+        directives and the repetition check may run; the
+        tension-observation mode records scores only.
       allowed_environment_events: Whitelist of NPC/environmental means
         the director's instructions may draw on.
       immutable_facts: Facts the director's instructions must never
@@ -321,11 +337,15 @@ class DramaDirector(
         'speech_only' (the raw action text is pure speech) or
         'speech_and_action' (a strict JSON object with 'speech' and
         'action_intent' fields, decoded per turn by the director).
+      repetition_push_enabled: Whether the resolution chain may run the
+        core repetition helper on check turns (spec section 7.2).
+      repetition_check_interval: A positive integer; the check turns are
+        every `repetition_check_interval`-th story turn.
 
     Raises:
-      ValueError: If the beat configuration is invalid, the scoring
-        or feedback configuration is out of range, or the action mode
-        is unknown. The model is not called.
+      ValueError: If the beat configuration is invalid, the scoring,
+        feedback or repetition configuration is out of range, or the
+        action mode is unknown. The model is not called.
     """
     super().__init__(pre_act_label=pre_act_label)
     _validate_beats(beats)
@@ -338,6 +358,13 @@ class DramaDirector(
       raise ValueError(f'tolerance must be >= 0, got {tolerance}.')
     if cooldown_turns < 0:
       raise ValueError(f'cooldown_turns must be >= 0, got {cooldown_turns}.')
+    if not isinstance(repetition_check_interval, int) or (
+        repetition_check_interval < 1
+    ):
+      raise ValueError(
+          'repetition_check_interval must be a positive integer, got'
+          f' {repetition_check_interval!r}.'
+      )
     self._model = model
     self._beats = tuple(beats)
     self._next_acting_component_key = next_acting_component_key
@@ -346,6 +373,8 @@ class DramaDirector(
     self._tolerance = tolerance
     self._cooldown_turns = cooldown_turns
     self._feedback_enabled = feedback_enabled
+    self._repetition_push_enabled = repetition_push_enabled
+    self._repetition_check_interval = repetition_check_interval
     self._allowed_environment_events = tuple(allowed_environment_events)
     self._immutable_facts = tuple(immutable_facts)
     self._player_names = tuple(player_names)
@@ -370,6 +399,9 @@ class DramaDirector(
     self._scoring_parse_retries = 0
     self._directive: dict[str, Any] | None = None
     self._last_directive_executed_turn: int | None = None
+    self._repetition_check_count = 0
+    self._repetition_execution_count = 0
+    self._last_intervention: dict[str, Any] | None = None
 
     # Per-turn state machine (pending until committed by update).
     self._turn_context: dict[str, Any] | None = None
@@ -401,6 +433,7 @@ class DramaDirector(
       observation: str,
   ) -> str:
     if observation.startswith(_PUTATIVE_EVENT_PREFIX):
+      self._rollback_uncommitted_integration()
       self._turn_context = None
       actor = self._get_active_player()
       if actor is not None:
@@ -420,7 +453,12 @@ class DramaDirector(
             'action_intent': action_intent,
             'action_result': None,
             'intervention': None,
+            # Transient repetition record of this turn (spec 7.2):
+            # checked/attempted/proposed_change only; executed is
+            # confirmed exclusively by the validated commit.
+            'repetition': None,
             'resolution_diagnostics': {},
+            'resolution_diagnostics_history': [],
             'beat_id_at_action': beat.id if beat is not None else None,
             'directive_at_start': copy.deepcopy(self._directive),
         }
@@ -529,14 +567,56 @@ class DramaDirector(
           'deviated': deviated,
       }
 
+    # Approved interventions of this turn (spec section 7.2): confirmed
+    # only here — after the final review validated the resolution and
+    # the awaited event closed the turn — and promoted to committed
+    # state exclusively by update. Neither a changed candidate nor
+    # entering the integrating status consumed anything yet, and the
+    # shared execution baseline below is a projection the same turn's
+    # post-processing must respect.
+    validated = self._validated or {}
+    repetition = snapshot['repetition']
+    repetition_checked = bool(repetition and repetition['checked'])
+    repetition_executed = bool(repetition and repetition['proposed_change'])
+    tension_executed = bool(validated.get('tension_approved'))
+    repetition_check_count = self._repetition_check_count + int(
+        repetition_checked
+    )
+    repetition_execution_count = self._repetition_execution_count + int(
+        repetition_executed
+    )
+    last_executed_turn = self._last_directive_executed_turn
+    last_intervention = copy.deepcopy(self._last_intervention)
+    if tension_executed or repetition_executed:
+      last_executed_turn = turn_id
+      last_intervention = {
+          'turn_id': turn_id,
+          'reason': 'tension' if tension_executed else 'repetition',
+      }
+    # The shared cooldown the post-processing below must respect: an
+    # intervention executed this very turn already suppresses a new
+    # tension directive of the same turn.
+    cooldown_active = (
+        last_executed_turn is not None
+        and turn_id - last_executed_turn <= self._cooldown_turns
+    )
+
     # Pipeline step 4: director directives (spec sections 4.4 step 4
     # and 4.5). A beat transition invalidates any still-active
     # directive of the old beat; a new directive is generated only when
     # every precondition holds: no transition this step, the story
     # still running, this step's score valid and deviating, feedback
     # enabled, no active directive awaiting execution, and outside the
-    # cooldown since the last execution.
+    # projected cooldown since the last intervention execution. A beat
+    # completed this step never generates a directive of the old beat.
     directive = dict(self._directive) if self._directive is not None else None
+    if tension_executed and directive is not None:
+      # The consuming commit of the turn that fused the directive.
+      directive = {
+          **directive,
+          'status': _DIRECTIVE_CONSUMED,
+          'executed_at_turn': turn_id,
+      }
     if (
         completed
         and directive is not None
@@ -555,7 +635,7 @@ class DramaDirector(
         and not completed
         and beat_index < len(self._beats)
         and not beat_timeout
-        and not self._in_cooldown(turn_id)
+        and not cooldown_active
         and (
             directive is None
             or directive['status'] not in _ACTIVE_DIRECTIVE_STATUSES
@@ -595,11 +675,23 @@ class DramaDirector(
         # Private diagnostics stay in the collector/checkpoint, never in
         # the resolved event that is broadcast to the players.
         'director_diagnostics': {
-            'directive_at_start': snapshot['directive_at_start'],
-            'directive_after_resolution': copy.deepcopy(self._directive),
+            'directive_at_start': copy.deepcopy(snapshot['directive_at_start']),
+            'directive_after_resolution': copy.deepcopy(
+                validated.get('directive_at_validation')
+            ),
             'directive_after_turn': copy.deepcopy(directive),
-            'cooldown_active': self._in_cooldown(turn_id),
-            'last_executed_turn': self._last_directive_executed_turn,
+            'cooldown_active': cooldown_active,
+            'last_executed_turn': last_executed_turn,
+            'last_intervention': copy.deepcopy(last_intervention),
+            'repetition': (
+                {**copy.deepcopy(repetition), 'executed': repetition_executed}
+                if repetition
+                else None
+            ),
+            'intervention': copy.deepcopy(snapshot['intervention']),
+            'resolution_diagnostics': copy.deepcopy(
+                snapshot['resolution_diagnostics_history']
+            ),
         },
     }
     self._pending_commit = {
@@ -612,6 +704,10 @@ class DramaDirector(
         'tension_eval_count': tension_eval_count,
         'tension_history_entry': tension_entry,
         'directive': directive,
+        'repetition_check_count': repetition_check_count,
+        'repetition_execution_count': repetition_execution_count,
+        'last_intervention': last_intervention,
+        'last_directive_executed_turn': last_executed_turn,
     }
     return ''
 
@@ -635,6 +731,16 @@ class DramaDirector(
       if directive != self._directive:
         self._logging_channel({'DirectorDirective': directive})
       self._directive = directive
+      # The intervention execution state promoted here — counters,
+      # `last_intervention` and the shared cooldown baseline — is the
+      # only confirmation path (spec section 7.2): rejected, interrupted
+      # or budget-exhausted turns never reach this promotion.
+      self._repetition_check_count = commit['repetition_check_count']
+      self._repetition_execution_count = commit['repetition_execution_count']
+      self._last_intervention = commit['last_intervention']
+      self._last_directive_executed_turn = commit[
+          'last_directive_executed_turn'
+      ]
       self._pending_commit = None
       # Clear the per-turn state machine; the turn is fully committed.
       self._turn_context = None
@@ -654,11 +760,15 @@ class DramaDirector(
   ) -> None:
     """Supplies the validated resolution of the current turn.
 
-    A directive being integrated into this resolution is committed as
-    consumed here, because only the validated final output proves the
-    directive reached the story (spec 4.5). An invalid final output
-    raises before this method is reached, leaving the directive
-    unconsumed.
+    This stores the turn's approved state only: the final review has
+    passed, so the interventions the resolution carries (a fused
+    tension directive, a repetition candidate) are eligible for
+    consumption — but the actual consumption, the execution counters
+    and the shared cooldown are confirmed exclusively by the pending
+    commit that `post_observe` constructs and `update` promotes. An
+    invalid final output never reaches this method, and an interruption
+    between this call and the commit leaves every intervention
+    unconsumed (spec sections 4.5 and 7.2).
 
     Args:
       resolved_event: The resolved event to publish for the current turn.
@@ -668,12 +778,33 @@ class DramaDirector(
         self._directive is not None
         and self._directive['status'] == _DIRECTIVE_INTEGRATING
     )
-    if integrating:
-      self.commit_directive()
+    intervention = (
+        self._turn_context['intervention']
+        if self._turn_context is not None
+        else None
+    )
+    repetition = (
+        self._turn_context['repetition']
+        if self._turn_context is not None
+        else None
+    )
     self._validated = {
         'resolved_event': resolved_event,
         'stage_directions': stage_directions,
         'directive_integrating': integrating,
+        # Consumed only when the directive was fused into THIS turn's
+        # resolution: a leftover integrating directive from an earlier
+        # failed turn must not be consumed by an unrelated validation.
+        'tension_approved': (
+            integrating
+            and isinstance(intervention, dict)
+            and intervention.get('reason') == 'tension'
+        ),
+        'repetition_approved': (
+            isinstance(repetition, dict)
+            and bool(repetition.get('proposed_change'))
+        ),
+        'directive_at_validation': copy.deepcopy(self._directive),
     }
 
   def get_pending_directive(self) -> dict[str, Any] | None:
@@ -697,7 +828,9 @@ class DramaDirector(
 
     Called by the director-note step when it starts fusing the
     directive into a candidate event. A directive that is not pending
-    is left untouched, so a repeated call cannot resurrect one.
+    is left untouched, so a repeated call cannot resurrect one. The
+    marker is working state of the attempt in progress: if the turn
+    never commits, the next putative event rolls it back to pending.
     """
     if (
         self._directive is not None
@@ -707,27 +840,6 @@ class DramaDirector(
           **self._directive,
           'status': _DIRECTIVE_INTEGRATING,
       }
-
-  def commit_directive(self) -> None:
-    """Commits the integrating directive as consumed, once.
-
-    Records the story turn being resolved as the execution turn for
-    the cooldown computation. A directive that is not integrating is
-    left untouched, so a second resolution never re-consumes one.
-    """
-    if (
-        self._directive is None
-        or self._directive['status'] != _DIRECTIVE_INTEGRATING
-    ):
-      return
-    self._directive = {
-        **self._directive,
-        'status': _DIRECTIVE_CONSUMED,
-        'executed_at_turn': self._story_turn + 1,
-    }
-    # The turn in progress is one past the last committed story turn.
-    self._last_directive_executed_turn = self._story_turn + 1
-    self._logging_channel({'DirectorDirective': self._directive})
 
   def mark_directive_failed(self, reason: str) -> None:
     """Records an active directive as failed, with its reason.
@@ -749,6 +861,34 @@ class DramaDirector(
           'failed_at_turn': self._story_turn + 1,
       }
       self._logging_channel({'DirectorDirective': self._directive})
+
+  def _rollback_uncommitted_integration(self) -> None:
+    """Restores a directive an uncommitted attempt left integrating.
+
+    ``mark_directive_integrating`` writes its working marker into the
+    directive while a turn attempts the fusion. When that turn never
+    commits (e.g. the final review rejected it), the marker must not
+    leak into the retried turn: a new putative event restores the
+    pending status the failed attempt started from, so the same
+    instance can fuse the directive again. Terminal states reached by
+    real determinations (failed) and committed transitions (consumed,
+    invalidated) are never rolled back.
+    """
+    context = self._turn_context
+    if (
+        context is not None
+        and self._directive is not None
+        and self._directive['status'] == _DIRECTIVE_INTEGRATING
+    ):
+      at_start = context['directive_at_start']
+      if (
+          at_start is not None
+          and at_start['status'] == _DIRECTIVE_PENDING
+          and at_start['beat_id'] == self._directive['beat_id']
+          and at_start['generated_at_turn']
+          == self._directive['generated_at_turn']
+      ):
+        self._directive = {**self._directive, 'status': _DIRECTIVE_PENDING}
 
   @property
   def allowed_environment_events(self) -> tuple[str, ...]:
@@ -869,11 +1009,110 @@ class DramaDirector(
         'candidate_before': candidate_before,
         'candidate_after': candidate_after,
     }
-    context['resolution_diagnostics'] = {
+    self._append_resolution_diagnostics({
         'stage': f'intervention_{reason}',
         'trace': trace,
         'error': None,
+    })
+
+  def should_attempt_repetition_push(self) -> bool:
+    """Decides whether the resolution chain may run the repetition check.
+
+    Read-only over committed state and the path already taken this
+    turn (spec section 7.2): the check runs only when feedback and the
+    repetition switch are enabled, the story has not stopped, the
+    current turn (committed story turns plus one) satisfies the check
+    interval, the shared execution cooldown has passed, no tension
+    directive was active at the turn's start (a pending directive — or
+    a leftover integrating one — occupies the turn's single
+    intervention path even if its fusion fails), and no repetition
+    result was already recorded this turn. A check interrupted by an
+    API or budget error leaves no record, so an uncommitted retry of
+    the same turn may check again.
+
+    Returns:
+      Whether the repetition helper may run for the turn in progress.
+    """
+    context = self._turn_context
+    if context is None:
+      return False
+    directive_at_start = context['directive_at_start']
+    if (
+        directive_at_start is not None
+        and directive_at_start['status'] in _ACTIVE_DIRECTIVE_STATUSES
+    ):
+      return False
+    if context['intervention'] is not None or context['repetition'] is not None:
+      return False
+    turn_id = self._story_turn + 1
+    return (
+        self._feedback_enabled
+        and self._repetition_push_enabled
+        and not self.is_story_stopped()
+        and turn_id % self._repetition_check_interval == 0
+        and not self._in_cooldown(turn_id)
+    )
+
+  def record_repetition_result(
+      self,
+      *,
+      candidate_before: str,
+      candidate_after: str,
+      attempted: bool,
+      trace: str,
+  ) -> None:
+    """Records the core repetition helper's actual return of this turn.
+
+    Called once, after the helper returned successfully: it records the
+    check, whether the helper actually attempted an intervention (it
+    judged the story repetitive and ran its suggestion-and-fusion path)
+    and — when the returned candidate differs from the input — the
+    proposed change as an intervention candidate for the final
+    generation and review. An attempt whose fusion returns the original
+    text is still an attempt (`attempted` true, `proposed_change`
+    false): only a changed candidate proposes anything to execute.
+    There is deliberately no executed flag: execution is confirmed
+    exclusively by the validated commit path (spec section 7.2). API
+    and budget errors propagate to the caller instead, leaving this
+    method unreached, so a failed check never masquerades as a
+    successful or unchanged return.
+
+    Args:
+      candidate_before: The candidate event handed to the helper.
+      candidate_after: The candidate event the helper actually returned.
+      attempted: Whether the helper actually attempted an intervention
+        (judged the story repetitive and ran its suggestion-and-fusion
+        path), independent of whether the returned candidate differs.
+      trace: Private trace of the repetition document.
+
+    Raises:
+      ValueError: If no story turn is in progress or a candidate was
+        already recorded this turn.
+    """
+    context = self._require_turn_context('record_repetition_result')
+    proposed_change = candidate_after != candidate_before
+    context['repetition'] = {
+        'reason': 'repetition',
+        'checked': True,
+        'attempted': attempted,
+        'proposed_change': proposed_change,
+        'executed': False,
     }
+    if proposed_change:
+      self.record_intervention_candidate(
+          reason='repetition',
+          candidate_before=candidate_before,
+          candidate_after=candidate_after,
+          trace=trace,
+      )
+    else:
+      # A check without a change carries no candidate; only its private
+      # trace is archived.
+      self._append_resolution_diagnostics({
+          'stage': 'repetition_check',
+          'trace': trace,
+          'error': None,
+      })
 
   def record_resolution_diagnostics(
       self,
@@ -886,7 +1125,10 @@ class DramaDirector(
 
     Supports partial records while a helper has not returned yet; it
     never changes checked, executed or any committed state (spec
-    section 7.2). Each call replaces the previous stage's record.
+    section 7.2). The latest record is exposed under the 'stage',
+    'trace' and 'error' keys while earlier records — e.g. an
+    intervention candidate trace followed by a review-failure trace —
+    stay retrievable side by side in the history.
 
     Args:
       stage: Pipeline stage the record belongs to.
@@ -897,11 +1139,28 @@ class DramaDirector(
       ValueError: If no story turn is in progress.
     """
     context = self._require_turn_context('record_resolution_diagnostics')
-    context['resolution_diagnostics'] = {
+    self._append_resolution_diagnostics({
         'stage': stage,
         'trace': trace,
         'error': error,
-    }
+    })
+
+  def _append_resolution_diagnostics(
+      self,
+      record: dict[str, Any],
+  ) -> None:
+    """Appends one resolution-diagnostics record to the turn context.
+
+    Args:
+      record: The {'stage', 'trace', 'error'} record to append; the
+        latest record is also mirrored under 'resolution_diagnostics'.
+    """
+    context = self._require_turn_context('record_resolution_diagnostics')
+    context['resolution_diagnostics'] = copy.deepcopy(record)
+    context['resolution_diagnostics_history'] = [
+        *context['resolution_diagnostics_history'],
+        copy.deepcopy(record),
+    ]
 
   def get_current_resolution_evidence(self) -> dict[str, Any]:
     """Returns a deep copy of the current turn's resolution evidence.
@@ -930,14 +1189,19 @@ class DramaDirector(
     save); the contents are never broadcast (spec section 7.2).
 
     Returns:
-      A deep copy of the current resolution evidence extended with
-      the 'stage', 'trace' and 'error' of the latest recorded
-      diagnostics, when any.
+      A deep copy of the current resolution evidence extended with the
+      'stage', 'trace' and 'error' of the latest recorded diagnostics
+      (when any) and the full 'history' of records in call order, so an
+      intervention candidate trace and a later review-failure trace
+      stay retrievable side by side.
     """
     diagnostics = self.get_current_resolution_evidence()
     if self._turn_context is not None:
       diagnostics.update(
           copy.deepcopy(self._turn_context['resolution_diagnostics'])
+      )
+      diagnostics['history'] = copy.deepcopy(
+          self._turn_context['resolution_diagnostics_history']
       )
     return diagnostics
 
@@ -992,6 +1256,13 @@ class DramaDirector(
             dict(self._directive) if self._directive is not None else None
         ),
         'last_directive_executed_turn': self._last_directive_executed_turn,
+        'repetition_check_count': self._repetition_check_count,
+        'repetition_execution_count': self._repetition_execution_count,
+        'last_intervention': (
+            copy.deepcopy(self._last_intervention)
+            if self._last_intervention is not None
+            else None
+        ),
     }
 
   @override
@@ -1038,6 +1309,24 @@ class DramaDirector(
     self._directive = dict(directive) if directive is not None else None
     self._last_directive_executed_turn = state.get(  # pyrefly: ignore[bad-assignment]
         'last_directive_executed_turn', None
+    )
+    # The repetition fields postdate the intervention-state schema of
+    # stages 1-2; older checkpoints resume untracked (0/0/None) while
+    # keeping the old tension execution baseline above as the shared
+    # cooldown baseline (spec section 9).
+    self._repetition_check_count = state.get(  # pyrefly: ignore[bad-assignment]
+        'repetition_check_count', 0
+    )
+    self._repetition_execution_count = state.get(  # pyrefly: ignore[bad-assignment]
+        'repetition_execution_count', 0
+    )
+    last_intervention = cast(
+        'dict[str, Any] | None', state.get('last_intervention', None)
+    )
+    self._last_intervention = (
+        copy.deepcopy(last_intervention)
+        if last_intervention is not None
+        else None
     )
 
   def _current_beat(self) -> Beat | None:
@@ -1204,7 +1493,9 @@ class DramaDirector(
     deviation, the direction of correction and the constraints that
     only whitelisted NPC/environmental means may be used and immutable
     facts must hold, so directives can never decide player characters'
-    voluntary actions.
+    voluntary actions. A4 (design section 7.2) adds that instructions
+    target a concrete unresolved problem of the recent public events
+    rather than novelty stacking.
 
     Args:
       score: This step's valid, deviating tension score.
@@ -1249,6 +1540,10 @@ class DramaDirector(
         ' Whitelisting an event does not make it repeatable: do not introduce'
         ' an event already established in the public history, or repeat a'
         ' demand as if it were new progress.'
+        ' Base the instruction on a concrete unresolved problem visible'
+        ' in the recent public events rather than novelty for its own'
+        ' sake; do not add another interruption, verification or'
+        ' registration chore on top of unresolved ones.'
     )
     document.statement('## GM-only boundaries (never disclose these)')
     for name, constraint in self._character_constraints.items():

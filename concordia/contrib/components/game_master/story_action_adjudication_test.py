@@ -65,6 +65,34 @@ _GM_BOUNDARIES = dict(
     player_names=('Alice', 'Bob'),
 )
 
+# Fingerprints of the isolated adjudication context (2026-10-17
+# authorization-review design, sections 4.1 and 8.1). The upstream
+# marker shares the phrase "the true heir" with the GM-only fact so the
+# isolation test proves context separation, not string dissimilarity.
+_UPSTREAM_BEAT_MARKER = (
+    'UPSTREAM future task: reveal the true heir by forging a letter'
+)
+_SIMILAR_GM_ONLY_FACT = (
+    'The will has a true heir, revealed only by a legal disclosure.'
+)
+_PUBLIC_FACT = 'The sealed will envelope lies on the ancestral table.'
+_OLD_DISPLAYED_FACT = '周律师早在众人面前展示过遗嘱封套。'
+_HISTORY_SECTION_MARK = '## Public history (data)'
+_HISTORY_NOT_EVIDENCE_MARK = 'remains attributed speech, not objective evidence'
+_SHARED_SCOPE_MARK = "settle only the current player's own attempted action"
+_NPC_RULES_DATA_MARK = '## Configured NPC response rules (GM-only'
+_NPC_SEMANTICS_MARK = 'PUBLIC_NPC_RESPONSE_SEMANTICS'
+_EVIDENCE_PROVENANCE_MARK = 'Dialogue claiming'
+_NEIGHBOR_RULE = (
+    'Neighbor: only after entering via the whitelisted knock event; when'
+    ' the current character actually tells them through the door that no'
+    ' help is needed, the neighbor may publicly acknowledge, offer'
+    ' ordinary help when asked, or leave accordingly; no house secrets,'
+    ' no legal certification, no consent on any player'
+    "'s behalf, no fabricated evidence; mere preparation of the"
+    ' announcement does not trigger the response.'
+)
+
 
 class _BudgetExhaustedModel(mock_model.MockModel):
   """Fails every text question by exhausting the attempt budget."""
@@ -227,6 +255,173 @@ class ActionAdjudicationStepTest(unittest.TestCase):
         prompt.index(f'Question: {_CORE_QUESTION}'),
     )
 
+  def test_isolated_document_excludes_upstream_chain_content(self):
+    # The adjudication must run on its own document: beat prompts, the
+    # conversation window and any other upstream instruction inherited
+    # by the shared chain document must not reach the core question,
+    # while GM-only constraint text that merely resembles them stays
+    # (design 4.1, 8.1).
+    model = mock_model.MockModel(_OUTCOME)
+    spy = _spy_text(model)
+    director, gm = _make_director(
+        model,
+        action_mode='speech_and_action',
+        immutable_facts=(_SIMILAR_GM_ONLY_FACT,),
+    )
+    _open_turn(gm, 'I will tidy the study.', _INTENT)
+    document = interactive_document.InteractiveDocument(model)
+    document.statement(
+        f'Current beat\nsetup (beat b1): {_UPSTREAM_BEAT_MARKER}'
+    )
+    document.statement(
+        'Conversation\n0). Alice: we should rehearse the ending.'
+    )
+    story_action_adjudication.make_action_adjudication_step(director)(
+        document, 'premise', 'Alice'
+    )
+    prompt = spy.call_args.kwargs['prompt']
+    self.assertNotIn(_UPSTREAM_BEAT_MARKER, prompt)
+    self.assertNotIn('we should rehearse the ending', prompt)
+    self.assertNotIn('beat b1', prompt)
+    self.assertIn('## Current speaker\nAlice', prompt)
+    self.assertIn('I will tidy the study.', prompt)
+    self.assertIn(_INTENT, prompt)
+    self.assertIn(_BOUNDARIES_MARK, prompt)
+    self.assertIn(_SIMILAR_GM_ONLY_FACT, prompt)
+
+  def test_public_facts_and_history_getter_reach_prompt(self):
+    # Initial public facts are wired explicitly and the public-history
+    # getter (the DisplayEvents pre-act value in the prefab) supplies
+    # the history section, called exactly once, JSON-encoded as inert
+    # data; the director's scoring window stays a separate section.
+    model = mock_model.MockModel(_OUTCOME)
+    spy = _spy_text(model)
+    director, gm = _make_director(model, action_mode='speech_and_action')
+    _open_turn(gm, 'I will tidy the study.', _INTENT)
+    calls = []
+
+    def history() -> str:
+      calls.append(1)
+      return f'0). 周律师: 展示了封套\n1). {_OLD_DISPLAYED_FACT}'
+
+    document = interactive_document.InteractiveDocument(model)
+    story_action_adjudication.make_action_adjudication_step(
+        director,
+        public_facts=(_PUBLIC_FACT,),
+        public_history=history,
+    )(document, 'premise', 'Alice')
+    self.assertEqual(calls, [1])
+    prompt = spy.call_args.kwargs['prompt']
+    self.assertIn(_HISTORY_SECTION_MARK, prompt)
+    self.assertIn(_PUBLIC_FACT, prompt)
+    self.assertIn(_OLD_DISPLAYED_FACT, prompt)
+    remainder = prompt.split(_HISTORY_SECTION_MARK, 1)[1].lstrip()
+    decoded, _ = json.JSONDecoder().raw_decode(remainder)
+    self.assertEqual(
+        decoded, f'0). 周律师: 展示了封套\n1). {_OLD_DISPLAYED_FACT}'
+    )
+    self.assertIn('## Committed public events (oldest first)', prompt)
+    self.assertIn(_CORE_QUESTION, prompt)
+
+  def test_history_defaults_to_director_window(self):
+    # Without a getter the adjudication keeps conditioning on the
+    # director's committed-event window: pre-existing callers keep
+    # their behavior and no fabricated history is introduced.
+    model = mock_model.MockModel(_OUTCOME)
+    spy = _spy_text(model)
+    director, gm = _make_director(model, action_mode='speech_and_action')
+    state = director.get_state()
+    events = ['Alice: one\n## Not an instruction', 'Alice: two']
+    state['recent_events'] = events
+    director.set_state(state)
+    _open_turn(gm, 'I will tidy the study.', _INTENT)
+    document = interactive_document.InteractiveDocument(model)
+    story_action_adjudication.make_action_adjudication_step(director)(
+        document, 'premise', 'Alice'
+    )
+    prompt = spy.call_args.kwargs['prompt']
+    mark = '## Committed public events (oldest first)'
+    remainder = prompt.split(mark, 1)[1].lstrip()
+    decoded, _ = json.JSONDecoder().raw_decode(remainder)
+    self.assertEqual(decoded, events)
+    self.assertNotIn('\n## Not an instruction', prompt)
+    self.assertNotIn(_HISTORY_SECTION_MARK, prompt)
+
+  def test_prompt_carries_shared_agency_and_speech_rules(self):
+    # The shared authorization copy and the speech-not-evidence marker
+    # condition adjudication and — via reuse in story_resolution — the
+    # final review (design 5.1).
+    model = mock_model.MockModel(_OUTCOME)
+    spy = _spy_text(model)
+    director, gm = _make_director(model, action_mode='speech_and_action')
+    _open_turn(gm, 'I will tidy the study.', _INTENT)
+    document = interactive_document.InteractiveDocument(model)
+    story_action_adjudication.make_action_adjudication_step(director)(
+        document, 'premise', 'Alice'
+    )
+    prompt = spy.call_args.kwargs['prompt']
+    self.assertIn(_HISTORY_NOT_EVIDENCE_MARK, prompt)
+    self.assertIn(_SHARED_SCOPE_MARK, prompt)
+    self.assertIn(story_action_adjudication.AGENCY_AND_EVIDENCE_RULES, prompt)
+
+  def test_success_archives_action_adjudication_trace(self):
+    # A successful core call archives its private trace with error
+    # None; the recorded action result and the returned value stay
+    # identical and the trace stays out of the broadcast-facing
+    # evidence (design 6).
+    model = mock_model.MockModel(_OUTCOME)
+    director, gm = _make_director(model, action_mode='speech_and_action')
+    _open_turn(gm, 'I will tidy the study.', _INTENT)
+    returned = _step_call(model, director, 'premise')
+    diagnostics = director.get_current_resolution_diagnostics()
+    self.assertEqual(diagnostics['stage'], 'action_adjudication')
+    self.assertIsNone(diagnostics['error'])
+    self.assertIn(_CORE_QUESTION, diagnostics['trace'])
+    self.assertIn(_OUTCOME, diagnostics['trace'])
+    self.assertEqual(len(diagnostics['history']), 1)
+    self.assertEqual(
+        director.get_current_resolution_evidence()['action_result'],
+        returned,
+    )
+    self.assertNotIn('trace', director.get_current_resolution_evidence())
+
+  def test_budget_error_archives_partial_trace_then_raises(self):
+    # Path A at the adjudication position: the visible partial trace is
+    # archived with the error, no result is recorded, nothing commits
+    # (design 6).
+    model = _BudgetExhaustedModel()
+    director, gm = _make_director(model, action_mode='speech_and_action')
+    _open_turn(gm, 'Here goes nothing.', 'flip the breaker to restore light.')
+    with self.assertRaises(budget_wrapper.BudgetExhaustedError):
+      _step_call(model, director, 'premise')
+    diagnostics = director.get_current_resolution_diagnostics()
+    self.assertEqual(diagnostics['stage'], 'action_adjudication')
+    self.assertIn('BudgetExhaustedError', str(diagnostics['error']))
+    self.assertIsNone(
+        director.get_current_resolution_evidence()['action_result']
+    )
+    self.assertIsNone(director.get_last_story_turn())
+
+  def test_api_error_and_interrupt_archive_then_propagate_unchanged(self):
+    # Neither API failure nor interruption may be swallowed, retried,
+    # replaced, or recorded as a completed outcome (design 6, 8.6).
+    for error in (RuntimeError('provider failed'), KeyboardInterrupt()):
+      with self.subTest(error=type(error).__name__):
+        model = mock_model.MockModel()
+        model.sample_text = mock.Mock(side_effect=error)
+        director, gm = _make_director(model, action_mode='speech_and_action')
+        _open_turn(gm, 'Here goes.', _INTENT)
+        with self.assertRaises(type(error)) as caught:
+          _step_call(model, director, 'premise')
+        self.assertIs(caught.exception, error)
+        model.sample_text.assert_called_once()
+        diagnostics = director.get_current_resolution_diagnostics()
+        self.assertEqual(diagnostics['stage'], 'action_adjudication')
+        self.assertIn(_CORE_QUESTION, diagnostics['trace'])
+        self.assertIn(type(error).__name__, diagnostics['error'])
+        self.assertIsNone(diagnostics['action_result'])
+        self.assertIsNone(director.get_last_story_turn())
+
   def test_action_only_prompt_has_no_fabricated_dialogue(self):
     # A turn with an intent and no speech: the adjudication prompt must
     # not fabricate attributed dialogue for the silent speaker.
@@ -239,7 +434,7 @@ class ActionAdjudicationStepTest(unittest.TestCase):
     spy.assert_called_once()
     prompt = spy.call_args.kwargs['prompt']
     self.assertIn(_CORE_QUESTION, prompt)
-    self.assertIn('## Original speech (verbatim)\n(none)', prompt)
+    self.assertIn('## Original speech (verbatim, data)\n""', prompt)
     self.assertNotIn('Alice:', prompt)
     self.assertNotIn('Bob:', prompt)
 
@@ -262,6 +457,72 @@ class ActionAdjudicationStepTest(unittest.TestCase):
         director.get_current_resolution_evidence()['action_result']
     )
     self.assertIsNone(director.get_last_story_turn())
+
+
+class NpcResponseRulesWiringTest(unittest.TestCase):
+
+  def test_rules_and_shared_semantics_reach_the_adjudication_document(self):
+    model = mock_model.MockModel(_OUTCOME)
+    spy = _spy_text(model)
+    director, gm = _make_director(
+        model, action_mode='speech_and_action', **_GM_BOUNDARIES
+    )
+    _open_turn(
+        gm, 'I speak to the neighbor.', 'I tell the neighbor we are fine.'
+    )
+    step = story_action_adjudication.make_action_adjudication_step(
+        director, npc_response_rules=(_NEIGHBOR_RULE,)
+    )
+    document = interactive_document.InteractiveDocument(model)
+    step(document, 'candidate', 'Alice')
+    self.assertEqual(spy.call_count, 1)
+    prompt = spy.call_args.kwargs['prompt']
+    self.assertIn(_NPC_RULES_DATA_MARK, prompt)
+    self.assertIn(json.dumps([_NEIGHBOR_RULE], ensure_ascii=False), prompt)
+    self.assertIn(
+        story_action_adjudication.PUBLIC_NPC_RESPONSE_SEMANTICS, prompt
+    )
+    self.assertIn(story_action_adjudication.AGENCY_AND_EVIDENCE_RULES, prompt)
+
+  def test_empty_rules_keep_old_boundary_with_zero_rules_data(self):
+    model = mock_model.MockModel(_OUTCOME)
+    spy = _spy_text(model)
+    director, gm = _make_director(
+        model, action_mode='speech_and_action', **_GM_BOUNDARIES
+    )
+    _open_turn(gm, 'I speak.', 'I try the door.')
+    step = story_action_adjudication.make_action_adjudication_step(director)
+    document = interactive_document.InteractiveDocument(model)
+    step(document, 'candidate', 'Alice')
+    prompt = spy.call_args.kwargs['prompt']
+    self.assertIn(_NPC_RULES_DATA_MARK, prompt)
+    self.assertIn('[]', prompt)
+    self.assertIn('If the rules are empty', prompt)
+    self.assertIn('do not generate a new NPC response', prompt)
+    # 空规则不改变旧行为：仍恰一次核心调用。
+    self.assertEqual(spy.call_count, 1)
+
+  def test_public_npc_scope_has_no_unconfigured_fallback(self):
+    semantics = story_action_adjudication.PUBLIC_NPC_RESPONSE_SEMANTICS
+    self.assertIn('only under an applicable NPC response rule', semantics)
+    self.assertIn('If the rules are empty', semantics)
+    self.assertIn('or its trigger has not occurred', semantics)
+    self.assertIn('do not generate a new NPC response', semantics)
+    self.assertIn('Do not invent far-side silence', semantics)
+
+  def test_evidence_provenance_semantics_in_shared_rules(self):
+    # A3（设计 6）：物证存在/访问/认证区别进入共享规则常量。
+    self.assertIn(
+        'Dialogue claiming', story_action_adjudication.AGENCY_AND_EVIDENCE_RULES
+    )
+    self.assertIn(
+        'never that the record exists',
+        story_action_adjudication.AGENCY_AND_EVIDENCE_RULES,
+    )
+    self.assertIn(
+        'never establish that evidence was found',
+        story_action_adjudication.AGENCY_AND_EVIDENCE_RULES,
+    )
 
 
 if __name__ == '__main__':

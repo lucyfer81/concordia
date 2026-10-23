@@ -45,6 +45,7 @@ import copy
 import dataclasses
 import json
 import os
+import pathlib
 import tempfile
 import time
 import types
@@ -336,6 +337,54 @@ class MakeRunConfigTest(unittest.TestCase):
           self.assertEqual(params.get('emotion_options', ()), ())
           self.assertEqual(params.get('relationships_refresh_interval', 0), 0)
 
+  def test_repetition_switch_follows_the_mode_matrix(self):
+    # beats_only and tension_observe never enable the repetition
+    # intervention; director and character_depth enable it by default
+    # with the appendix-C interval, and an explicit opt-out is honored.
+    for mode, enabled in (
+        ('beats_only', False),
+        ('tension_observe', False),
+        ('director', True),
+        ('character_depth', True),
+    ):
+      with self.subTest(mode=mode):
+        config = run_lib.make_run_config(self.story, mode=mode)
+        params = config['director_params']
+        self.assertEqual(params['repetition_push_enabled'], enabled)
+        self.assertEqual(params['repetition_check_interval'], 3)
+    # An explicit opt-out reaches the effective config unchanged.
+    config = run_lib.make_run_config(self.story, mode='director')
+    config['director_params']['repetition_push_enabled'] = False
+    effective = run_lib._normalize_run_config(  # pylint: disable=protected-access
+        config
+    )
+    self.assertFalse(effective['director_params']['repetition_push_enabled'])
+    # A non-positive interval is rejected by the director at build.
+    invalid = run_lib.make_run_config(self.story, mode='director')
+    invalid['director_params']['repetition_check_interval'] = 0
+    with tempfile.TemporaryDirectory() as tmp:
+      with mock.patch.object(
+          run_lib, 'make_language_model', return_value=(mock.Mock(), ())
+      ):
+        with self.assertRaises(ValueError):
+          run_lib.run(os.path.join(tmp, 'invalid'), run_config=invalid)
+
+  def test_old_config_without_repetition_switches_reads_off(self):
+    # Checkpoints from before the repetition switches (including A/B's
+    # schema-2 director runs) resume with the intervention off: the
+    # missing keys are read as disabled regardless of the mode, never
+    # silently enabled by it.
+    config = run_lib.make_run_config(self.story, mode='director')
+    del config['director_params']['repetition_push_enabled']
+    del config['director_params']['repetition_check_interval']
+    effective = run_lib._normalize_run_config(  # pylint: disable=protected-access
+        config
+    )
+    self.assertFalse(effective['director_params']['repetition_push_enabled'])
+    self.assertEqual(
+        effective['director_params']['repetition_check_interval'], 3
+    )
+
   def test_scene_premises_carry_public_background_only(self):
     config = run_lib.make_run_config(self.story)
     premise = config['scene_dicts'][0]['premise']
@@ -370,6 +419,29 @@ class MakeRunConfigTest(unittest.TestCase):
       self.assertIn(
           f'{character.name}：{character.hard_constraint}', constraints
       )
+
+  def test_npc_response_rules_and_two_event_channels_recorded(self):
+    config = run_lib.make_run_config(self.story, total_turn_limit=2)
+    self.assertEqual(
+        config['gm_params']['npc_response_rules'],
+        list(self.story.npc_response_rules),
+    )
+    constraints = '\n'.join(config['gm_params']['world_constraints'])
+    # 双通道：导演新外部事件走白名单；已登场 NPC 的公开直接回应走
+    # 配置的回应规则，不算导演新事件（设计 5.2）。
+    self.assertIn('导演主动发起的新 NPC 或环境事件', constraints)
+    self.assertIn('已合法登场的 NPC', constraints)
+    self.assertIn('npc_response_rules', constraints)
+    self.assertIn('；'.join(self.story.allowed_environment_events), constraints)
+    # 非空规则只授权公开范围，不进入角色 premise 或广播队列。
+    premises = config['scene_dicts'][0]['premise']
+    public_text = '\n'.join(
+        line for lines in premises.values() for line in lines
+    )
+    self.assertNotIn('隔壁邻居被争执声惊动', public_text)
+    self.assertNotIn('npc_response_rules', public_text)
+    for rule in self.story.npc_response_rules:
+      self.assertNotIn(rule, public_text)
 
   def test_review_initial_public_facts_exclude_hidden_and_future_information(
       self,
@@ -421,6 +493,53 @@ class MakeRunConfigTest(unittest.TestCase):
       self.assertIn(ending, final.description)
       self.assertIn(ending, final.done_question)
     self.assertIn('仅按已发生的事件判断', final.done_question)
+
+
+class DirectorActionModeConfigTest(unittest.TestCase):
+  """Phase A of the run4 design: the comparison config is consistent.
+
+  Building the run4 comparison configuration records one action
+  contract everywhere: the top-level ``action_mode``, the game
+  master's params and the scene's canonical elicitation text all name
+  ``speech_and_action``, and the shared codec decodes the JSON
+  contract that text elicits. Constructing the config performs no
+  model calls.
+  """
+
+  def test_director_mode_records_one_contract_everywhere(self):
+    config = run_lib.make_run_config(
+        story_config.make_example_config(),
+        mode='director',
+        action_mode='speech_and_action',
+        total_turn_limit=24,
+        total_model_attempt_limit=400,
+    )
+    self.assertEqual(config['mode'], 'director')
+    self.assertEqual(config['action_mode'], 'speech_and_action')
+    self.assertEqual(config['gm_params']['action_mode'], 'speech_and_action')
+    spec = config['scene_dicts'][0]['scene_type']['action_spec']
+    self.assertEqual(
+        spec['call_to_action'],
+        story_config.make_speech_and_action_action_spec().call_to_action,
+    )
+    # The director stage keeps its intervention switches alongside the
+    # action contract, and the consistency gate accepts the config.
+    self.assertTrue(config['director_params']['repetition_push_enabled'])
+    self.assertEqual(config['director_params']['repetition_check_interval'], 3)
+    normalized = run_lib._normalize_run_config(config)  # pylint: disable=protected-access
+    self.assertEqual(normalized['action_mode'], 'speech_and_action')
+
+  def test_shared_codec_decodes_the_elicited_contract(self):
+    raw = json.dumps(
+        {
+            'speech': '第一段。\n\n第二段 "引号"',
+            'action_intent': '林雪用自己持有的那把钥匙去转动保险柜的锁。',
+        },
+        ensure_ascii=False,
+    )
+    speech, intent = story_action.decode_action(raw)
+    self.assertEqual(speech, '第一段。\n\n第二段 "引号"')
+    self.assertEqual(intent, '林雪用自己持有的那把钥匙去转动保险柜的锁。')
 
 
 class BuildSimulationTest(unittest.TestCase):
@@ -650,7 +769,7 @@ class AllowedEndingsWiringTest(unittest.TestCase):
     )
     self.assertEqual(stub.sample_text(speech_last), '我有话说。')
 
-  def test_dual_track_route_takes_precedence_and_preserves_speech(self):
+  def test_final_output_route_returns_only_stage_directions(self):
     stub = testing_stubs.PromptStubModel()
     prompt = (
         'Question: What would a person like 林雪 do in a situation like '
@@ -661,15 +780,12 @@ class AllowedEndingsWiringTest(unittest.TestCase):
         '## Original speech (verbatim)\n'
         '遗嘱的封印从未核验。\n'
         '## Output\n'
-        'Output a JSON object with exactly two string fields:\n'
-        '- "resolved_event"\n- "stage_directions"\n'
+        'Output a JSON object with exactly one string field:\n'
+        '- "stage_directions"\n'
         'Answer: '
     )
     payload = json.loads(stub.sample_text(prompt))
-    self.assertEqual(
-        payload['resolved_event'],
-        '林雪: 遗嘱的封印从未核验。\n' + payload['stage_directions'],
-    )
+    self.assertEqual(set(payload), {'stage_directions'})
     self.assertEqual(payload['stage_directions'], '窗外的雷声滚过，烛火摇曳。')
 
   def test_choice_maps_by_beat_completion_answer_with_shuffled_letters(
@@ -1196,7 +1312,6 @@ class SemanticReviewFailureTest(_StateDirTestCase):
       self,
       response: str,
       *,
-      stage_only: bool = False,
       pending_directive: bool = False,
   ):
     marker = 'REJECTED_EVENT_DO_NOT_PUBLISH'
@@ -1205,19 +1320,9 @@ class SemanticReviewFailureTest(_StateDirTestCase):
         + marker
     )
 
-    class RejectedCandidate(testing_stubs.PromptStubModel):
-
-      def _dual_track_output(self, prompt):
-        result = super()._dual_track_output(prompt)
-        if stage_only:
-          payload = json.loads(result)
-          payload['resolved_event'] = payload['resolved_event'].split('\n', 1)[
-              0
-          ]
-          return json.dumps(payload, ensure_ascii=False)
-        return result
-
-    stub = RejectedCandidate(stage_directions=stage, review_response=response)
+    stub = testing_stubs.PromptStubModel(
+        stage_directions=stage, review_response=response
+    )
     config = _fixture_config()
     built = []
     real_build = run_lib.build_simulation
@@ -1274,13 +1379,6 @@ class SemanticReviewFailureTest(_StateDirTestCase):
 
   def test_malformed_review_is_not_broadcast_or_committed(self):
     self._run_rejected('invalid JSON')
-
-  def test_stage_only_signature_rejection_is_not_broadcast_or_committed(self):
-    self._run_rejected(
-        '{"valid": false, "reason": "Signature exists in stage directions'
-        ' only"}',
-        stage_only=True,
-    )
 
   def test_rejected_resolution_does_not_consume_director_instruction(self):
     self._run_rejected(
@@ -1907,6 +2005,29 @@ class ActionModeRunTest(_StateDirTestCase):
     maker.assert_not_called()
     self.assertFalse(os.path.exists(os.path.join(directory, 'checkpoint.json')))
 
+  def test_schema2_missing_gm_mode_rejects_recorded_json_mode(self):
+    config = self._json_fixture(total_turn_limit=2)
+    del config['gm_params']['action_mode']
+    directory = self._dir('schema2-missing-gm-mode')
+    with mock.patch.object(
+        run_lib, 'make_language_model', wraps=run_lib.make_language_model
+    ) as maker:
+      with self.assertRaisesRegex(ValueError, 'action_mode mismatch'):
+        run_lib.run(directory, run_config=config)
+    maker.assert_not_called()
+    self.assertFalse(os.path.exists(os.path.join(directory, 'checkpoint.json')))
+
+  def test_schema2_missing_gm_mode_allows_recorded_speech_only(self):
+    config = self._speech_fixture(total_turn_limit=2)
+    del config['gm_params']['action_mode']
+    result = run_lib.run(self.state_dir, run_config=config)
+    self.assertEqual(result.committed_turn_id, 2)
+    self.assertEqual(self.summary()['action_mode'], 'speech_only')
+    self.assertEqual(
+        [turn['speech'] for turn in self.turn_log().load()],
+        ['这宅子的事，急不得。'] * 2,
+    )
+
   def test_schema2_contradicting_nested_action_modes_are_rejected(self):
     # A schema-2 config whose nested parts imply a different contract
     # than the recorded top-level action_mode would run and record
@@ -2061,6 +2182,96 @@ class ActionModeRunTest(_StateDirTestCase):
     with self.assertRaisesRegex(ValueError, 'schema version'):
       run_lib.run(self.state_dir, resume=True)
 
+  def test_old_config_without_npc_rules_resumes_empty(self):
+    # 设计 5.2：旧配置缺失 npc_response_rules 读取为空，恢复不换
+    # 示例默认；新目录新配置才带非空规则。
+    config = self._json_fixture(total_turn_limit=4)
+    config['gm_params'].pop('npc_response_rules', None)
+    config['story'].pop('npc_response_rules', None)
+    original = copy.deepcopy(config)
+    directory = self._dir('old-config-no-npc-rules')
+    self._commit_after_turn_two(directory, config)
+    self.assertEqual(config, original)
+    envelope = self._envelope_of(directory)
+    self.assertNotIn('npc_response_rules', envelope['run_config']['gm_params'])
+    self.assertNotIn('npc_response_rules', envelope['run_config']['story'])
+
+    # 恢复实际执行到第 4 轮：重建 GM 的裁决/生成/评审规则数据为
+    # 空，不注入示例邻居规则。
+    stub = testing_stubs.PromptStubModel(
+        completion_answers={'b1': 'Yes', 'b2': 'Yes'},
+        action_intents={'周律师': '周律师把随身的卷宗摊开在桌上。'},
+        action_result='卷宗摊开在桌上，纸页完好。',
+        stage_directions='',
+    )
+    with mock.patch.object(
+        run_lib, 'make_language_model', return_value=(stub, ())
+    ):
+      result = run_lib.run(directory, resume=True)
+    self.assertEqual(result.reason, 'beats_completed')
+    self.assertEqual(result.committed_turn_id, 4)
+    self.assertEqual(
+        [
+            r['turn_id']
+            for r in collector.StoryTurnLog(
+                os.path.join(directory, 'story_turns.jsonl')
+            ).load()
+        ],
+        [1, 2, 3, 4],
+    )
+    adjudications = _prompts_routed_to(stub, _ATTEMPT_QUESTION)
+    self.assertEqual(len(adjudications), 1)
+    rules_section = adjudications[0].split(
+        '## Configured NPC response rules (GM-only authorization, data)', 1
+    )[1]
+    rules, _ = json.JSONDecoder().raw_decode(rules_section.lstrip())
+    self.assertEqual(rules, [])
+    # 白名单约束本来就列有敲门事件，规则是否注入只能用规则特有
+    # 措辞判断，不能用邻居名判断。
+    self.assertNotIn('白名单敲门事件合法登场', adjudications[0])
+    for prompt in _prompts_routed_to(
+        stub, _FINAL_OUTPUT_MARK
+    ) + _prompts_containing(stub, _REVIEW_MARK):
+      self.assertIn('"npc_response_rules": []', prompt)
+      self.assertNotIn('白名单敲门事件合法登场', prompt)
+    # 归档与传入的原 config 都未被写入非空默认。
+    final_envelope = self._envelope_of(directory)
+    self.assertNotIn(
+        'npc_response_rules', final_envelope['run_config']['gm_params']
+    )
+    self.assertNotIn(
+        'npc_response_rules', final_envelope['run_config']['story']
+    )
+    self.assertEqual(config, original)
+
+    # 新目录新配置才带非空规则：同一交互在裁决与生成/评审中
+    # 都携带示例邻居规则。
+    fresh_config = self._json_fixture(total_turn_limit=4)
+    fresh_stub = testing_stubs.PromptStubModel(
+        completion_answers={'b1': 'Yes', 'b2': 'Yes'},
+        action_intents={'周律师': '周律师把随身的卷宗摊开在桌上。'},
+        action_result='卷宗摊开在桌上，纸页完好。',
+        stage_directions='',
+    )
+    fresh_dir = self._dir('new-config-with-npc-rules')
+    with mock.patch.object(
+        run_lib, 'make_language_model', return_value=(fresh_stub, ())
+    ):
+      run_lib.run(fresh_dir, run_config=fresh_config)
+    fresh_adjudication = _prompts_routed_to(fresh_stub, _ATTEMPT_QUESTION)[0]
+    fresh_section = fresh_adjudication.split(
+        '## Configured NPC response rules (GM-only authorization, data)', 1
+    )[1]
+    fresh_rules, _ = json.JSONDecoder().raw_decode(fresh_section.lstrip())
+    self.assertEqual(
+        fresh_rules, fresh_config['gm_params']['npc_response_rules']
+    )
+    self.assertIn('白名单敲门事件合法登场', fresh_adjudication)
+    for prompt in _prompts_routed_to(
+        fresh_stub, _FINAL_OUTPUT_MARK
+    ) + _prompts_containing(fresh_stub, _REVIEW_MARK):
+      self.assertIn('白名单敲门事件合法登场', prompt)
+
 
 # The GM-only date of the swapped old will: public only after the core
 # adjudication discloses it (task-9 pipeline tests).
@@ -2068,7 +2279,7 @@ _WILL_DATE = '二〇一九年三月十二日'
 
 # Fingerprints for locating real prompts of the action chain.
 _ATTEMPT_QUESTION = 'What happens as a result of the attempted action?'
-_DUAL_TRACK_MARK = 'Output a JSON object with exactly two string fields'
+_FINAL_OUTPUT_MARK = 'Output a JSON object with exactly one string field'
 _REVIEW_MARK = '# Story resolution semantic review'
 
 
@@ -2152,10 +2363,92 @@ class _ActionChainTestCase(_StateDirTestCase):
       return run_lib.run(directory, run_config=config)
 
 
+class DirectorActionRunTest(_ActionChainTestCase):
+  """The run4 configuration shape: director mode with adjudicated action.
+
+  Phase A of the run4 design verifies the already-integrated action
+  adjudication under the director stage switch (scoring and feedback
+  active, repetition gate on its own interval): the blocked two-key
+  adjudication is conditioned on the public world constraint, and its
+  result flows to the turn log and the FDX exactly as under
+  beats_only. No new action system is introduced.
+  """
+
+  _INTENT = '林雪用自己持有的那把钥匙去开堂屋侧室的保险柜。'
+  _BLOCKED = (
+      '保险柜纹丝不动：它须两把钥匙同时转动才能开启，林雪手里只有一把，'
+      '柜门没有开启。'
+  )
+
+  def test_director_mode_adjudicates_action_result_end_to_end(self):
+    config = _fixture_config(
+        total_turn_limit=2,
+        total_model_attempt_limit=200,
+        beats=(_beat('b1', max_turns=99),),
+        completion_answers={},
+        scene_rounds=99,
+        action_mode='speech_and_action',
+    )
+    config['mode'] = 'director'
+    story = story_config.make_example_config()
+    config['director_params'] = {
+        'eval_interval': 1,
+        'scoring_window': 8,
+        'tolerance': 1,
+        'feedback_enabled': True,
+        'cooldown_turns': 3,
+        'allowed_environment_events': list(story.allowed_environment_events),
+        'immutable_facts': list(story.immutable_facts),
+        'repetition_push_enabled': True,
+        'repetition_check_interval': 3,
+    }
+    stub = testing_stubs.PromptStubModel(
+        action_intents={'林雪': self._INTENT},
+        action_result=self._BLOCKED,
+        scoring_answer='5',
+        stage_directions='',
+    )
+    result = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(result.reason, 'step_limit')
+    self.assertEqual(result.committed_turn_id, 2)
+    self.assertEqual(self.summary()['mode'], 'director')
+    self.assertEqual(self.summary()['action_mode'], 'speech_and_action')
+    # The blocked adjudication result reached the committed turn.
+    record = self.turn_log().load()[0]
+    self.assertEqual(record['actor'], '林雪')
+    self.assertEqual(record['action_intent'], self._INTENT)
+    core_result = f'{self._INTENT} Because of that, {self._BLOCKED}'
+    self.assertEqual(record['stage_directions'], core_result)
+    self.assertIn('柜门没有开启', record['resolved_event'])
+    # The core adjudication question was conditioned on the public
+    # two-key constraint, ran exactly once, and nobody decided the
+    # other key holder's choice for her.
+    adjudications = [
+        p
+        for p in stub.text_prompts
+        if _ATTEMPT_QUESTION in _last_question_block(p)
+    ]
+    self.assertEqual(len(adjudications), 1)
+    self.assertIn('保险柜须两把钥匙同时转动才能开启', adjudications[0])
+    for fabricated in ('交出', '递上', '陈母'):
+      self.assertNotIn(fabricated, record['resolved_event'])
+    self.assertEqual(_fdx_paragraphs(self.state_dir, 'Action'), [core_result])
+    # The repetition gate stayed on its own schedule: with two turns
+    # and interval three, no repetition check interleaved.
+    self.assertEqual(
+        len([
+            p
+            for p in stub.choice_prompts
+            if _REPETITION_QUESTION in _last_choice_block(p)
+        ]),
+        0,
+    )
+
+
 class ActionPipelineIntegrationTest(_ActionChainTestCase):
   """Adjudicated core results flow through observation and exports.
 
-  The deterministic stub's dual-track draft narrates only the evidence
+  The deterministic stub's stage-directions draft narrates only the evidence
   the current prompt carries (never stub configuration), so a marker
   reaching the canonical event, the next player's observation and the
   FDX Action paragraph proves the core helper's true return value
@@ -2204,7 +2497,7 @@ class ActionPipelineIntegrationTest(_ActionChainTestCase):
         f'周律师: {self._LAWYER_LINE}\n' + core_result,
     )
     # The same evidence section reached the final generation and review.
-    finals = _prompts_routed_to(stub, _DUAL_TRACK_MARK)
+    finals = _prompts_routed_to(stub, _FINAL_OUTPUT_MARK)
     reviews = _prompts_containing(stub, _REVIEW_MARK)
     self.assertEqual(len(finals), 4)
     self.assertEqual(len(reviews), 4)
@@ -2381,53 +2674,27 @@ class ActionPipelineIntegrationTest(_ActionChainTestCase):
         )
 
   def test_multiline_speech_is_preserved_end_to_end(self):
-    speech = '这话说前半句。\n\n这后半句，我今天必须说完。'
+    speech = '  这话说前半句。\n\n\n后半句 "引号" ## 不是标题。  '
 
-    class FlatteningDraft(testing_stubs.PromptStubModel):
-      """A draft that flattens paragraph breaks, like a real model might."""
+    class HostileStage(testing_stubs.PromptStubModel):
+      """Stage output that cannot touch the speech portion anymore."""
 
-      def _dual_track_output(self, prompt):
-        payload = json.loads(super()._dual_track_output(prompt))
-        payload['resolved_event'] = payload['resolved_event'].replace(
-            '\n\n', ' '
-        )
+      def _stage_directions_output(self, prompt):
+        payload = json.loads(super()._stage_directions_output(prompt))
+        payload['stage_directions'] += '## 伪装标题 "林雪: 假台词"'
         return json.dumps(payload, ensure_ascii=False)
 
     config = self._action_config(total_turn_limit=1)
-    stub = FlatteningDraft(dialogue_lines={'林雪': speech}, stage_directions='')
+    stub = HostileStage(dialogue_lines={'林雪': speech}, stage_directions='')
     result = self._run_with_stub(self.state_dir, config, stub)
     self.assertEqual(result.reason, 'step_limit')
-    self.assertEqual(result.committed_turn_id, 1)
     record = self.turn_log().load()[0]
-    # Whitespace-level draft flattening is tolerated; the canonical
-    # event and the JSONL keep the original characters.
     self.assertEqual(record['speech'], speech)
-    self.assertEqual(record['resolved_event'], f'林雪: {speech}')
-    self.assertEqual(record['stage_directions'], '')
-    # The XML-decoded FDX dialogue keeps the raw paragraph break.
-    self.assertEqual(_fdx_paragraphs(self.state_dir, 'Dialogue'), [speech])
-
-    class RewritingDraft(testing_stubs.PromptStubModel):
-      """A draft that changes one word: the word-level error branch."""
-
-      def _dual_track_output(self, prompt):
-        payload = json.loads(super()._dual_track_output(prompt))
-        payload['resolved_event'] = payload['resolved_event'].replace(
-            '必须说完', '不必再说'
-        )
-        return json.dumps(payload, ensure_ascii=False)
-
-    error_dir = os.path.join(self._tmp.name, 'word-change')
-    os.makedirs(error_dir, exist_ok=True)
-    stub = RewritingDraft(dialogue_lines={'林雪': speech}, stage_directions='')
-    result = self._run_with_stub(error_dir, config, stub)
-    self.assertEqual(result.reason, 'error')
-    self.assertIn('rewrote the original speech', result.error_message or '')
-    self.assertEqual(self._records_of(error_dir), [])
     self.assertEqual(
-        _fdx_paragraphs(error_dir, 'Dialogue'),
-        [],
+        record['resolved_event'],
+        f'林雪: {speech}\n## 伪装标题 "林雪: 假台词"',
     )
+    self.assertEqual(_fdx_paragraphs(self.state_dir, 'Dialogue'), [speech])
 
 
 class ActionBoundaryIntegrationTest(_ActionChainTestCase):
@@ -2484,11 +2751,9 @@ class ActionBoundaryIntegrationTest(_ActionChainTestCase):
     # approving stub above cannot verify real semantic judgment.
     class SigningDraft(testing_stubs.PromptStubModel):
 
-      def _dual_track_output(self, prompt):
-        payload = json.loads(super()._dual_track_output(prompt))
-        extra = '陈母当众签下名字并认罪。'
-        payload['stage_directions'] += '\n' + extra
-        payload['resolved_event'] += '\n' + extra
+      def _stage_directions_output(self, prompt):
+        payload = json.loads(super()._stage_directions_output(prompt))
+        payload['stage_directions'] += '\n陈母当众签下名字并认罪。'
         return json.dumps(payload, ensure_ascii=False)
 
     reject_dir = os.path.join(self._tmp.name, 'sign-reject')
@@ -2602,13 +2867,376 @@ class ActionBoundaryIntegrationTest(_ActionChainTestCase):
     )
 
 
+class PublicNpcResponseIntegrationTest(_ActionChainTestCase):
+  """Design 5: public, in-scope NPC responses ride the one core call.
+
+  The stub's `action_result` stands for the one core adjudication's
+  return (which may include the configured neighbor response); these
+  tests prove the plumbing — evidence, generation, review, observation,
+  exports, call counts — never real semantic judgment.
+  """
+
+  _INTENT = '周律师走到门边，隔着门对邻居说明今晚家事暂不需要帮助。'
+  _KNOCK = '隔壁邻居被争执声惊动，前来敲门探问'
+  _RESPONSE = (
+      '邻居在门外公开应声表示听到了，说若有需要随时可以叫他，随后按告知离开。'
+  )
+  _REJECT_MARK = ' REJECTED_NPC_CANDIDATE_DO_NOT_PUBLISH'
+  _APPROVE = '{"valid": true, "reason": "scripted approval"}'
+  _NPC_RULES_DATA_MARK = (
+      '## Configured NPC response rules (GM-only authorization, data)'
+  )
+
+  def _neighbor_config(self) -> dict[str, Any]:
+    config = self._action_config()
+    story = story_config.make_example_config()
+    config['mode'] = 'director'
+    config['director_params'] = {
+        'eval_interval': 1,
+        'scoring_window': 8,
+        'tolerance': 1,
+        'feedback_enabled': True,
+        'cooldown_turns': 3,
+        'allowed_environment_events': list(story.allowed_environment_events),
+        'immutable_facts': list(story.immutable_facts),
+        'repetition_push_enabled': True,
+        'repetition_check_interval': 2,
+    }
+    return config
+
+  def _records_of(self, directory: str) -> list[dict[str, Any]]:
+    return collector.StoryTurnLog(
+        os.path.join(directory, 'story_turns.jsonl')
+    ).load()
+
+  def _envelope_of(self, directory: str) -> dict[str, Any]:
+    with open(
+        os.path.join(directory, 'checkpoint.json'), encoding='utf-8'
+    ) as handle:
+      return json.load(handle)
+
+  def _restored_from(
+      self, directory: str, run_config: dict[str, Any]
+  ) -> tuple[simulation_lib.Simulation, drama_director.DramaDirector]:
+    sim, director, _, _ = run_lib.build_simulation(
+        run_config=run_config,
+        model=testing_stubs.PromptStubModel(),
+        embedder=_embedder,
+    )
+    sim.load_from_checkpoint(self._envelope_of(directory)['simulation_state'])
+    return sim, director
+
+  def test_public_neighbor_response_flows_end_to_end(self):
+    config = self._neighbor_config()
+    stub = testing_stubs.PromptStubModel(
+        action_intents={'周律师': self._INTENT},
+        action_result=self._RESPONSE,
+        stage_directions='',
+        scoring_answer='5',
+        repetition_answer='Yes',
+        push_events=self._KNOCK,
+        push_merged='',
+    )
+    result = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(result.reason, 'step_limit')
+    self.assertEqual(result.committed_turn_id, 4)
+    records = self.turn_log().load()
+    self.assertNotIn(self._KNOCK, records[0]['resolved_event'])
+    self.assertIn(self._KNOCK, records[1]['resolved_event'])
+    self.assertTrue(
+        records[1]['director_diagnostics']['repetition']['executed']
+    )
+    # 恰一次核心裁决。既验证规则 JSON 数据，也解码历史数据区，
+    # 确认第 2 回合已提交事件是本次回应的事实来源。
+    adjudications = _prompts_routed_to(stub, _ATTEMPT_QUESTION)
+    self.assertEqual(len(adjudications), 1)
+    self.assertIn('隔壁邻居', adjudications[0])
+    self.assertIn('白名单敲门事件合法登场', adjudications[0])
+    self.assertIn('不披露屋内秘密', adjudications[0])
+    self.assertIn(self._NPC_RULES_DATA_MARK, adjudications[0])
+    self.assertIn(
+        json.dumps(
+            config['gm_params']['npc_response_rules'], ensure_ascii=False
+        ),
+        adjudications[0],
+    )
+    history_section = adjudications[0].split('## Public history (data)\n', 1)[1]
+    history, _ = json.JSONDecoder().raw_decode(history_section.lstrip())
+    self.assertIsInstance(history, str)
+    self.assertIn(self._KNOCK, history)
+    # 核心结果原样贯通 evidence、提交事件、下一玩家观察、JSONL、
+    # checkpoint、FDX（变异契约：改 _RESPONSE 文本则事件随之变化）。
+    lawyer = records[2]
+    core_result = f'{self._INTENT} Because of that, {self._RESPONSE}'
+    self.assertEqual(lawyer['stage_directions'], core_result)
+    self.assertIn('随后按告知离开', lawyer['resolved_event'])
+    # 下一玩家（王婶）在实际 action prompt 中观察到公开回应。
+    wang_prompts = _exercise_prompts_of(stub, '王婶')
+    self.assertEqual(len(wang_prompts), 1)
+    self.assertIn('随后按告知离开', wang_prompts[0])
+    # 恢复后的 director 状态与玩家记忆携带该公开事实。
+    sim_after, director_after = self.restored(config)
+    recent = cast('list[str]', director_after.get_state()['recent_events'])
+    self.assertTrue(any('随后按告知离开' in e for e in recent))
+    self.assertIn('随后按告知离开', _entity_memory_text(sim_after, '王婶'))
+    self.assertIn('随后按告知离开', self.read_script('script.txt'))
+    self.assertEqual(
+        _fdx_paragraphs(self.state_dir, 'Action'),
+        [records[1]['stage_directions'], core_result],
+    )
+    # 无新增独立 NPC 调用：空规则对照仍发生同一次合法敲门，但
+    # 核心只返回律师自己的告知，不生成任何 NPC 回应。
+    control_config = self._neighbor_config()
+    control_config['story']['npc_response_rules'] = []
+    control_config['gm_params']['npc_response_rules'] = []
+    control_stub = testing_stubs.PromptStubModel(
+        action_intents={'周律师': self._INTENT},
+        action_result='周律师完成了自己的隔门告知。',
+        stage_directions='',
+        scoring_answer='5',
+        repetition_answer='Yes',
+        push_events=self._KNOCK,
+        push_merged='',
+    )
+    control_dir = os.path.join(self._tmp.name, 'without-npc-rules')
+    control = self._run_with_stub(control_dir, control_config, control_stub)
+    self.assertEqual(control.reason, 'step_limit')
+    self.assertEqual(control.committed_turn_id, 4)
+    self.assertEqual(len(stub.text_prompts), len(control_stub.text_prompts))
+    self.assertEqual(len(stub.choice_prompts), len(control_stub.choice_prompts))
+    self.assertEqual(
+        len(_prompts_routed_to(control_stub, _ATTEMPT_QUESTION)), 1
+    )
+
+  def _rejected_candidate_run(
+      self,
+      slug: str,
+      *,
+      config: dict[str, Any],
+      intent: str,
+      core_answer: str,
+      reason: str,
+      with_knock: bool,
+  ) -> tuple[str, run_lib.RunResult, '_ScriptedReviewStub']:
+    """Runs one illegal-candidate fixture with a turn-three rejection.
+
+    The first two reviews approve; only the lawyer's third-turn review
+    rejects, so any frozen state is attributable to the candidate.
+
+    Args:
+      slug: directory slug of the candidate.
+      config: the run config (with or without the knock pipeline).
+      intent: the lawyer's action intent for the candidate.
+      core_answer: the illegal raw adjudication answer.
+      reason: the scripted reviewer's rejection reason.
+      with_knock: whether the neighbor legally enters on turn two.
+
+    Returns:
+      The state directory, run result and the recorded stub.
+    """
+    stub_kwargs: dict[str, Any] = dict(
+        action_intents={'周律师': intent},
+        action_result=core_answer,
+        stage_directions='',
+    )
+    if with_knock:
+      stub_kwargs.update(
+          scoring_answer='5',
+          repetition_answer='Yes',
+          push_events=self._KNOCK,
+          push_merged='',
+      )
+    stub = _ScriptedReviewStub(
+        review_script=(
+            self._APPROVE,
+            self._APPROVE,
+            json.dumps({'valid': False, 'reason': reason}, ensure_ascii=False),
+        ),
+        **stub_kwargs,
+    )
+    directory = os.path.join(self._tmp.name, f'reject-{slug}')
+    return directory, self._run_with_stub(directory, config, stub), stub
+
+  def test_review_rejection_of_illegal_candidates_commits_nothing(self):
+    # 设计 10.1-4：非法候选（邻居未登场、仅准备告知、替另一玩家
+    # 配合、私密内容全员广播，以及规则为空/没有适用规则）
+    # 注入 reviewer 拒绝后不提交、不投递、不消费。逐候选 subTest：
+    # 前两轮 reviewer 批准，只在律师第 3 轮拒绝；预期 checkpoint
+    # 停在 2，不是 0。相对失败前状态证明本步未新增投递、提交或
+    # 消费；已经提交的第 2 轮合法敲门不会因此回滚。对私密限制
+    # 另加的“不得虚构对方沉默、拒绝、挂断或身份核验失败”是提示
+    # 语义要求，此处只验证 scripted rejection 边界。未登场反例用
+    # _action_config，禁止暗中给它补登场历史。
+    empty_rules = self._neighbor_config()
+    empty_rules['story']['npc_response_rules'] = []
+    empty_rules['gm_params']['npc_response_rules'] = []
+    cases = (
+        # 邻居从未登场却回应（无敲门历史，规则在场也不适用）。
+        (
+            'never-entered',
+            self._action_config(),
+            '周律师走到门边，隔门请邻居帮忙照看院子。',
+            '邻居在门外应声答应帮忙照看院子，还主动说出他听到的屋内争执内容。'
+            + self._REJECT_MARK,
+            'Neighbor responded without ever legally entering the story',
+            False,
+        ),
+        # 仅“准备告知”就被当作已经说出，邻居按告知作出反应。
+        (
+            'preparation-only',
+            self._neighbor_config(),
+            '周律师准备走到门边，隔门告知邻居今晚家事暂不需要帮助。',
+            self._RESPONSE + self._REJECT_MARK,
+            'A mere preparation to tell was treated as already announced',
+            True,
+        ),
+        # 邻居的回应替陈默和林雪作出了配合与承诺。
+        (
+            'player-compliance',
+            self._neighbor_config(),
+            self._INTENT,
+            '邻居高声替陈默答应了和解安排，林雪也当场认下了这个安排。'
+            + self._REJECT_MARK,
+            'Invented 陈默 and 林雪 agreement through the NPC response',
+            True,
+        ),
+        # 私密内容：门外来电者的答复被标记为仅律师一人听见。
+        (
+            'private-reply',
+            self._neighbor_config(),
+            '周律师拨打遗产登记处的电话，询问遗嘱备案的登记情况。',
+            '来电者压低声音答复了备案的细节，仅律师听见：备案记录被人改动过。'
+            + self._REJECT_MARK,
+            'A far-side reply was marked as heard by 周律师 only',
+            True,
+        ),
+        # 空规则：不能以“有限回应/拒绝”为由生成任何回应。
+        (
+            'empty-rules',
+            empty_rules,
+            self._INTENT,
+            self._RESPONSE + self._REJECT_MARK,
+            'NPC response generated although npc_response_rules is empty',
+            True,
+        ),
+        # 规则在场但触发条件不匹配：作证请求不在该规则的授权内。
+        (
+            'no-applicable-rule',
+            self._neighbor_config(),
+            '周律师隔门请邻居作证，说明他今晚听到的争执经过。',
+            '邻居公开作了证，逐句复述他听到的屋内争执内容。'
+            + self._REJECT_MARK,
+            'No applicable NPC response rule authorizes this response',
+            True,
+        ),
+    )
+    for slug, config, intent, answer, reason, with_knock in cases:
+      with self.subTest(candidate=slug):
+        directory, result, stub = self._rejected_candidate_run(
+            slug,
+            config=config,
+            intent=intent,
+            core_answer=answer,
+            reason=reason,
+            with_knock=with_knock,
+        )
+        self.assertEqual(result.reason, 'error')
+        self.assertIn(reason, result.error_message or '')
+        self.assertEqual(result.committed_turn_id, 2)
+        records = self._records_of(directory)
+        self.assertEqual([r['turn_id'] for r in records], [1, 2])
+        self.assertEqual(self._envelope_of(directory)['committed_turn_id'], 2)
+        # 拒绝评的正是携带非法原始结果的证据；之后无任何投递。
+        reviews = _prompts_containing(stub, _REVIEW_MARK)
+        self.assertEqual(len(reviews), 3)
+        evidence = testing_stubs.read_evidence_section(reviews[2])
+        assert evidence is not None
+        self.assertIn(self._REJECT_MARK, evidence['action_result'])
+        sim, director = self._restored_from(directory, config)
+        for name in ('林雪', '陈默', '周律师', '王婶'):
+          self.assertNotIn(self._REJECT_MARK, _entity_memory_text(sim, name))
+        with open(
+            os.path.join(directory, 'script.fdx'), encoding='utf-8'
+        ) as handle:
+          self.assertNotIn(self._REJECT_MARK, handle.read())
+        self.assertNotIn(
+            self._REJECT_MARK,
+            '\n'.join(_fdx_paragraphs(directory, 'Action')),
+        )
+        # 指令与干预未被消费；已提交的合法敲门不回滚。
+        state = director.get_state()
+        self.assertIsNone(state['directive'])
+        if with_knock:
+          self.assertIn(self._KNOCK, records[1]['resolved_event'])
+          self.assertEqual(state['repetition_check_count'], 1)
+          self.assertEqual(state['repetition_execution_count'], 1)
+          self.assertEqual(state['last_directive_executed_turn'], 2)
+          self.assertEqual(
+              state['last_intervention'],
+              {'turn_id': 2, 'reason': 'repetition'},
+          )
+        else:
+          self.assertEqual(state['repetition_check_count'], 0)
+          self.assertEqual(state['repetition_execution_count'], 0)
+          self.assertIsNone(state['last_intervention'])
+          self.assertIsNone(state['last_directive_executed_turn'])
+
+  def test_npc_response_is_not_a_director_intervention(self):
+    # 设计 7.2/10.1-7：公开 NPC 直接回应不产生 director 干预记录；
+    # 第 2 轮敲门确有一次已执行干预；第 3 轮律师回应的
+    # director_diagnostics.intervention 为 None，且不因回应新增
+    # 执行计数或刷新最后执行回合。第 3/4 轮没有第二次干预，
+    # 不错误要求整个运行的干预总数为 0。
+    config = self._neighbor_config()
+    stub = testing_stubs.PromptStubModel(
+        action_intents={'周律师': self._INTENT},
+        action_result=self._RESPONSE,
+        stage_directions='',
+        scoring_answer='5',
+        repetition_answer='Yes',
+        push_events=self._KNOCK,
+        push_merged='',
+    )
+    result = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(result.reason, 'step_limit')
+    self.assertEqual(result.committed_turn_id, 4)
+    records = self.turn_log().load()
+    knock = records[1]['director_diagnostics']
+    self.assertEqual(knock['intervention']['reason'], 'repetition')
+    self.assertTrue(knock['repetition']['executed'])
+    response = records[2]['director_diagnostics']
+    self.assertIsNone(response['intervention'])
+    self.assertIsNone(response['repetition'])
+    self.assertEqual(response['last_executed_turn'], 2)
+    self.assertEqual(
+        response['last_intervention'], {'turn_id': 2, 'reason': 'repetition'}
+    )
+    # 第 4 轮在共享冷却内，也没有第二次干预或重复登场。
+    fourth = records[3]['director_diagnostics']
+    self.assertIsNone(fourth['intervention'])
+    self.assertIsNone(fourth['repetition'])
+    self.assertEqual(
+        '\n'.join(_fdx_paragraphs(self.state_dir, 'Action')).count(self._KNOCK),
+        1,
+    )
+    _, director = self.restored(config)
+    state = director.get_state()
+    self.assertEqual(state['repetition_check_count'], 1)
+    self.assertEqual(state['repetition_execution_count'], 1)
+    self.assertEqual(state['last_directive_executed_turn'], 2)
+    self.assertEqual(
+        state['last_intervention'], {'turn_id': 2, 'reason': 'repetition'}
+    )
+    self.assertIsNone(state['directive'])
+
+
 class ActionChainBudgetTest(_ActionChainTestCase):
   """Budget paths of the adjudicated chain (spec section 11.3).
 
   Model-call pattern per story turn in the sequential engine: three
   perception questions plus the contract exercise (four entity text
   calls), then — for a turn with an action intent — one adjudication
-  text call, the final dual-track generation and its semantic review;
+  text call, the final stage-directions generation and its semantic review;
   one extra choice attempt whenever the beat-completion question is
   asked. Fixtures position exhaustion by the total attempt limit.
   """
@@ -2657,7 +3285,7 @@ class ActionChainBudgetTest(_ActionChainTestCase):
 
   def test_exhaustion_at_final_generation_of_step_two(self):
     # Limit 12 lets step two's adjudication through (the 12th attempt)
-    # and blocks the final dual-track generation.
+    # and blocks the final stage-directions generation.
     config = self._intent_config(limit=12)
     result, stub = self._run_budget(self.state_dir, config)
     self.assertEqual(result.reason, 'budget_limit')
@@ -2667,7 +3295,7 @@ class ActionChainBudgetTest(_ActionChainTestCase):
     # The adjudicated result of the blocked turn exists in the document
     # trace but is never committed: no second final draft or review.
     self.assertEqual(len(_prompts_routed_to(stub, _ATTEMPT_QUESTION)), 2)
-    self.assertEqual(len(_prompts_routed_to(stub, _DUAL_TRACK_MARK)), 1)
+    self.assertEqual(len(_prompts_routed_to(stub, _FINAL_OUTPUT_MARK)), 1)
     self.assertEqual(len(_prompts_containing(stub, _REVIEW_MARK)), 1)
 
   def test_exhaustion_at_semantic_review_of_step_two(self):
@@ -2679,7 +3307,7 @@ class ActionChainBudgetTest(_ActionChainTestCase):
     self.assertEqual(result.committed_turn_id, 1)
     self.assertEqual([r['turn_id'] for r in self.turn_log().load()], [1])
     self.assertEqual(result.used_model_attempts, 13)
-    self.assertEqual(len(_prompts_routed_to(stub, _DUAL_TRACK_MARK)), 2)
+    self.assertEqual(len(_prompts_routed_to(stub, _FINAL_OUTPUT_MARK)), 2)
     self.assertEqual(len(_prompts_containing(stub, _REVIEW_MARK)), 1)
     self.assertEqual(self.envelope()['used_model_attempts'], 7)
 
@@ -2765,6 +3393,970 @@ class ActionChainBudgetTest(_ActionChainTestCase):
     self.assertTrue(records[1]['budget_stopped'])
     self.assertEqual(self.envelope()['committed_turn_id'], 2)
     self.assertEqual(result.used_model_attempts, 15)
+
+
+class ActionAuthorizationBoundaryTest(_ActionChainTestCase):
+  """Pending-review adjudication outcomes and the commit boundary.
+
+  Scripted stub verdicts prove the plumbing — what reaches the review,
+  what a rejection freezes, which traces are archived — never that a
+  real model detects the violation (design sections 4.3, 8 and 9.1).
+  """
+
+  _INTENT = '林雪取下堂屋条案上的旧花瓶。'
+  _LEGAL_ANSWER = '花瓶被取下，完好无损。'
+  _LEGAL_RAW = f'{_INTENT} Because of that, {_LEGAL_ANSWER}'
+  _SECOND_INTENT = '陈默走到堂屋门边停下。'
+  _ILLEGAL_SENTENCE = '花瓶碎裂，露出烧灼纸灰残片。'
+  _ILLEGAL_RAW = f'{_SECOND_INTENT} Because of that, {_ILLEGAL_SENTENCE}'
+  _REJECT = json.dumps({
+      'valid': False,
+      'reason': 'The adjudicated outcome fabricated paper ash.',
+  })
+  _APPROVE = '{"valid": true, "reason": "scripted approval"}'
+
+  class _TwoTurnStub(testing_stubs.PromptStubModel):
+    """Legal first adjudication and review; illegal second raw outcome."""
+
+    def __init__(self, **kwargs):
+      super().__init__(
+          action_intents={
+              '林雪': ActionAuthorizationBoundaryTest._INTENT,
+              '陈默': ActionAuthorizationBoundaryTest._SECOND_INTENT,
+          },
+          stage_directions='',
+          **kwargs,
+      )
+      self._attempt_answers = 0
+
+    def _route_text(self, prompt):
+      block = _last_question_block(prompt)
+      if _ATTEMPT_QUESTION in block:
+        self._attempt_answers += 1
+        if self._attempt_answers == 1:
+          return ActionAuthorizationBoundaryTest._LEGAL_ANSWER
+        return ActionAuthorizationBoundaryTest._ILLEGAL_SENTENCE
+      if '# Story resolution semantic review' in prompt:
+        if self._attempt_answers > 1:
+          return ActionAuthorizationBoundaryTest._REJECT
+      return super()._route_text(prompt)
+
+  def test_illegal_raw_result_rejected_even_when_stage_omits_it(self):
+    # F11/F12 end to end (design 9.1): turn 1's legal outcome commits
+    # and flows through every export; turn 2's raw adjudicated outcome
+    # fabricates paper ash, the stage directions delete the bad
+    # sentence, and the scripted review still rejects the whole turn —
+    # the turn stops at the last commit with directives and cooldown
+    # untouched (design 8.7).
+    config = self._action_config(total_turn_limit=2)
+    stub = self._TwoTurnStub(
+        review_response=self._APPROVE,
+        stage_omissions=(self._ILLEGAL_SENTENCE,),
+    )
+    result = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(result.reason, 'error')
+    self.assertIn('fabricated paper ash', result.error_message or '')
+    self.assertEqual(result.committed_turn_id, 1)
+    records = self.turn_log().load()
+    self.assertEqual([r['turn_id'] for r in records], [1])
+    self.assertEqual(self.envelope()['committed_turn_id'], 1)
+    # Turn 1's approved outcome flowed through canonical event, JSONL,
+    # checkpoint and FDX; the illegal candidate reached none of them.
+    self.assertIn('花瓶被取下', records[0]['resolved_event'])
+    self.assertEqual(
+        _fdx_paragraphs(self.state_dir, 'Action')[-1], self._LEGAL_RAW
+    )
+    self.assertNotIn('纸灰', self.read_script('script.fdx'))
+    sim, director = self.restored(config)
+    self.assertNotIn('纸灰', _entity_memory_text(sim, '王婶'))
+    state = director.get_state()
+    self.assertIsNone(state['directive'])
+    self.assertIsNone(state['last_directive_executed_turn'])
+    self.assertEqual(state['repetition_check_count'], 0)
+    # The second review judged the evidence carrying the illegal raw
+    # result — the core question ran once per action turn, exactly.
+    reviews = _prompts_containing(stub, _REVIEW_MARK)
+    self.assertEqual(len(reviews), 2)
+    self.assertEqual(len(_prompts_routed_to(stub, _ATTEMPT_QUESTION)), 2)
+    second_evidence = testing_stubs.read_evidence_section(reviews[1])
+    assert second_evidence is not None
+    self.assertEqual(second_evidence['action_result'], self._ILLEGAL_RAW)
+    self.assertIn('纸灰', second_evidence['action_result'])
+
+  def test_normal_action_turn_call_counts_are_unchanged(self):
+    # Design 8.8: a normal non-empty action turn costs one core
+    # adjudication, one final generation and one independent review —
+    # the rewiring added no calls. Budget assertions align on call
+    # positions, not legacy global hard-coded totals.
+    config = self._action_config(total_turn_limit=2)
+    # A separate always-legal stub: do not reuse the fixture whose
+    # second outcome and second review deliberately reject the turn.
+    stub = testing_stubs.PromptStubModel(
+        action_intents={
+            '林雪': self._INTENT,
+            '陈默': self._SECOND_INTENT,
+        },
+        action_result='当前角色完成了自己提出的动作，没有额外事件。',
+        stage_directions='',
+        review_response=self._APPROVE,
+    )
+    result = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(result.reason, 'step_limit')
+    self.assertEqual(result.committed_turn_id, 2)
+    self.assertEqual(len(_prompts_routed_to(stub, _ATTEMPT_QUESTION)), 2)
+    self.assertEqual(len(_prompts_routed_to(stub, _FINAL_OUTPUT_MARK)), 2)
+    self.assertEqual(len(_prompts_containing(stub, _REVIEW_MARK)), 2)
+    total_calls = len(stub.text_prompts) + len(stub.choice_prompts)
+    self.assertEqual(result.used_model_attempts, total_calls)
+    self.assertEqual(self.envelope()['used_model_attempts'], total_calls)
+
+  def test_budget_error_at_core_archives_partial_trace_path_a(self):
+    # Design 8.6/8.8: exhaustion at the core question leaves a partial
+    # `action_adjudication` trace in the private archive, no fabricated
+    # result, path A (nothing commits), and the failed call's
+    # consumption survives in the usage sidecar. A budget-exhausted
+    # directory must refuse resume under the existing runner contract.
+    class _BudgetAtCore(testing_stubs.PromptStubModel):
+
+      def _route_text(self, prompt):
+        if _ATTEMPT_QUESTION in _last_question_block(prompt):
+          raise budget_wrapper.BudgetExhaustedError(
+              'budget spent at adjudication'
+          )
+        return super()._route_text(prompt)
+
+    config = self._action_config(total_turn_limit=2)
+    stub = _BudgetAtCore(
+        action_intents={'林雪': self._INTENT}, stage_directions=''
+    )
+    result = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(result.reason, 'budget_limit')
+    self.assertTrue(result.budget_exhausted)
+    self.assertEqual(result.committed_turn_id, 0)
+    self.assertEqual(self.turn_log().load(), [])
+    self.assertGreaterEqual(result.used_model_attempts, 1)
+    self.assertEqual(self.envelope()['used_model_attempts'], 0)
+    usage = json.loads(
+        pathlib.Path(self.state_dir, 'process_usage.json').read_text(
+            encoding='utf-8'
+        )
+    )
+    self.assertGreaterEqual(usage['used_model_attempts'], 1)
+    summary = json.loads(
+        sorted(
+            pathlib.Path(self.state_dir, 'process_summaries').glob('*.json')
+        )[-1].read_text(encoding='utf-8')
+    )
+    uncommitted = summary['uncommitted_resolution']
+    assert uncommitted is not None
+    self.assertEqual(uncommitted['stage'], 'action_adjudication')
+    self.assertIn('BudgetExhaustedError', uncommitted['error'])
+    self.assertNotIn('花瓶', self.read_script('script.fdx'))
+    # Do not turn a budget stop into a resumable API error or reset its
+    # budget. Resume refusal precedes even building the next model.
+    good = testing_stubs.PromptStubModel(
+        action_intents={'林雪': self._INTENT},
+        action_result=self._LEGAL_ANSWER,
+        stage_directions='',
+    )
+    with mock.patch.object(
+        run_lib, 'make_language_model', return_value=(good, ())
+    ) as factory:
+      with self.assertRaisesRegex(ValueError, 'budget-exhausted'):
+        run_lib.run(self.state_dir, run_config=config, resume=True)
+    factory.assert_not_called()
+
+  def test_api_error_at_core_preserves_usage_on_resume(self):
+    # A non-budget API error is resumable. Its failed call remains in
+    # the sidecar and the next invocation's initial cumulative usage.
+    class _APIAtCore(testing_stubs.PromptStubModel):
+
+      def _route_text(self, prompt):
+        if _ATTEMPT_QUESTION in _last_question_block(prompt):
+          raise testing_stubs.TransientAPIError('provider failed at core')
+        return super()._route_text(prompt)
+
+    config = self._action_config(total_turn_limit=2)
+    stub = _APIAtCore(
+        action_intents={'林雪': self._INTENT}, stage_directions=''
+    )
+    first = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(first.reason, 'error')
+    self.assertFalse(first.budget_exhausted)
+    self.assertEqual(first.committed_turn_id, 0)
+    self.assertEqual(len(_prompts_routed_to(stub, _ATTEMPT_QUESTION)), 1)
+    self.assertEqual(self.envelope()['used_model_attempts'], 0)
+    usage = json.loads(
+        pathlib.Path(self.state_dir, 'process_usage.json').read_text(
+            encoding='utf-8'
+        )
+    )
+    self.assertEqual(usage['used_model_attempts'], first.used_model_attempts)
+    self.assertGreater(first.used_model_attempts, 0)
+    good = testing_stubs.PromptStubModel(
+        action_intents={'林雪': self._INTENT},
+        action_result=self._LEGAL_ANSWER,
+        stage_directions='',
+    )
+    with mock.patch.object(
+        run_lib, 'make_language_model', return_value=(good, ())
+    ):
+      second = run_lib.run(self.state_dir, run_config=config, resume=True)
+    self.assertEqual(second.reason, 'step_limit')
+    self.assertEqual(second.committed_turn_id, 2)
+    last_summary = json.loads(
+        sorted(
+            pathlib.Path(self.state_dir, 'process_summaries').glob('*.json')
+        )[-1].read_text(encoding='utf-8')
+    )
+    self.assertEqual(
+        last_summary['used_model_attempts_at_start'], first.used_model_attempts
+    )
+
+  def test_success_trace_and_review_failure_trace_coexist(self):
+    # Design 8.6: the successful adjudication trace and the later
+    # review-failure trace stay side by side in the private history,
+    # the latest stage reflecting the true failure position.
+    config = self._action_config(total_turn_limit=1)
+    stub = testing_stubs.PromptStubModel(
+        action_intents={'林雪': self._INTENT},
+        action_result=self._LEGAL_ANSWER,
+        stage_directions='',
+        review_response=self._REJECT,
+    )
+    result = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(result.reason, 'error')
+    self.assertEqual(result.committed_turn_id, 0)
+    summary = json.loads(
+        sorted(
+            pathlib.Path(self.state_dir, 'process_summaries').glob('*.json')
+        )[-1].read_text(encoding='utf-8')
+    )
+    uncommitted = summary['uncommitted_resolution']
+    assert uncommitted is not None
+    self.assertEqual(
+        [record['stage'] for record in uncommitted['history']],
+        ['action_adjudication', 'semantic_review'],
+    )
+    self.assertIsNone(uncommitted['history'][0]['error'])
+    self.assertIsNotNone(uncommitted['history'][-1]['error'])
+    self.assertIn('花瓶被取下', uncommitted['action_result'])
+    # Private diagnostics never reach the players or the script.
+    self.assertNotIn('action_adjudication', self.read_script('script.fdx'))
+
+
+# A whitelisted environmental event of the example story: a legal new
+# fact the repetition push may introduce (task-12 pipeline tests).
+_PUSH_EVENT = '邮差冒雨敲门，送来一封老人生前寄出的旧信'
+
+# Fingerprints of the core repetition helper's questions.
+_REPETITION_QUESTION = (
+    'Is the story traced out by the above list of events repetitive?'
+)
+_PUSH_SUGGEST_QUESTION = 'Suggest five plausible events'
+_PUSH_MERGE_QUESTION = 'How does 2 modify'
+_COMPLICATION_QUESTION = 'Suggest five plausible in-story complications'
+
+
+def _last_choice_block(prompt: str) -> str:
+  """Returns the prompt from its last choice-question block on."""
+  start = prompt.rfind('Question: ')
+  return prompt[start:] if start >= 0 else ''
+
+
+class RepetitionPipelineIntegrationTest(_StateDirTestCase):
+  """The repetition intervention wired through the real run pipeline.
+
+  All runs use the director mode with scoring every turn and the
+  example story's environment whitelist; the stub answers the real core
+  repetition questions, and the fixed approving review exercises the
+  plumbing (never real semantic judgment). The propagation tests set
+  `stage_directions=''` so no preset narration can masquerade as the
+  intervention.
+  """
+
+  def _director_config(
+      self,
+      *,
+      total_turn_limit: int = 4,
+      total_model_attempt_limit: int = 100,
+      repetition_check_interval: int = 3,
+      beats=None,
+      action_mode: str = 'speech_only',
+      prompt_stub: dict[str, Any] | None = None,
+      scene_rounds: int | None = 99,
+  ) -> dict[str, Any]:
+    config = _fixture_config(
+        total_turn_limit=total_turn_limit,
+        total_model_attempt_limit=total_model_attempt_limit,
+        beats=beats or (_beat('b1', max_turns=99),),
+        completion_answers={},
+        scene_rounds=scene_rounds,
+        prompt_stub=prompt_stub,
+        action_mode=action_mode,
+    )
+    config['mode'] = 'director'
+    story = story_config.make_example_config()
+    config['director_params'] = {
+        'eval_interval': 1,
+        'scoring_window': 8,
+        'tolerance': 1,
+        'feedback_enabled': True,
+        'cooldown_turns': 3,
+        'allowed_environment_events': list(story.allowed_environment_events),
+        'immutable_facts': list(story.immutable_facts),
+        'repetition_push_enabled': True,
+        'repetition_check_interval': repetition_check_interval,
+    }
+    return config
+
+  def _run_with_stub(self, directory: str, config, stub):
+    with mock.patch.object(
+        run_lib, 'make_language_model', return_value=(stub, ())
+    ):
+      return run_lib.run(directory, run_config=config)
+
+  def _restored_from(
+      self, directory: str, run_config: dict[str, Any]
+  ) -> drama_director.DramaDirector:
+    """Rebuilds the director of the checkpoint saved in ``directory``."""
+    sim, director, _, _ = run_lib.build_simulation(
+        run_config=run_config,
+        model=testing_stubs.PromptStubModel(),
+        embedder=_embedder,
+    )
+    with open(
+        os.path.join(directory, 'checkpoint.json'), encoding='utf-8'
+    ) as handle:
+      sim.load_from_checkpoint(json.load(handle)['simulation_state'])
+    return director
+
+  def _repetition_choice_prompts(self, stub) -> list[str]:
+    return [
+        p
+        for p in stub.choice_prompts
+        if _REPETITION_QUESTION in _last_choice_block(p)
+    ]
+
+  def test_tension_five_repetition_can_push(self):
+    # Tension sits inside the beat's target range (5 in 3-6, so no
+    # tension directive), the public history repeats the same line, and
+    # turn three satisfies the interval: the core helper really runs,
+    # and the whitelisted environmental fact first appears in turn
+    # three, flowing to the next player's observation and the FDX.
+    config = self._director_config()
+    stub = testing_stubs.PromptStubModel(
+        scoring_answer='5',
+        repetition_answer='Yes',
+        push_events=_PUSH_EVENT,
+        push_merged='',
+        stage_directions='',
+    )
+    result = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(result.reason, 'step_limit')
+    self.assertEqual(result.committed_turn_id, 4)
+    records = self.turn_log().load()
+    self.assertEqual([r['turn_id'] for r in records], [1, 2, 3, 4])
+    # The scoring really happened every turn, and no directive was
+    # generated (score 5 never deviates from (3, 6)).
+    scoring = [p for p in stub.text_prompts if 'Respond with a single' in p]
+    self.assertEqual(len(scoring), 4)
+    self.assertNotIn('Write one short director instruction', ''.join(scoring))
+    _, director = self.restored(config)
+    self.assertIsNone(director.get_state()['directive'])
+    # The core helper ran exactly once, on turn three, conditioned on
+    # the two committed turns (real history, not a stuffed window).
+    repetition_prompts = self._repetition_choice_prompts(stub)
+    self.assertEqual(len(repetition_prompts), 1)
+    self.assertIn('- 林雪: 这宅子的事，急不得。', repetition_prompts[0])
+    self.assertIn('not yet committed', repetition_prompts[0])
+    self.assertEqual(len(_prompts_routed_to(stub, _PUSH_SUGGEST_QUESTION)), 1)
+    self.assertEqual(len(_prompts_routed_to(stub, _PUSH_MERGE_QUESTION)), 1)
+    # The new environmental fact first appears in turn three's
+    # committed record and nowhere earlier.
+    for record in records[:2]:
+      self.assertNotIn(_PUSH_EVENT, record['resolved_event'])
+      self.assertNotIn(_PUSH_EVENT, record['stage_directions'])
+    self.assertIn(_PUSH_EVENT, records[2]['stage_directions'])
+    self.assertIn(_PUSH_EVENT, records[2]['resolved_event'])
+    # Review note 2: the stub extracts only the candidate's new fact, so
+    # the narrator track never repeats the turn's dialogue and the
+    # canonical event carries it exactly once.
+    self.assertNotIn('这宅子的事，急不得。', records[2]['stage_directions'])
+    self.assertEqual(
+        records[2]['resolved_event'].count('周律师: 这宅子的事，急不得。'), 1
+    )
+    diagnostics = records[2]['director_diagnostics']
+    self.assertEqual(
+        diagnostics['repetition'],
+        {
+            'reason': 'repetition',
+            'checked': True,
+            'attempted': True,
+            'proposed_change': True,
+            'executed': True,
+        },
+    )
+    self.assertEqual(diagnostics['intervention']['reason'], 'repetition')
+    self.assertIn(_PUSH_EVENT, diagnostics['intervention']['candidate_after'])
+    # The same evidence reached turn three's final generation and review.
+    finals = _prompts_routed_to(stub, _FINAL_OUTPUT_MARK)
+    reviews = _prompts_containing(stub, _REVIEW_MARK)
+    for prompt in (finals[2], reviews[2]):
+      evidence = testing_stubs.read_evidence_section(prompt)
+      assert evidence is not None
+      self.assertEqual(evidence['intervention']['reason'], 'repetition')
+      self.assertIn(_PUSH_EVENT, evidence['intervention']['candidate_after'])
+    # The next player observed the new fact in their real action prompt.
+    self.assertIn(_PUSH_EVENT, _exercise_prompts_of(stub, '王婶')[0])
+    # And the export carries it in exactly one Action paragraph.
+    actions = _fdx_paragraphs(self.state_dir, 'Action')
+    self.assertEqual(actions.count(actions[0]), 1)
+    self.assertIn(_PUSH_EVENT, actions[0])
+    # The execution is committed once with the shared baseline.
+    _, director = self.restored(config)
+    state = director.get_state()
+    self.assertEqual(state['repetition_check_count'], 1)
+    self.assertEqual(state['repetition_execution_count'], 1)
+    self.assertEqual(
+        state['last_intervention'], {'turn_id': 3, 'reason': 'repetition'}
+    )
+    self.assertEqual(state['last_directive_executed_turn'], 3)
+
+  def test_fresh_progress_does_not_force_push(self):
+    # The stub's core judgment says the story is NOT repetitive (recent
+    # turns carry new facts and effective responses): the check is
+    # recorded, nothing executes and no execution cooldown starts.
+    config = self._director_config()
+    stub = testing_stubs.PromptStubModel(
+        scoring_answer='5',
+        repetition_answer='No',
+        stage_directions='',
+    )
+    result = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(result.committed_turn_id, 4)
+    repetition_prompts = self._repetition_choice_prompts(stub)
+    self.assertEqual(len(repetition_prompts), 1)
+    self.assertEqual(_prompts_routed_to(stub, _PUSH_SUGGEST_QUESTION), [])
+    self.assertEqual(_prompts_routed_to(stub, _PUSH_MERGE_QUESTION), [])
+    records = self.turn_log().load()
+    self.assertNotIn(_PUSH_EVENT, records[2]['resolved_event'])
+    self.assertEqual(
+        records[2]['director_diagnostics']['repetition'],
+        {
+            'reason': 'repetition',
+            'checked': True,
+            'attempted': False,
+            'proposed_change': False,
+            'executed': False,
+        },
+    )
+    stages = [
+        record['stage']
+        for record in records[2]['director_diagnostics'][
+            'resolution_diagnostics'
+        ]
+    ]
+    self.assertIn('repetition_check', stages)
+    _, director = self.restored(config)
+    state = director.get_state()
+    self.assertEqual(state['repetition_check_count'], 1)
+    self.assertEqual(state['repetition_execution_count'], 0)
+    self.assertIsNone(state['last_intervention'])
+    self.assertIsNone(state['last_directive_executed_turn'])
+
+  def test_pending_tension_strictly_suppresses_repetition(self):
+    # A deviating score (9 outside 3-6) generates a real pending
+    # directive on turn one; with the interval at one, every turn is a
+    # check turn, yet turn two runs ONLY the tension path: the core
+    # repetition helper is called exactly once (turn one) and the
+    # directive is consumed with the shared counters.
+    config = self._director_config(repetition_check_interval=1)
+    stub = testing_stubs.PromptStubModel(
+        scoring_answer='9',
+        repetition_answer='No',
+        stage_directions='',
+    )
+    # First a one-turn run proves the pending directive really formed.
+    one_turn_dir = os.path.join(self._tmp.name, 'pending-proof')
+    os.makedirs(one_turn_dir, exist_ok=True)
+    one_turn_config = self._director_config(
+        total_turn_limit=1, repetition_check_interval=1
+    )
+    self._run_with_stub(
+        one_turn_dir,
+        one_turn_config,
+        testing_stubs.PromptStubModel(
+            scoring_answer='9', repetition_answer='No', stage_directions=''
+        ),
+    )
+    one_turn_director = self._restored_from(one_turn_dir, one_turn_config)
+    pending = one_turn_director.get_state()['directive']
+    self.assertIsNotNone(pending)
+    self.assertEqual(pending['status'], 'pending')
+
+    result = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(result.committed_turn_id, 4)
+    # One repetition call only (turn one); turns two and three made
+    # zero repetition calls despite the interval of one.
+    self.assertEqual(len(self._repetition_choice_prompts(stub)), 1)
+    # Turn two ran the tension fusion path exactly once.
+    complications = _prompts_routed_to(stub, _COMPLICATION_QUESTION)
+    merges = _prompts_routed_to(stub, 'Chosen complication to weave in')
+    self.assertEqual(len(complications), 1)
+    self.assertEqual(len(merges), 1)
+    records = self.turn_log().load()
+    self.assertEqual(
+        records[1]['director_diagnostics']['intervention']['reason'],
+        'tension',
+    )
+    _, director = self.restored(config)
+    state = director.get_state()
+    self.assertEqual(state['directive']['status'], 'consumed')
+    self.assertEqual(state['directive']['executed_at_turn'], 2)
+    self.assertEqual(
+        state['last_intervention'], {'turn_id': 2, 'reason': 'tension'}
+    )
+    self.assertEqual(state['repetition_check_count'], 1)
+    self.assertEqual(state['repetition_execution_count'], 0)
+
+  def test_dropped_push_is_rejected_without_consumption(self):
+    # The core helper really introduces the new event, the final draft
+    # deliberately omits it, and the reviewer — receiving the full
+    # evidence — rejects: nothing broadcasts, commits or consumes.
+    class DroppingDraft(_ScriptedReviewStub):
+
+      def __init__(self):
+        super().__init__(
+            review_script=(
+                '{"valid": true, "reason": "scripted approval"}',
+                '{"valid": true, "reason": "scripted approval"}',
+                (
+                    '{"valid": false, "reason": "dropped the intervention'
+                    ' candidate"}'
+                ),
+            ),
+            scoring_answer='5',
+            repetition_answer='Yes',
+            push_events=_PUSH_EVENT,
+            push_merged='',
+            stage_directions='',
+        )
+
+      def _stage_directions_output(self, prompt):
+        payload = json.loads(super()._stage_directions_output(prompt))
+        payload['stage_directions'] = '堂内一片沉默。'
+        return json.dumps(payload, ensure_ascii=False)
+
+    config = self._director_config()
+    stub = DroppingDraft()
+    result = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(result.reason, 'error')
+    self.assertIn('dropped the intervention', result.error_message or '')
+    self.assertEqual(result.committed_turn_id, 2)
+    records = self.turn_log().load()
+    self.assertEqual([r['turn_id'] for r in records], [1, 2])
+    # The reviewer received the complete evidence including the
+    # candidate's post-merge text before rejecting.
+    reviews = _prompts_containing(stub, _REVIEW_MARK)
+    self.assertEqual(len(reviews), 3)
+    evidence = testing_stubs.read_evidence_section(reviews[2])
+    assert evidence is not None
+    self.assertIn(_PUSH_EVENT, evidence['intervention']['candidate_after'])
+    # No consumption: the restored state keeps the turn-two boundary.
+    _, director = self.restored(config)
+    state = director.get_state()
+    self.assertEqual(state['repetition_check_count'], 0)
+    self.assertEqual(state['repetition_execution_count'], 0)
+    self.assertIsNone(state['last_intervention'])
+    self.assertIsNone(state['last_directive_executed_turn'])
+    self.assertNotIn(_PUSH_EVENT, self.read_script('script.fdx'))
+    self.assertEqual(self.envelope()['committed_turn_id'], 2)
+
+  def test_rejection_on_turn_three_keeps_two_commits(self):
+    # The review answer is scripted per call: the first two reviews
+    # approve, only the third is invalid JSON. Turns one and two commit
+    # for real; turn three never broadcasts or commits.
+    class ThirdReviewInvalid(testing_stubs.PromptStubModel):
+
+      def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._review_calls = 0
+
+      def _route_text(self, prompt):
+        if '# Story resolution semantic review' in prompt:
+          self._review_calls += 1
+          if self._review_calls >= 3:
+            return 'not valid json'
+          return '{"valid": true, "reason": "scripted approval"}'
+        return super()._route_text(prompt)
+
+    config = self._director_config()
+    stub = ThirdReviewInvalid(
+        scoring_answer='5',
+        repetition_answer='Yes',
+        push_events=_PUSH_EVENT,
+        push_merged='',
+        stage_directions='',
+    )
+    result = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(result.reason, 'error')
+    self.assertEqual(result.committed_turn_id, 2)
+    self.assertEqual([r['turn_id'] for r in self.turn_log().load()], [1, 2])
+    self.assertEqual(self.envelope()['committed_turn_id'], 2)
+    # The first two review answers really approved (their turns
+    # committed); only the third failed.
+    self.assertEqual(stub._review_calls, 3)  # pylint: disable=protected-access
+
+  def test_same_identity_resume_continues_after_targeted_rejection(self):
+    # The first process fails on turn three's review; the resume keeps
+    # the checkpointed model identity (same prompt_stub parameters) and
+    # swaps only the injected fault behavior, never the persisted
+    # prompt_stub configuration.
+    config = self._director_config()
+    fault = _ScriptedReviewStub(
+        review_script=(
+            '{"valid": true, "reason": "ok"}',
+            '{"valid": true, "reason": "ok"}',
+            'not valid json',
+        ),
+        scoring_answer='5',
+        repetition_answer='Yes',
+        push_events=_PUSH_EVENT,
+        push_merged='',
+        stage_directions='',
+    )
+    result = self._run_with_stub(self.state_dir, config, fault)
+    self.assertEqual(result.reason, 'error')
+    self.assertEqual(result.committed_turn_id, 2)
+    healthy = _ScriptedReviewStub(
+        review_script=('{"valid": true, "reason": "resumed approval"}',) * 4,
+        scoring_answer='5',
+        repetition_answer='Yes',
+        push_events=_PUSH_EVENT,
+        push_merged='',
+        stage_directions='',
+    )
+    with mock.patch.object(
+        run_lib, 'make_language_model', return_value=(healthy, ())
+    ) as maker:
+      resumed = run_lib.run(self.state_dir, resume=True, mode='director')
+    self.assertEqual(resumed.reason, 'step_limit')
+    self.assertEqual(resumed.committed_turn_id, 4)
+    self.assertEqual(
+        [r['turn_id'] for r in self.turn_log().load()], [1, 2, 3, 4]
+    )
+    # The checkpointed identity was used unchanged: the persisted
+    # prompt_stub parameters match the original config's.
+    effective = maker.call_args_list[0].args[0]
+    self.assertEqual(
+        effective['prompt_stub'], config['model_config']['prompt_stub']
+    )
+    self.assertEqual(
+        self.envelope()['run_config']['model_config']['prompt_stub'],
+        config['model_config']['prompt_stub'],
+    )
+    # The replayed turn three carried the intervention into the export.
+    self.assertIn(
+        _PUSH_EVENT, '\n'.join(_fdx_paragraphs(self.state_dir, 'Action'))
+    )
+
+  def test_resume_accumulates_usage_of_failed_turn(self):
+    # 第一个进程在第三轮复核失败：失败回合已发生的调用不随剧情
+    # checkpoint 回退（checkpoint 仍停在两轮边界），但续跑必须从真实
+    # 累计消耗恢复预算——汇总按累计口径报告，原上限在跨进程合计意义
+    # 上仍然成立；紧上限下续跑触顶即停，不重获失败回合的额度。
+    def fault_stub():
+      return _ScriptedReviewStub(
+          review_script=(
+              '{"valid": true, "reason": "ok"}',
+              '{"valid": true, "reason": "ok"}',
+              'not valid json',
+          ),
+          scoring_answer='5',
+          repetition_answer='Yes',
+          push_events=_PUSH_EVENT,
+          push_merged='',
+          stage_directions='',
+      )
+
+    def healthy_stub():
+      return _ScriptedReviewStub(
+          review_script=('{"valid": true, "reason": "resumed"}',) * 4,
+          scoring_answer='5',
+          repetition_answer='Yes',
+          push_events=_PUSH_EVENT,
+          push_merged='',
+          stage_directions='',
+      )
+
+    # 宽上限：续跑完成，汇总按真实累计口径报告（首进程的真实消耗 +
+    # 续跑进程的增量），剧情 checkpoint 保持在已提交边界。
+    roomy = os.path.join(self._tmp.name, 'roomy')
+    config = self._director_config(
+        total_turn_limit=4, total_model_attempt_limit=100
+    )
+    first = self._run_with_stub(roomy, config, fault_stub())
+    self.assertEqual(first.reason, 'error')
+    self.assertEqual(first.committed_turn_id, 2)
+    checkpoint_used = self.envelope_of(roomy)['used_model_attempts']
+    self.assertEqual(checkpoint_used, 15)
+    self.assertGreater(first.used_model_attempts, checkpoint_used)
+    with mock.patch.object(
+        run_lib, 'make_language_model', return_value=(healthy_stub(), ())
+    ):
+      resumed = run_lib.run(roomy, resume=True, mode='director')
+    self.assertEqual(resumed.reason, 'step_limit')
+    self.assertEqual(resumed.committed_turn_id, 4)
+    self.assertEqual(
+        resumed.used_model_attempts,
+        first.used_model_attempts + resumed.attempts_used_this_process,
+    )
+
+    # 紧上限：真实累计触顶后，续跑只能用剩余额度并在原上限处停止。
+    tight = os.path.join(self._tmp.name, 'tight')
+    tight_config = self._director_config(
+        total_turn_limit=4,
+        total_model_attempt_limit=first.used_model_attempts + 5,
+    )
+    first_tight = self._run_with_stub(tight, tight_config, fault_stub())
+    self.assertEqual(first_tight.reason, 'error')
+    self.assertEqual(first_tight.committed_turn_id, 2)
+    with mock.patch.object(
+        run_lib, 'make_language_model', return_value=(healthy_stub(), ())
+    ):
+      resumed_tight = run_lib.run(tight, resume=True, mode='director')
+    self.assertEqual(resumed_tight.reason, 'budget_limit')
+    self.assertEqual(resumed_tight.committed_turn_id, 2)
+    self.assertEqual(
+        resumed_tight.used_model_attempts,
+        tight_config['total_model_attempt_limit'],
+    )
+
+  def test_interruption_after_turn_three_resumes_with_original_limit(self):
+    # The first process crashes after turn three's checkpoint commit;
+    # the resume keeps the original limit of six, numbers contiguously
+    # and never replays turn three's intervention.
+    config = self._director_config(total_turn_limit=6)
+    stub = testing_stubs.PromptStubModel(
+        scoring_answer='5',
+        repetition_answer='Yes',
+        push_events=_PUSH_EVENT,
+        push_merged='',
+        stage_directions='',
+    )
+    with mock.patch.object(
+        run_lib, 'make_language_model', return_value=(stub, ())
+    ):
+      with _interrupt_when(3, when='after_commit'):
+        with self.assertRaises(SimulatedInterruption):
+          run_lib.run(self.state_dir, run_config=config)
+    self.assertEqual(self.envelope()['committed_turn_id'], 3)
+    self.assertEqual(self.envelope()['total_turn_limit'], 6)
+    healthy = testing_stubs.PromptStubModel(
+        scoring_answer='5',
+        repetition_answer='Yes',
+        push_events=_PUSH_EVENT,
+        push_merged='',
+        stage_directions='',
+    )
+    with mock.patch.object(
+        run_lib, 'make_language_model', return_value=(healthy, ())
+    ):
+      with _capture_play() as plays:
+        result = run_lib.run(self.state_dir, resume=True, mode='director')
+    self.assertEqual(result.reason, 'step_limit')
+    self.assertEqual(result.committed_turn_id, 6)
+    self.assertEqual(self.envelope()['total_turn_limit'], 6)
+    self.assertEqual(plays[-1]['max_steps'], 3)
+    records = self.turn_log().load()
+    self.assertEqual([r['turn_id'] for r in records], [1, 2, 3, 4, 5, 6])
+    # The resumed process made zero repetition calls: turn six hits the
+    # interval but stays inside the shared cooldown of turn three (the
+    # intervention was not replayed and not repeated).
+    self.assertEqual(self._repetition_choice_prompts(healthy), [])
+    _, director = self.restored(config)
+    state = director.get_state()
+    self.assertEqual(state['repetition_execution_count'], 1)
+    self.assertEqual(
+        state['last_intervention'], {'turn_id': 3, 'reason': 'repetition'}
+    )
+    self.assertEqual(
+        '\n'.join(_fdx_paragraphs(self.state_dir, 'Action')).count(_PUSH_EVENT),
+        1,
+    )
+
+  def test_json_resume_without_action_mode_preserves_contract(self):
+    # A speech-and-action run with the repetition intervention resumes
+    # with the action mode omitted: the JSON contract survives the new
+    # chain and the raw JSON is never treated as dialogue.
+    config = self._director_config(action_mode='speech_and_action')
+    stub = testing_stubs.PromptStubModel(
+        scoring_answer='5',
+        repetition_answer='Yes',
+        push_events=_PUSH_EVENT,
+        push_merged='',
+        stage_directions='',
+    )
+    with mock.patch.object(
+        run_lib, 'make_language_model', return_value=(stub, ())
+    ):
+      with _interrupt_when(2, when='after_commit'):
+        with self.assertRaises(SimulatedInterruption):
+          run_lib.run(self.state_dir, run_config=config)
+    healthy = testing_stubs.PromptStubModel(
+        scoring_answer='5',
+        repetition_answer='Yes',
+        push_events=_PUSH_EVENT,
+        push_merged='',
+        stage_directions='',
+    )
+    with mock.patch.object(
+        run_lib, 'make_language_model', return_value=(healthy, ())
+    ):
+      result = run_lib.run(self.state_dir, resume=True, mode='director')
+    self.assertEqual(result.committed_turn_id, 4)
+    records = self.turn_log().load()
+    self.assertEqual([r['turn_id'] for r in records], [1, 2, 3, 4])
+    for record in records[2:]:
+      speech, intent = story_action.decode_action(record['raw_action'])
+      self.assertEqual(record['speech'], speech)
+      self.assertNotEqual(record['speech'], record['raw_action'])
+    self.assertIn(_PUSH_EVENT, records[2]['stage_directions'])
+    self.assertEqual(self.summary()['action_mode'], 'speech_and_action')
+
+  def test_budget_paths_cover_repetition_calls(self):
+    # Turn costs with scoring every turn and completion from turn two:
+    # turn one 7, turn two 8, turn three 4 entity + repetition choice +
+    # suggestion + merge + final + review + completion + scoring = 10.
+    def budget_config(limit: int) -> dict[str, Any]:
+      return self._director_config(
+          total_turn_limit=4, total_model_attempt_limit=limit
+      )
+
+    def stub() -> testing_stubs.PromptStubModel:
+      return testing_stubs.PromptStubModel(
+          scoring_answer='5',
+          repetition_answer='Yes',
+          push_events=_PUSH_EVENT,
+          push_merged='',
+          stage_directions='',
+      )
+
+    # Path A at the choice position: the blocked 20th attempt is the
+    # repetition judgment of turn three.
+    result = self._run_with_stub(
+        os.path.join(self._tmp.name, 'choice'), budget_config(19), stub()
+    )
+    self.assertEqual(result.reason, 'budget_limit')
+    self.assertEqual(result.committed_turn_id, 2)
+    # Path A at the suggestion position (limit 20) and the merge
+    # position (limit 21): no commit, no consumption.
+    for name, limit in (('suggestion', 20), ('merge', 21)):
+      with self.subTest(position=name):
+        directory = os.path.join(self._tmp.name, name)
+        os.makedirs(directory, exist_ok=True)
+        config = budget_config(limit)
+        result = self._run_with_stub(directory, config, stub())
+        self.assertEqual(result.reason, 'budget_limit')
+        self.assertEqual(result.committed_turn_id, 2)
+        self.assertEqual(
+            [r['turn_id'] for r in self.turn_log_of(directory).load()],
+            [1, 2],
+        )
+        envelope = self.envelope_of(directory)
+        self.assertEqual(envelope['committed_turn_id'], 2)
+        self.assertEqual(envelope['used_model_attempts'], 15)
+        director = self._restored_from(directory, config)
+        state = director.get_state()
+        self.assertEqual(state['repetition_check_count'], 0)
+        self.assertEqual(state['repetition_execution_count'], 0)
+        self.assertIsNone(state['last_intervention'])
+    # Path B: limit 25 covers turn three through its review and blocks
+    # the completion judgment: the approved intervention step commits
+    # exactly once and the checkpoint holds it.
+    path_b = os.path.join(self._tmp.name, 'path-b')
+    os.makedirs(path_b, exist_ok=True)
+    config = budget_config(25)
+    result = self._run_with_stub(path_b, config, stub())
+    self.assertEqual(result.reason, 'budget_limit')
+    self.assertEqual(result.committed_turn_id, 3)
+    records = self.turn_log_of(path_b).load()
+    self.assertEqual([r['turn_id'] for r in records], [1, 2, 3])
+    self.assertTrue(records[2]['budget_stopped'])
+    self.assertTrue(
+        records[2]['director_diagnostics']['repetition']['executed']
+    )
+    self.assertIn(_PUSH_EVENT, records[2]['stage_directions'])
+    envelope = self.envelope_of(path_b)
+    self.assertEqual(envelope['committed_turn_id'], 3)
+    self.assertEqual(envelope['used_model_attempts'], 25)
+    director = self._restored_from(path_b, config)
+    self.assertEqual(director.get_state()['repetition_execution_count'], 1)
+    # The budget-exhausted summary refuses an auto-resume.
+    with self.assertRaises(ValueError):
+      run_lib.run(path_b, resume=True, mode='director')
+
+  def test_resume_does_not_change_model_identity_or_raise_budget(self):
+    config = self._director_config()
+    stub = testing_stubs.PromptStubModel(
+        scoring_answer='5',
+        repetition_answer='Yes',
+        push_events=_PUSH_EVENT,
+        push_merged='',
+        stage_directions='',
+    )
+    with mock.patch.object(
+        run_lib, 'make_language_model', return_value=(stub, ())
+    ):
+      with _interrupt_when(3, when='after_commit'):
+        with self.assertRaises(SimulatedInterruption):
+          run_lib.run(self.state_dir, run_config=config)
+    with self.assertRaises(ValueError):
+      run_lib.run(
+          self.state_dir,
+          resume=True,
+          mode='director',
+          model_config={'api_type': 'stub', 'model_name': 'other-model'},
+      )
+    with self.assertRaises(ValueError):
+      run_lib.run(
+          self.state_dir,
+          resume=True,
+          mode='director',
+          total_model_attempt_limit=999,
+      )
+    with self.assertRaises(ValueError):
+      run_lib.run(
+          self.state_dir, resume=True, mode='director', total_turn_limit=9
+      )
+
+  def turn_log_of(self, directory: str) -> collector.StoryTurnLog:
+    return collector.StoryTurnLog(os.path.join(directory, 'story_turns.jsonl'))
+
+  def envelope_of(self, directory: str) -> dict[str, Any]:
+    with open(
+        os.path.join(directory, 'checkpoint.json'), encoding='utf-8'
+    ) as handle:
+      return json.load(handle)
+
+
+class _ScriptedReviewStub(testing_stubs.PromptStubModel):
+  """Answers semantic reviews from a per-call script."""
+
+  def __init__(self, *, review_script: tuple[str, ...], **kwargs):
+    super().__init__(**kwargs)
+    self._review_script = list(review_script)
+    self._review_calls = 0
+
+  def _route_text(self, prompt):
+    if '# Story resolution semantic review' in prompt:
+      answer = self._review_script[
+          min(self._review_calls, len(self._review_script) - 1)
+      ]
+      self._review_calls += 1
+      return answer
+    return super()._route_text(prompt)
 
 
 if __name__ == '__main__':

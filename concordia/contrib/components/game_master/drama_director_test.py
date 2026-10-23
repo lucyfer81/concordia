@@ -444,6 +444,10 @@ class LifecycleTest(unittest.TestCase):
             'directive_after_turn': None,
             'cooldown_active': False,
             'last_executed_turn': None,
+            'last_intervention': None,
+            'repetition': None,
+            'intervention': None,
+            'resolution_diagnostics': [],
         },
     )
     diagnostics['directive_at_start'] = 'tampered'
@@ -708,6 +712,21 @@ class DirectiveGenerationTest(unittest.TestCase):
         prompt,
     )
 
+  def test_directive_generation_prefers_actionable_progress(self):
+    # A4 (design 7.2): the generation prompt grounds the instruction in
+    # a concrete unresolved problem of the recent public events rather
+    # than novelty stacking of interruptions or verification chores,
+    # while the original player-agency boundary stays verbatim.
+    model = _DirectiveModel(False)
+    director, gm = _make_director(model, **_DIRECTOR_FEEDBACK_PARAMS)
+    _complete_turn(gm, 'one')
+    self.assertEqual(director.get_state()['directive']['status'], 'pending')
+    prompt = next(p for p in model.text_prompts if _DIRECTIVE_MARK in p)
+    self.assertIn('concrete unresolved problem', prompt)
+    self.assertIn('novelty for its own sake', prompt)
+    self.assertIn('verification or registration chore', prompt)
+    self.assertIn('Never make players agree', prompt)
+
   def test_low_score_directive_asks_to_raise_tension(self):
     beat = dataclasses.replace(BEATS[0], tension_range=(6, 8))
     model = _DirectiveModel(False, score='2')
@@ -872,6 +891,510 @@ class DirectiveGenerationTest(unittest.TestCase):
           feedback_enabled=True,
           cooldown_turns=-1,
       )
+
+
+# Long-running beats for the repetition-gate tests: no early completion
+# (min_turns high) and no timeout before the ninth turn.
+_LONG_BEATS = (
+    drama_director.Beat(
+        id='b1',
+        description='setup',
+        tension_range=(1, 3),
+        done_question='Is the evidence revealed?',
+        min_turns=9,
+        max_turns=12,
+    ),
+    drama_director.Beat(
+        id='b2',
+        description='resolution',
+        tension_range=(1, 3),
+        done_question='Is the fallout addressed?',
+        min_turns=9,
+        max_turns=12,
+    ),
+)
+
+# A candidate change the repetition helper could propose on turn three.
+_PUSH_EVENT = '窗外雷声大作，堂屋的烛火被穿堂风扑灭。'
+
+
+class _ScriptedScoreModel(_BeatModel):
+  """Answers each tension-scoring question from a scripted list.
+
+  The unit-test harness resolves turns without model calls, so every
+  `sample_text` call is a scoring question; the answers are consumed in
+  call order (later calls reuse the last scripted score).
+  """
+
+  def __init__(self, completed, scores):
+    super().__init__(completed)
+    self._scores = list(scores)
+    self.text_prompts = []
+
+  def sample_text(self, prompt, **kwargs):
+    del kwargs
+    self.text_prompts.append(prompt)
+    if self._scores:
+      self._last = self._scores.pop(0)
+    return self._last
+
+
+class RepetitionStateTest(unittest.TestCase):
+  """Repetition-intervention gating, state and commit semantics (spec 7.2)."""
+
+  _REPETITION_PARAMS = dict(
+      eval_interval=0,
+      feedback_enabled=True,
+      repetition_push_enabled=True,
+  )
+
+  def _make(self, model=None, beats=_LONG_BEATS, **params):
+    merged = {**self._REPETITION_PARAMS, **params}
+    return _make_director(model or _BeatModel(False), beats=beats, **merged)
+
+  def test_third_turn_gate_uses_two_committed_turns(self):
+    # The check interval counts real committed story turns plus one for
+    # the turn in progress; stuffing the recent-events window is not a
+    # substitute (spec 7.2). With interval three the check turns are
+    # 3, 6, 9...; turns one and two never qualify.
+    director, gm = self._make()
+    for speech, eligible in (('one', False), ('two', False)):
+      gm.observe(f'[putative_event] Alice: {speech}')
+      self.assertFalse(director.should_attempt_repetition_push(), speech)
+      result = gm.act(_RESOLVE_SPEC)
+      gm.observe(f'[event] {result}')
+    self.assertEqual(director.get_state()['story_turn'], 2)
+    gm.observe('[putative_event] Alice: three')
+    self.assertTrue(director.should_attempt_repetition_push())
+    # Every gate precondition is checked against committed switches:
+    # either feedback disabled, repetition disabled, or an interval that
+    # this turn does not satisfy blocks the check.
+    for overrides in (
+        dict(feedback_enabled=False),
+        dict(repetition_push_enabled=False),
+        dict(repetition_check_interval=4),
+    ):
+      with self.subTest(params=overrides):
+        blocked, blocked_gm = self._make(**overrides)
+        blocked_gm.observe('[putative_event] Alice: one')
+        self.assertFalse(blocked.should_attempt_repetition_push())
+    # A stopped story never checks.
+    stopped_director, stopped_gm = self._make()
+    _complete_turn(stopped_gm, 'one')
+    state = stopped_director.get_state()
+    state['beat_timeout'] = True
+    stopped_director.set_state(state)
+    stopped_gm.observe('[putative_event] Alice: two')
+    self.assertFalse(stopped_director.should_attempt_repetition_push())
+
+  def test_no_change_only_commits_check(self):
+    # The core helper returning the candidate unchanged records a check
+    # only: no execution, no shared cooldown, so turn six checks again.
+    director, gm = self._make()
+    for speech in ('one', 'two'):
+      _complete_turn(gm, speech)
+    gm.observe('[putative_event] Alice: three')
+    director.record_repetition_result(
+        candidate_before='Alice: three',
+        candidate_after='Alice: three',
+        attempted=False,
+        trace='重复检查 trace：未见重复',
+    )
+    result = gm.act(_RESOLVE_SPEC)
+    gm.observe(f'[event] {result}')
+    state = director.get_state()
+    self.assertEqual(state['repetition_check_count'], 1)
+    self.assertEqual(state['repetition_execution_count'], 0)
+    self.assertIsNone(state['last_intervention'])
+    self.assertIsNone(state['last_directive_executed_turn'])
+    turn = director.get_last_story_turn()
+    self.assertEqual(
+        turn['director_diagnostics']['repetition'],
+        {
+            'reason': 'repetition',
+            'checked': True,
+            'attempted': False,
+            'proposed_change': False,
+            'executed': False,
+        },
+    )
+    # Without an execution there is no cooldown: turn six may check.
+    for speech in ('four', 'five'):
+      _complete_turn(gm, speech)
+    gm.observe('[putative_event] Alice: six')
+    self.assertTrue(director.should_attempt_repetition_push())
+
+  def test_attempted_but_unchanged_records_attempt_not_change(self):
+    # 实际尝试与候选变化分别记录：核心判定重复并完成建议与融合、
+    # 但融合返回原文时，attempted=True 而 proposed_change=False——
+    # 仍只计检查，不执行、不进共享冷却（spec §7.2）。
+    director, gm = self._make()
+    for speech in ('one', 'two'):
+      _complete_turn(gm, speech)
+    gm.observe('[putative_event] Alice: three')
+    director.record_repetition_result(
+        candidate_before='Alice: three',
+        candidate_after='Alice: three',
+        attempted=True,
+        trace='重复检查 trace：判定重复但融合返回原文',
+    )
+    self.assertIsNone(
+        director.get_current_resolution_evidence()['intervention']
+    )
+    result = gm.act(_RESOLVE_SPEC)
+    gm.observe(f'[event] {result}')
+    turn = director.get_last_story_turn()
+    self.assertEqual(
+        turn['director_diagnostics']['repetition'],
+        {
+            'reason': 'repetition',
+            'checked': True,
+            'attempted': True,
+            'proposed_change': False,
+            'executed': False,
+        },
+    )
+    state = director.get_state()
+    self.assertEqual(state['repetition_check_count'], 1)
+    self.assertEqual(state['repetition_execution_count'], 0)
+    self.assertIsNone(state['last_intervention'])
+    self.assertIsNone(state['last_directive_executed_turn'])
+
+  def test_changed_candidate_is_not_yet_execution(self):
+    # A changed candidate is a proposal: execution is confirmed only by
+    # the validated commit, and it then starts the shared cooldown.
+    director, gm = self._make()
+    for speech in ('one', 'two'):
+      _complete_turn(gm, speech)
+    gm.observe('[putative_event] Alice: three')
+    director.record_repetition_result(
+        candidate_before='Alice: three',
+        candidate_after=f'Alice: three\n{_PUSH_EVENT}',
+        attempted=True,
+        trace='重复检查 trace：建议并融合新事件',
+    )
+    result = gm.act(_RESOLVE_SPEC)
+    # Validated but not yet committed: nothing executed, no cooldown.
+    state = director.get_state()
+    self.assertEqual(state['repetition_execution_count'], 0)
+    self.assertIsNone(state['last_directive_executed_turn'])
+    intervention = director.get_current_resolution_evidence()['intervention']
+    self.assertIsNotNone(intervention)
+    assert intervention is not None
+    self.assertEqual(
+        intervention['candidate_after'], f'Alice: three\n{_PUSH_EVENT}'
+    )
+    gm.observe(f'[event] {result}')
+    state = director.get_state()
+    self.assertEqual(state['repetition_check_count'], 1)
+    self.assertEqual(state['repetition_execution_count'], 1)
+    self.assertEqual(
+        state['last_intervention'], {'turn_id': 3, 'reason': 'repetition'}
+    )
+    self.assertEqual(state['last_directive_executed_turn'], 3)
+    turn = director.get_last_story_turn()
+    self.assertTrue(turn['director_diagnostics']['repetition']['executed'])
+    # Shared cooldown: with cooldown three, turn six (6 - 3 <= 3) is
+    # still suppressed even though the interval is satisfied.
+    for speech in ('four', 'five'):
+      _complete_turn(gm, speech)
+    gm.observe('[putative_event] Alice: six')
+    self.assertFalse(director.should_attempt_repetition_push())
+
+  def test_validated_intervention_commits_once(self):
+    director, gm = self._make()
+    for speech in ('one', 'two'):
+      _complete_turn(gm, speech)
+    gm.observe('[putative_event] Alice: three')
+    director.record_repetition_result(
+        candidate_before='Alice: three',
+        candidate_after=f'Alice: three\n{_PUSH_EVENT}',
+        attempted=True,
+        trace='trace',
+    )
+    result = gm.act(_RESOLVE_SPEC)
+    gm.observe(f'[event] {result}')
+    # A repeated event observation cannot re-commit or double-count.
+    gm.observe(f'[event] {result}')
+    state = director.get_state()
+    self.assertEqual(state['repetition_execution_count'], 1)
+    self.assertEqual(state['repetition_check_count'], 1)
+    self.assertEqual(
+        director.get_last_story_turn()['director_diagnostics']['repetition'][
+            'executed'
+        ],
+        True,
+    )
+
+  def test_uncommitted_retry_is_eligible(self):
+    # An uncommitted check forms no persistent deduplication: a new
+    # putative event of the same turn clears the old candidate and the
+    # check may run again (spec 7.2: check is not execution).
+    director, gm = self._make()
+    for speech in ('one', 'two'):
+      _complete_turn(gm, speech)
+    gm.observe('[putative_event] Alice: three')
+    director.record_repetition_result(
+        candidate_before='Alice: three',
+        candidate_after=f'Alice: three\n{_PUSH_EVENT}',
+        attempted=True,
+        trace='第一次尝试的候选 trace',
+    )
+    self.assertIsNotNone(
+        director.get_current_resolution_evidence()['intervention']
+    )
+    gm.observe('[putative_event] Alice: three')
+    self.assertIsNone(
+        director.get_current_resolution_evidence()['intervention']
+    )
+    self.assertTrue(director.should_attempt_repetition_push())
+    director.record_repetition_result(
+        candidate_before='Alice: three',
+        candidate_after='Alice: three',
+        attempted=False,
+        trace='第二次尝试只计检查',
+    )
+    self.assertEqual(
+        director.get_current_resolution_diagnostics()['stage'],
+        'repetition_check',
+    )
+
+  def test_pending_tension_wins_even_if_fusion_fails(self):
+    # A pending tension directive at the turn's start occupies the one
+    # intervention path of the turn; even a failed fusion (or a mid-turn
+    # status change) must not hand the turn to the repetition helper.
+    director, gm = _make_director(
+        _DirectiveModel(False),
+        beats=_LONG_BEATS,
+        repetition_push_enabled=True,
+        **_DIRECTOR_FEEDBACK_PARAMS,
+    )
+    _complete_turn(gm, 'one')
+    self.assertEqual(director.get_state()['directive']['status'], 'pending')
+    gm.observe('[putative_event] Alice: two')
+    self.assertFalse(director.should_attempt_repetition_push())
+    director.mark_directive_integrating()
+    self.assertFalse(director.should_attempt_repetition_push())
+    director.mark_directive_failed('fusion found no valid complication')
+    self.assertFalse(director.should_attempt_repetition_push())
+
+  def test_rejected_fusion_attempt_restores_pending_on_retry(self):
+    # 融合把指令标记为 integrating 后本轮被复核拒绝（未提交、未消
+    # 费）：同一实例重试同一轮（新 putative event）必须把指令恢复到
+    # 未提交前的 pending，重试轮才能重新融合并正常消费一次；重试轮
+    # 的唯一干预路径仍由张力指令占据（spec §7.2）。
+    director, gm = _make_director(
+        _DirectiveModel(False),
+        beats=_LONG_BEATS,
+        repetition_push_enabled=True,
+        **_DIRECTOR_FEEDBACK_PARAMS,
+    )
+    _complete_turn(gm, 'one')
+    gm.observe('[putative_event] Alice: two')
+    director.mark_directive_integrating()
+    # 模拟复核拒绝：set_validated_resolution 未被调用，本轮不提交。
+    gm.observe('[putative_event] Alice: two')
+    pending = director.get_pending_directive()
+    self.assertIsNotNone(pending)
+    self.assertEqual(pending['status'], 'pending')
+    self.assertFalse(director.should_attempt_repetition_push())
+    # 重试轮重新融合（再次进入 integrating并记录候选）并提交，恰好
+    # 消费一次。
+    director.mark_directive_integrating()
+    director.record_intervention_candidate(
+        reason='tension',
+        candidate_before='Alice: two',
+        candidate_after='Alice: two 融合后事件',
+        trace='重试轮融合 trace',
+    )
+    result = gm.act(_RESOLVE_SPEC)
+    gm.observe(f'[event] {result}')
+    state = director.get_state()
+    self.assertEqual(state['directive']['status'], 'consumed')
+    self.assertEqual(state['directive']['executed_at_turn'], 2)
+    self.assertEqual(state['last_directive_executed_turn'], 2)
+    self.assertEqual(director.get_last_story_turn()['turn_id'], 2)
+
+  def test_shared_cooldown_and_reason_survive_restore(self):
+    director, gm = self._make()
+    for speech in ('one', 'two'):
+      _complete_turn(gm, speech)
+    gm.observe('[putative_event] Alice: three')
+    director.record_repetition_result(
+        candidate_before='Alice: three',
+        candidate_after=f'Alice: three\n{_PUSH_EVENT}',
+        attempted=True,
+        trace='trace',
+    )
+    result = gm.act(_RESOLVE_SPEC)
+    gm.observe(f'[event] {result}')
+    state = director.get_state()
+    fresh, fresh_gm = self._make()
+    fresh.set_state(state)
+    self.assertEqual(fresh.get_state(), state)
+    # The restored shared baseline suppresses turn six (interval hit,
+    # cooldown hit) exactly as before the roundtrip.
+    for speech in ('four', 'five'):
+      _complete_turn(fresh_gm, speech)
+    fresh_gm.observe('[putative_event] Alice: six')
+    self.assertFalse(fresh.should_attempt_repetition_push())
+
+  def test_old_state_preserves_tension_cooldown(self):
+    # Checkpoints from before repetition tracking lack the new fields:
+    # they resume as 0/0/None while the old tension execution baseline
+    # keeps its cooldown effect (spec section 9).
+    director, gm = self._make()
+    for speech in ('one', 'two'):
+      gm.observe(f'[putative_event] Alice: {speech}')
+      result = gm.act(_RESOLVE_SPEC)
+      gm.observe(f'[event] {result}')
+    state = director.get_state()
+    state['directive'] = {
+        'beat_id': 'b1',
+        'generated_at_turn': 1,
+        'content': 'a storm cuts the power',
+        'status': 'consumed',
+        'executed_at_turn': 2,
+    }
+    state['last_directive_executed_turn'] = 2
+    del state['repetition_check_count']
+    del state['repetition_execution_count']
+    del state['last_intervention']
+    fresh, fresh_gm = self._make()
+    fresh.set_state(state)
+    restored = fresh.get_state()
+    self.assertEqual(restored['repetition_check_count'], 0)
+    self.assertEqual(restored['repetition_execution_count'], 0)
+    self.assertIsNone(restored['last_intervention'])
+    # Turn three hits the interval but stays inside the restored
+    # cooldown of the turn-two tension execution (3 - 2 <= 3).
+    fresh_gm.observe('[putative_event] Alice: three')
+    self.assertFalse(fresh.should_attempt_repetition_push())
+    # Without the legacy baseline the same turn would check.
+    no_baseline = dict(state)
+    no_baseline['last_directive_executed_turn'] = None
+    other, other_gm = self._make()
+    other.set_state(no_baseline)
+    other_gm.observe('[putative_event] Alice: three')
+    self.assertTrue(other.should_attempt_repetition_push())
+
+  def test_accepted_repetition_suppresses_same_turn_directive_generation(self):
+    # A repetition execution confirmed in this turn's pending commit
+    # projects the shared cooldown onto the same turn's post-processing,
+    # so no tension directive is generated for the just-executed turn.
+    for proposed_change in (True, False):
+      with self.subTest(proposed_change=proposed_change):
+        model = _ScriptedScoreModel(False, scores=['3', '3', '7'])
+        director, gm = _make_director(
+            model,
+            beats=_LONG_BEATS,
+            eval_interval=1,
+            feedback_enabled=True,
+            repetition_push_enabled=True,
+        )
+        _complete_turn(gm, 'one')
+        _complete_turn(gm, 'two')
+        gm.observe('[putative_event] Alice: three')
+        after = (
+            f'Alice: three\n{_PUSH_EVENT}'
+            if proposed_change
+            else ('Alice: three')
+        )
+        director.record_repetition_result(
+            candidate_before='Alice: three',
+            candidate_after=after,
+            attempted=proposed_change,
+            trace='trace',
+        )
+        result = gm.act(_RESOLVE_SPEC)
+        gm.observe(f'[event] {result}')
+        state = director.get_state()
+        if proposed_change:
+          # The projected cooldown suppressed the deviating score's
+          # directive generation on the execution turn itself.
+          self.assertIsNone(state['directive'])
+          self.assertEqual(state['last_directive_executed_turn'], 3)
+          self.assertTrue(
+              director.get_last_story_turn()['director_diagnostics'][
+                  'cooldown_active'
+              ]
+          )
+        else:
+          # A check without execution never starts the cooldown: the
+          # deviating score still generates a pending directive.
+          self.assertEqual(state['directive']['status'], 'pending')
+          self.assertEqual(state['directive']['generated_at_turn'], 3)
+          self.assertIsNone(state['last_directive_executed_turn'])
+
+  def test_completed_beat_does_not_generate_old_beat_directive(self):
+    # Completing a beat in the same turn that executed a repetition
+    # intervention advances the story without generating a directive of
+    # the old beat: completion and the projected cooldown both block.
+    beats = (
+        drama_director.Beat(
+            id='b1',
+            description='setup',
+            tension_range=(1, 3),
+            done_question='Is the evidence revealed?',
+            min_turns=3,
+            max_turns=8,
+        ),
+        drama_director.Beat(
+            id='b2',
+            description='resolution',
+            tension_range=(1, 3),
+            done_question='Is the fallout addressed?',
+            min_turns=9,
+            max_turns=12,
+        ),
+    )
+    for proposed_change in (True, False):
+      with self.subTest(proposed_change=proposed_change):
+        model = _ScriptedScoreModel(True, scores=['3', '3', '7'])
+        director, gm = _make_director(
+            model,
+            beats=beats,
+            eval_interval=1,
+            feedback_enabled=True,
+            repetition_push_enabled=True,
+        )
+        _complete_turn(gm, 'one')
+        _complete_turn(gm, 'two')
+        gm.observe('[putative_event] Alice: three')
+        after = (
+            f'Alice: three\n{_PUSH_EVENT}'
+            if proposed_change
+            else ('Alice: three')
+        )
+        director.record_repetition_result(
+            candidate_before='Alice: three',
+            candidate_after=after,
+            attempted=proposed_change,
+            trace='trace',
+        )
+        result = gm.act(_RESOLVE_SPEC)
+        gm.observe(f'[event] {result}')
+        turn = director.get_last_story_turn()
+        self.assertEqual(turn['beat_id_after_event'], 'b2')
+        self.assertIsNone(director.get_state()['directive'])
+        self.assertFalse(
+            any(
+                _DIRECTIVE_MARK in prompt
+                for prompt in model.text_prompts  # pytype: disable=attribute-error
+            )
+        )
+
+  def test_invalid_repetition_config_rejected(self):
+    for interval in (0, -3):
+      with self.subTest(interval=interval):
+        with self.assertRaises(ValueError):
+          drama_director.DramaDirector(
+              model=mock_model.MockModel(),
+              beats=BEATS,
+              feedback_enabled=True,
+              repetition_push_enabled=True,
+              repetition_check_interval=interval,
+          )
 
 
 class ActionContractParsingTest(unittest.TestCase):
