@@ -619,6 +619,68 @@ python -m examples.story_enactment.world_response_rev_probe --stage=run --batch_
 python -m examples.story_enactment.world_response_rev_probe --stage=summarize --batch_dir=<同上>
 ```
 
+## S3 Diagnostic Story Runner
+
+`s3_diagnostic_story.py` executes the frozen S3 diagnostic story
+protocol
+([docs/superpowers/plans/2026-10-23-sol-s3-diagnostic-story-protocol.md](../../docs/superpowers/plans/2026-10-23-sol-s3-diagnostic-story-protocol.md),
+user-confirmed 2026-10-23): two independent full runs (R1/R2) of the
+production enactment pipeline over Sol only (`AI_MODEL_4` /
+gpt-6.1-sol), each with 24 story turns and a 400 model-attempt budget
+under a global ledger cap of 800. Production `run.py` stays
+byte-identical: the `LedgerLanguageModel` is injected by
+module-attribute replacement with try/finally restore, and every
+forwarded Concordia model attempt occupies one request-ledger slot. The
+ledger pre-debits budget at `started` — API errors, timeouts and
+no-result calls spend budget — and interrupted evidence is never
+resent, refunded, skipped or re-generated: an interrupted run (bare
+checkpoint without a summary, or started-without-finish ledger slots)
+is marked `interrupted` and the batch pauses for user review; there
+is no auto-resume — per protocol §5 the runner implements no
+mid-process recovery.
+
+Budget enforcement is two-layered (protocol §4): besides the
+Concordia attempts ledger, every SDK `chat.completions.create` is
+pre-debited against a per-run hard cap of 400 before the provider is
+contacted; the two ledgers are rebuilt separately from their own
+started events (associated per call by attempt id, never summed into
+one number), and either budget being exhausted stops that run.
+Concurrent calls keep their own thread-local observation state. Both
+ledgers share a short bookkeeping lock for numbering, pre-debit and
+archival; the lock is released while waiting for the provider. Frozen
+source/protocol hashes and both ledgers are re-audited before each run
+and each model/SDK forwarding boundary. A provider, archival or script
+fault remains a batch stop even when production returns it as
+`reason=error`; only an explicit semantic review rejection permits the
+next run after an error. Archival failures are never silently ignored.
+On production exit, the wrapper closes admission and drains already
+admitted calls, including component work left by the fail-fast executor,
+before the batch records its final result. Late calls cannot write new
+ledger entries or reach the provider after closure.
+
+Stages `dry_run`, `freeze`, `run`, `summarize` follow the
+frozen-protocol discipline. The offline `dry_run` freezes a batch into
+the dry-run directory, executes both runs through the deterministic
+stub (`--disable_language_model` path of the production runner: zero
+network, no `.env` read), summarizes, and records each batch invariant
+(terminal reasons, ledger/production attempt equality, archived
+prompts, caps, stub-only request stages) in `dry_run_report.json`.
+Real `freeze`/`run` execution requires separate user authorization per
+protocol §8, under a new batch directory (真实 `freeze`/`run` 需按协议
+§8 另获授权); the protocol never initiates calls by itself. The batch
+is a diagnostic, not an acceptance gate: the summary answers "where is
+the obstacle" and declares no MVP quality verdict (诊断无验收门).
+Tests in `s3_diagnostic_story_test.py` run fully offline.
+
+```
+python -m examples.story_enactment.s3_diagnostic_story --stage=dry_run \
+    --dry_run_dir=/tmp/...dry_run
+python -m examples.story_enactment.s3_diagnostic_story --stage=freeze \
+    --batch_dir=run_results/story_enactment/s3_diagnostic_story/<UTC时间戳>
+python -m examples.story_enactment.s3_diagnostic_story --stage=run --batch_dir=<同上>
+python -m examples.story_enactment.s3_diagnostic_story --stage=summarize --batch_dir=<同上>
+```
+
 ## File Structure
 
 ```
