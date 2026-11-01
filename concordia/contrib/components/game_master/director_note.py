@@ -134,7 +134,7 @@ def _join(values: Sequence[str]) -> str:
 
 
 def _public_history(director: drama_director.DramaDirector) -> str:
-  """Returns committed public history, never the current candidate."""
+  """Returns the GM's complete committed record, never the candidate."""
   return '\n'.join(director.get_committed_events()) or '(none)'
 
 
@@ -153,8 +153,9 @@ _AGENCY_AND_NOVELTY = (
     'Never make players agree, confess, disclose secrets, sign, hand over'
     ' evidence or comply with commands. Never change their goals or positions'
     ' to lower tension. Allowed means are permissions, not evidence: do not'
-    ' repeat an environmental event already established in the public history.'
-    ' A proposed command or accusation does not establish its outcome.'
+    ' repeat an environmental event already established in the GM complete'
+    ' committed record. A proposed command or accusation does not establish'
+    ' its outcome.'
 )
 
 # Run4 design 5.3: candidates focus on the new event itself, so the
@@ -171,14 +172,15 @@ _CANDIDATE_FOCUS = (
 # A4 (design 7.2): suggestions target actionable progress tied to the
 # existing blockage, not novelty stacking. Guidance only — the fused
 # return value is never rewritten programmatically and no candidate is
-# re-drawn or re-ranked.
+# re-drawn or re-ranked. The record the blockage is visible in is the
+# GM complete committed record (design 6.2), not common knowledge.
 _PROGRESS_FOCUS = (
     ' Prefer a complication that addresses a concrete unresolved'
-    ' blockage or unanswered question visible in the committed public'
-    ' history. Do not stack another interruption, verification or'
-    ' registration chore onto unresolved ones merely for novelty, and'
-    ' never instruct a player to change their goal, confess, cooperate,'
-    ' or pick a specific ending.'
+    ' blockage or unanswered question visible in the GM complete'
+    ' committed record. Do not stack another interruption, verification'
+    ' or registration chore onto unresolved ones merely for novelty,'
+    ' and never instruct a player to change their goal, confess,'
+    ' cooperate, or pick a specific ending.'
 )
 
 
@@ -207,7 +209,8 @@ def _complication_question(
       f'{_AGENCY_AND_NOVELTY}\n'
       'GM-only boundaries (never disclose these): '
       f'{_private_boundaries(director)}\n'
-      f'## Committed public history\n{_public_history(director)}\n'
+      f'{drama_director.GM_COMPLETE_RECORD_LABEL}\n'
+      f'{_public_history(director)}\n'
       f'Allowed means: {_join(director.allowed_environment_events)}\n'
       f'Immutable facts: {_join(director.immutable_facts)}\n'
       'Player characters whose voluntary actions you cannot decide: '
@@ -241,10 +244,11 @@ def _merge_question(
       ' character. Do not contradict immutable'
       f' facts.\n{_CANDIDATE_FOCUS}\n{_PROGRESS_FOCUS}\nImmutable facts:'
       f' {_join(director.immutable_facts)}\n{_AGENCY_AND_NOVELTY}\nGM-only'
-      f' boundaries (never disclose these): {_private_boundaries(director)}\n##'
-      f' Committed public history\n{_public_history(director)}\nAllowed means'
-      f' for new events: {_join(director.allowed_environment_events)}\nPlayer'
-      ' characters whose voluntary actions you cannot decide:'
+      ' boundaries (never disclose these):'
+      f' {_private_boundaries(director)}\n{drama_director.GM_COMPLETE_RECORD_LABEL}\n{_public_history(director)}\nAllowed'
+      ' means for new events:'
+      f' {_join(director.allowed_environment_events)}\nPlayer characters whose'
+      ' voluntary actions you cannot decide:'
       f' {", ".join(director.player_names) if director.player_names else "(none)"}\n\n##'
       ' Output\nWrite the single merged event and nothing else.'
   )

@@ -16,8 +16,8 @@
 
 The directive pipeline is exercised through the real entity lifecycle
 (observe/act/update) with a resolution act that runs the actual story
-thought chain (director note followed by the single-field final
-output). The language model is a semantic stub routing on the last
+thought chain (director note followed by the two-field final
+output, full and public). The language model is a semantic stub routing on the last
 question block, mirroring ``examples.story_enactment.testing_stubs``.
 """
 
@@ -78,7 +78,7 @@ _SCORING_MARK = 'Respond with a single integer from 1 to 10'
 _DIRECTIVE_MARK = 'Write one short director instruction'
 _COMPLICATION_MARK = 'Suggest five plausible in-story complications'
 _MERGE_MARK = 'Merge the candidate event and the complication'
-_FINAL_OUTPUT_MARK = 'Output a JSON object with exactly one string field'
+_FINAL_OUTPUT_MARK = 'Output a JSON object with exactly two string fields'
 _LAST_BLOCK_OPENER = re.compile(r'^(?:Question|Exercise): ', re.M)
 _CHOICE_LINE = re.compile(r'^  \(([^)]+)\) (Yes|No)$', re.M)
 
@@ -220,18 +220,20 @@ class _DirectorFlowModel(mock_model.MockModel):
     return responses.index(letter), letter, {}
 
   def _stage_directions_output(self, prompt: str) -> str:
-    """Builds the single-field stage-directions JSON of one final turn.
+    """Builds the two-field stage-directions JSON of one final turn.
 
     Test instrumentation mirroring the example stub: the narration is
     derived from the current prompt's evidence alone (the
     core-adjudicated action result and the intervention candidate's
-    new fact), never from a fixture carrying the expected event.
+    new fact), never from a fixture carrying the expected event. The
+    public track mirrors the full track: this harness scripts fully
+    public turns only.
 
     Args:
       prompt: the final-generation prompt.
 
     Returns:
-      The single-field JSON object as a string.
+      The two-field JSON object as a string.
     """
     parts = []
     evidence = _read_evidence_section(prompt)
@@ -242,8 +244,9 @@ class _DirectorFlowModel(mock_model.MockModel):
       intervention = evidence.get('intervention')
       if isinstance(intervention, dict):
         parts.append(_intervention_fact(intervention))
+    full = '\n'.join(part for part in parts if part)
     return json.dumps(
-        {'stage_directions': '\n'.join(part for part in parts if part)},
+        {'stage_directions': full, 'public_stage_directions': full},
         ensure_ascii=False,
     )
 
@@ -265,7 +268,7 @@ class _ChainResolutionAct(entity_component.ActingComponent):
   """Runs the real story thought chain on RESOLVE acts.
 
   The chain mirrors the prefab wiring: the director-note step followed
-  by the single-field final-output step, both operating on one fresh
+  by the two-field final-output step, both operating on one fresh
   interactive document per resolution.
   """
 
@@ -371,7 +374,9 @@ class FusionStepTest(unittest.TestCase):
       self.assertIn('Alice: Never confess touching the will.', prompt)
       self.assertIn('Bob secretly holds a recording.', prompt)
       self.assertIn(
-          '## Committed public history\nAlice: A courier arrives', prompt
+          '## GM complete committed record (not common knowledge)\n'
+          'Alice: A courier arrives',
+          prompt,
       )
 
   def test_fuses_first_candidate_with_constrained_prompts(self):
@@ -392,7 +397,9 @@ class FusionStepTest(unittest.TestCase):
     self.assertIn('Alice, Bob', complication_prompt)
     for prompt in (complication_prompt, merge_prompt):
       self.assertIn(
-          '## Committed public history\nAlice: I hid the letter.', prompt
+          '## GM complete committed record (not common knowledge)\n'
+          'Alice: I hid the letter.',
+          prompt,
       )
       self.assertIn(
           'Never make players agree, confess, disclose secrets', prompt
@@ -450,6 +457,30 @@ class FusionStepTest(unittest.TestCase):
       self.assertIn('concrete unresolved blockage', prompt)
       self.assertIn('never instruct a player to change their goal', prompt)
       self.assertIn('verification or registration chore', prompt)
+
+  def test_complete_record_label_and_rule_wording_align(self):
+    # 设计 6.2：融合提示的完整事件段标签改为 GM 完整已提交记录（非
+    # 共同知识），内容不变；消费规则文本与数据源对齐——
+    # _AGENCY_AND_NOVELTY/_PROGRESS_FOCUS 的 "public history" 表述同步
+    # 改为 GM 完整记录口径，不得让规则文本声称只看公开事件。
+    model = _DirectorFlowModel()
+    director, gm = _make_director(model)
+    _complete_turn(gm, 'I hid the letter.')
+    before = len(model.text_prompts)
+    self.assertEqual(_step_call(model, director), _FUSED_EVENT)
+    label = '## GM complete committed record (not common knowledge)'
+    for prompt in model.text_prompts[before:]:
+      self.assertIn(label, prompt)
+      self.assertNotIn('## Committed public history', prompt)
+      self.assertNotIn('public history', prompt)
+    self.assertNotIn('public history', director_note._AGENCY_AND_NOVELTY)  # pylint: disable=protected-access
+    self.assertNotIn('public history', director_note._PROGRESS_FOCUS)  # pylint: disable=protected-access
+    self.assertIn(  # pylint: disable=protected-access
+        'GM complete committed record', director_note._AGENCY_AND_NOVELTY
+    )
+    self.assertIn(  # pylint: disable=protected-access
+        'GM complete committed record', director_note._PROGRESS_FOCUS
+    )
 
   def test_step_marks_directive_integrating(self):
     model = _DirectorFlowModel()

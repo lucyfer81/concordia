@@ -138,13 +138,52 @@ class RunProvenanceTest(unittest.TestCase):
             list(story.allowed_environment_events),
         )
 
+  def test_generation_and_review_share_five_event_authorization(self):
+    # 设计 §6.1-5：最终生成与最终评审收到同一「## GM-only constraints」
+    # JSON 授权区——五项事件与未改的邻居规则（stub 不做真实语义判断）。
+    story = story_config.make_example_config()
+    self.directory = self.enterContext(tempfile.TemporaryDirectory())
+    self.model.text_prompts.clear()
+    result = run.run(
+        self.directory,
+        disable_language_model=True,
+        run_config=run.make_run_config(
+            story, mode='director', total_turn_limit=1
+        ),
+    )
+    self.assertEqual(result.committed_turn_id, 1)
+    finals = [
+        prompt
+        for prompt in self.model.text_prompts
+        if 'Output a JSON object with exactly two string fields' in prompt
+    ]
+    reviews = [
+        prompt
+        for prompt in self.model.text_prompts
+        if '# Story resolution semantic review' in prompt
+    ]
+    self.assertEqual(len(finals), 1)
+    self.assertEqual(len(reviews), 1)
+    for prompt in (*finals, *reviews):
+      constraints_text = prompt.split('## GM-only constraints\n', 1)[1]
+      constraints, _ = json.JSONDecoder().raw_decode(constraints_text.lstrip())
+      self.assertEqual(
+          constraints['allowed_environment_events'],
+          list(story.allowed_environment_events),
+      )
+      self.assertEqual(
+          constraints['npc_response_rules'], list(story.npc_response_rules)
+      )
+
 
 class SimulatedInterruption(BaseException):
   """A crash stand-in that the runner must let propagate untouched."""
 
 
 _REVIEW_MARK = '# Story resolution semantic review'
-_PUSH_EVENT = '邮差冒雨敲门，送来一封老人生前寄出的旧信'
+# A retained whitelisted event (2026-10-24 admission fix): the stub's
+# repetition push introduces only whitelisted facts.
+_PUSH_EVENT = '堂屋的旧收音机自己响了起来，播报暴雨红色预警'
 _ARCHIVE_FILES = (
     'run_manifest.json',
     'checkpoint.json',

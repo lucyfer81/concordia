@@ -14,15 +14,25 @@
 
 """S3 diagnostic story runner: ledgered executor of the frozen protocol.
 
-This module serves the S3 diagnostic story batch of
-``docs/superpowers/plans/2026-10-23-sol-s3-diagnostic-story-protocol.md``:
-two runs (R1/R2) of the production enactment pipeline over
-AI_MODEL_4 / gpt-6.1-sol, 24 story turns and 400 model attempts each.
-The frozen §3 director configuration — feedback on, scoring interval 2,
-window 8, tolerance 1, repetition intervention on with interval 3 and
-the shared cooldown of 3 turns — travels explicitly in the run config
-the runner builds for each run; production defaults are never relied
-upon.
+This module serves the S3 diagnostic story batch of the 2026-10-30
+post-C-2R full-story diagnostic protocol
+``docs/superpowers/plans/
+2026-10-30-story-enactment-post-c2r-full-story-diagnostic-protocol.md``
+(the original
+``docs/superpowers/plans/2026-10-23-sol-s3-diagnostic-story-protocol.md``
+and the 2026-10-24 event-admission protocol remain as the historical
+basis): two runs (R1/R2) of the production enactment pipeline over
+AI_MODEL_4 / gpt-6.1-sol, 24 story turns and 400 model attempts each,
+each run a fresh story. The batch is the current-version full-story
+diagnostic of the B (adjudicated-result delivery fidelity) and C
+(repetition judgment with the turn's actual contribution) production
+repairs and locates the next narrative obstacle; it is not a strict
+before/after A/B experiment and attributes nothing to a single prompt
+repair (protocol §1). The 2026-10-30 protocol's §2 director
+configuration — feedback on, scoring interval 2, window 8, tolerance
+1, repetition intervention on with interval 3 and the shared cooldown
+of 3 turns — travels in the run config the runner builds for each
+run; production defaults are never relied upon.
 Production ``run.py`` stays byte-identical: the ``LedgerLanguageModel``
 is injected by module-attribute replacement with try/finally restore
 (later tasks), and every logical model call occupies exactly one
@@ -33,7 +43,8 @@ timeouts and no-result calls all spend budget.
 
 At the SDK boundary an observing client forwards every
 ``chat.completions.create`` through the protocol's second ledger layer
-(protocol §4): each create is pre-debited against a per-run SDK hard
+(2026-10-30 protocol §2, inheriting original protocol §4): each create
+is pre-debited against a per-run SDK hard
 cap of 400 — cap check and debit synchronized under one lock — before
 it is forwarded, so a capped create is refused before the provider is
 contacted and books no slot. Apart from that budget gate the client
@@ -46,23 +57,34 @@ SDK-layer ledger (rooted at ``batch_dir/'sdk_ledger'``) are rebuilt
 separately from their own started events — associated per call through
 the attempt id, never summed into one number.
 
-The freeze stage captures the user-confirmed protocol, a per-file
+The freeze stage captures the selected protocol and its authorization
+status, a per-file
 SHA-256 snapshot of every repository file the real path touches, and
 the initial batch report into a fresh batch directory. Freezing is
 fully offline (no credentials read, no client built, no network); the
 run stage below re-verifies every recorded hash before any attempt and
-refuses to continue after drift.
+refuses to continue after drift. The real run entry is guarded by a
+one-time marker: read-only frozen verification, run-trace absence and
+fresh-report checks come first, then the atomically occupied
+``run_started.json`` marker, and only then are credentials read — an
+executed or interrupted batch directory is never run again, there is
+no auto-resume and R2 is never silently started for an interrupted
+batch.
 
 The offline dry-run stage exercises the whole pipeline end to end with
 zero network: it freezes a batch into the dry-run directory, executes
-both runs through the deterministic stub path of the production runner,
-summarizes, and records each batch invariant (terminal reasons,
-ledger/production attempt equality, archived prompts, caps, stub-only
-request stages) in ``dry_run_report.json`` — the diagnostic has no
-acceptance gate. The command-line entry point at the bottom dispatches
-the ``--stage`` flag: ``dry_run``, ``freeze``, ``run`` or ``summarize``;
+both runs through the deterministic stub path of the production runner
+(including the offline-only stub scaffolding that stimulates the B/C
+wiring), summarizes, and records each batch invariant (terminal
+reasons, ledger/production attempt equality, archived prompts, caps,
+stub-only request stages, per-run B/C wiring evidence and artifact
+retention) in ``dry_run_report.json`` — the dry run only proves
+wiring; it asserts nothing about story quality and no acceptance gate
+exists. The command-line entry point at the bottom dispatches the
+``--stage`` flag: ``dry_run``, ``freeze``, ``run`` or ``summarize``;
 the real ``freeze``/``run`` round requires separate user authorization
-per protocol §8.
+per the 2026-10-30 protocol §4. Offline freezing does not imply
+authorization.
 """
 
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
@@ -89,7 +111,7 @@ from examples.story_enactment import run as run_lib
 from examples.story_enactment import story_config
 
 # -----------------------------------------------------------------------------
-# Frozen protocol constants (2026-10-23-sol-s3-diagnostic-story-protocol.md).
+# Frozen protocol constants (2026-10-30 post-C-2R full-story protocol §2).
 # -----------------------------------------------------------------------------
 
 _BATCH_ID = 's3_diagnostic_story'
@@ -102,7 +124,7 @@ _ACTION_MODE = 'speech_and_action'
 _DEFAULT_TURNS = 24
 _DEFAULT_ATTEMPTS = 400
 
-# Frozen §3 director parameter table (protocol line 50-58). The runner
+# Frozen director parameter table (2026-10-30 protocol §2). The runner
 # copies these seven values into the run config it builds for every
 # run — the batch must not depend on production defaults: drift would
 # silently change the diagnostic's configuration mainline.
@@ -115,6 +137,14 @@ _FROZEN_DIRECTOR_PARAMS: dict[str, Any] = {
     'repetition_check_interval': 3,
     'cooldown_turns': 3,
 }
+
+# The two events the 2026-10-24 admission fix removed from the default
+# story's whitelist; the dry run asserts they stay out of every run's
+# effective config.
+_REMOVED_EVENTS: tuple[str, ...] = (
+    '周律师的手机响起，来电显示是遗产登记处',
+    '邮差冒雨敲门，送来一封老人生前寄出的旧信',
+)
 
 # Final story termination reasons (story_terminator, spec section 4.7),
 # used by later tasks to ground closure checks.
@@ -186,7 +216,7 @@ def _first_content(response: Any) -> str | None:
 
 
 class _SdkCreateLedger:
-  """Second ledger layer at the SDK ``create`` boundary (protocol §4).
+  """Second ledger layer at the SDK ``create`` boundary (2026-10-30 protocol §2).
 
   One instance owns the batch's SDK request ledger, rooted at
   ``batch_dir/'sdk_ledger'``, and enforces the frozen per-run hard cap
@@ -404,7 +434,7 @@ class _ObservingCompletions:
         if key != 'messages'
     }
     messages = kwargs.get('messages')
-    # Protocol §4: pre-debit the SDK slot before forwarding — the cap
+    # 2026-10-30 protocol §2: pre-debit the SDK slot before forwarding — the cap
     # check and the durable started marker happen before the provider
     # is contacted, and a capped create never reaches it.
     sdk_slot = self._sdk_ledger.begin(
@@ -765,19 +795,20 @@ class LedgerLanguageModel(language_model.LanguageModel):
 # above. The source snapshot is computed at call time from the repo root,
 # so freezing captures the working tree; the run stage re-verifies every
 # hash before each attempt and refuses to continue after drift (the S2
-# probe pattern, protocol §3: 源冻结).
+# probe pattern, 2026-10-30 protocol §4: 源冻结).
 # -----------------------------------------------------------------------------
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _PROTOCOL_DOCUMENT = (
-    'docs/superpowers/plans/2026-10-23-sol-s3-diagnostic-story-protocol.md'
+    'docs/superpowers/plans/'
+    '2026-10-30-story-enactment-post-c2r-full-story-diagnostic-protocol.md'
 )
 _PROTOCOL_NAME = 'protocol.json'
 _SNAPSHOT_NAME = 'source_snapshot.json'
 _REPORT_NAME = 'report.json'
 _LEDGER_NAME = 'requests.jsonl'
 _RAW_DIRNAME = 'raw'
-# The second ledger layer (protocol §4) owns one requests.jsonl of its
+# The second ledger layer (2026-10-30 protocol §2) owns one requests.jsonl of its
 # own, rooted at this subdirectory of the batch directory.
 _SDK_LEDGER_DIRNAME = 'sdk_ledger'
 
@@ -801,9 +832,23 @@ _SNAPSHOT_FILES: tuple[str, ...] = (
     'concordia/contrib/components/game_master/story_action.py',
     'concordia/contrib/components/game_master/story_action_adjudication.py',
     'concordia/contrib/components/game_master/story_resolution.py',
+    # B/C 修复链（2026-10-30 协议 §3.2）：story_dramaturgic.py:358-359
+    # 构造 director_note_step 与 repetition_push_step 并注入 EventResolution
+    # 裁决链——C 修复本体 repetition_push.py（直接调用核心裁决器
+    # event_resolution.py）与 director_note.py 随之进入清单。
+    'concordia/contrib/components/game_master/director_note.py',
+    'concordia/contrib/components/game_master/repetition_push.py',
+    # 核心裁决器：repetition_push.py 直接 import 并调用其 helper。
+    'concordia/components/game_master/event_resolution.py',
+    # 三个 GM 组件的判断文档工具及其底层依赖（repetition_push.py:85、
+    # director_note.py:47、story_resolution.py:74 使用）。
+    'concordia/document/interactive_document.py',
+    'concordia/document/document.py',
     'concordia/contrib/components/game_master/story_terminator.py',
     'concordia/contrib/language_models/budget_wrapper.py',
     'concordia/contrib/language_models/retry_stats_wrapper.py',
+    # retry_stats_wrapper.py:180 组装的外层生产重试（retry_wrapper.py）。
+    'concordia/language_model/retry_wrapper.py',
     'concordia/contrib/prefabs/entity/story_character.py',
     'concordia/contrib/prefabs/game_master/story_dramaturgic.py',
     'concordia/contrib/prefabs/game_master/story_scene.py',
@@ -815,7 +860,17 @@ _SNAPSHOT_FILES: tuple[str, ...] = (
     _PROTOCOL_DOCUMENT,
     (
         'docs/superpowers/specs/'
+        '2026-10-24-story-enactment-event-admission-design.md'
+    ),
+    (
+        'docs/superpowers/specs/'
         '2026-10-21-story-enactment-probe-accounting-and-sol-validation-design.md'
+    ),
+    # B/C 两生产修复的接受设计（story_resolution.py 保真指引与
+    # repetition_push.py 贡献区出自该设计）。
+    (
+        'docs/superpowers/specs/'
+        '2026-10-24-story-enactment-fidelity-and-repetition-context-design.md'
     ),
 )
 
@@ -858,7 +913,7 @@ def _save_report(batch_dir: pathlib.Path, report: Mapping[str, Any]) -> None:
 
 
 def protocol_payload(created_utc: str | None = None) -> dict[str, Any]:
-  """Builds the frozen protocol document (S3 protocol §3/§4/§5/§6/§7/§8).
+  """Builds the 2026-10-30 protocol payload (sections 2 through 9).
 
   Args:
     created_utc: freeze-time stamp; the payload alone stays None so the
@@ -866,16 +921,47 @@ def protocol_payload(created_utc: str | None = None) -> dict[str, Any]:
 
   Returns:
     The protocol dict: model scope and identity disclosure, run plan,
-    the frozen §3 director parameter table, budgets, retry disclosure,
-    failure handling (§5), evaluation criteria (§6), conclusion
-    semantics, invocation and stop boundary.
+    the frozen director parameter table, budgets, retry disclosure and
+    failure handling (§2), diagnostic positioning (§1), the B/C
+    evaluation tables (§5-§8), conclusion semantics (§9), invocation
+    and stop boundary (§4/§10).
   """
   return {
       'batch': _BATCH_ID,
       'protocol_document': {
           'path': _PROTOCOL_DOCUMENT,
-          'confirmation': 'user-confirmed 2026-10-23',
+          'confirmation': 'designed 2026-10-30；执行仍待用户单独授权，未获确认',
       },
+      'design_document': (
+          'docs/superpowers/specs/'
+          '2026-10-24-story-enactment-fidelity-and-repetition-context-design.md'
+      ),
+      'historical_basis': (
+          '两份旧协议文档：docs/superpowers/plans/'
+          '2026-10-23-sol-s3-diagnostic-story-protocol.md 与'
+          ' docs/superpowers/plans/'
+          '2026-10-24-story-enactment-event-admission-validation-protocol.md；'
+          '仅继承 2026-10-30 协议明确列出的配置与执行纪律，'
+          '旧批冻结记录原样保留。'
+      ),
+      'diagnostic_positioning': (
+          '当前版本两次完整故事诊断：检验 B（裁决结果保真交付到后续故事）'
+          '与 C（重复判断考虑当轮实际贡献）两处生产修复在完整链路中的表现，'
+          '并诊断下一处真实叙事障碍。不是改前/改后的严格 A/B，不新增第三次'
+          '运行、双模型组或消融组；历史轨迹仅供障碍定位，不将变化归因于单个'
+          '提示修复；不将 C-2R 的配对 RNG 包装移入完整故事生产链。'
+      ),
+      'historical_reference': (
+          '主历史参照为 S3 批次 20261024T063748Z 的原始轨迹及'
+          ' turn_evaluation_reviewed.md；不沿用已勘误的「邻居无人应门」'
+          '「补光解除宣读阻塞」旧结论；旧批与本次非同次随机轨迹，'
+          '差异不得单独归因于 B 或 C。'
+      ),
+      'c2r_annotation_disclosure': (
+          'C-2R 九条人工标注流程状态已按用户 2026-10-30 指令置为 complete，'
+          '来源为批内 human_annotation_status.json；该指令未提供逐项语义'
+          '判定，不据此宣布其全部通过，语义未定项与保留意见继续列示。'
+      ),
       'model_scope': 'Sol-only',
       'models': {
           _MODEL_TAG: {
@@ -895,12 +981,27 @@ def protocol_payload(created_utc: str | None = None) -> dict[str, Any]:
           '不同，如实披露，该差异不作为已验证身份的证据，不作任何'
           '身份冒称。'
       ),
+      'model_interface_params': {
+          'defaults': {
+              'temperature': language_model.DEFAULT_TEMPERATURE,
+              'top_p': language_model.DEFAULT_TOP_P,
+              'top_k': language_model.DEFAULT_TOP_K,
+              'timeout_seconds': language_model.DEFAULT_TIMEOUT_SECONDS,
+              'max_tokens': language_model.DEFAULT_MAX_TOKENS,
+          },
+          'note': (
+              '生产组件按库默认值传递采样参数、不固定 seed，未控制的'
+              '随机性如实披露；每次请求实际 passed_params 逐条留档于账本'
+              ' sidecar，可离线核对；SDK 客户端保持 openai 库默认'
+              ' max_retries=2。'
+          ),
+      },
       'runs': list(_RUN_IDS),
       'director_params': {
           'values': dict(_FROZEN_DIRECTOR_PARAMS),
           'source': (
-              '协议 §3 冻结参数表：由 runner 为每次运行显式构建并传入 '
-              'run_config，不依赖生产默认值隐式开启重复干预；dry-run '
+              '2026-10-30 协议 §2 冻结参数表：由 runner 为每次运行显式构建'
+              '并传入 run_config，不依赖生产默认值隐式开启重复干预；dry-run '
               '核对 checkpoint 实际生效的 director_params 与此表一致。'
           ),
       },
@@ -957,31 +1058,35 @@ def protocol_payload(created_utc: str | None = None) -> dict[str, Any]:
           ),
       },
       'evaluation_criteria': (
-          '逐轮五问（逐轮、可引用原文证据）：1) 回应具体性，还是'
-          '程序性重复；2) 条件满足后的行动或明确拒绝，各角色声音是否'
-          '可区分；3) 世界回应的因果，新信息是否有来源、是否只到达'
-          '被允许的听众；4) 实际推进判定：首次发现阻塞若改变角色掌握'
-          '的信息、可行选择或具体策略可计推进，重复准备、改述请求、'
-          '无依据的额外核验与无实质变化的微步不算；5) 导演效果是否'
-          '减少循环、改变局势。汇总诊断：循环段识别与推进/循环事件'
-          '比；干预-循环因果记录（启用开关不等于必定触发，不强制'
-          '敲门、生成回应或增加干预补齐样本）；结局条件核对表：四个'
-          '允许结局（真相大白/秘密永埋/协商保宅/僵局散场）逐项核对'
-          '条件是否真实发生，进入终局节拍 b4 不足为凭；评审误拒嫌疑'
-          '（REV05/REV07 型边界行为被拒）单列，不自动计为模型违规；'
-          'beat_timeout 不是完成结局，合理超时照实报告，不粉饰为'
-          '接近完成。'
+          '逐轮五问（逐轮、可引用原文证据）：回应具体性、条件满足后的'
+          '行动或明确拒绝、世界回应的因果与新信息来源受众、实际推进'
+          '判定、导演效果；progress = substantive | none | uncertain 与'
+          ' repetition = yes | no | uncertain 独立标注。按 2026-10-30 协议'
+          '分表核对：§5 B 逐轮表（核心结果关键项/成功失败受阻/对象与'
+          '明确值/否定发现/范围与不确定性/信息来源与获知者/最终交付'
+          '情况；有非空裁决结果的轮均进入检查分母，缺失项标不适用，'
+          '不虚增保真成功）；§6 C 判断表（gate 状态/当轮原始对白与动作/'
+          '已提交历史/裁决结果/真实判断提示/Yes-No/建议及融合；无检查'
+          '机会或未触发分支标「未覆盖」，不补跑造样本）；§7 干预五状态'
+          '（checked/attempted/proposed/approved/committed）与随后最多'
+          ' 5 个已提交回合内的角色选择与状态变化；§8 四个允许结局逐'
+          '条件核对公开证据、缺失项与反证，及剧本格式解码与人工通读'
+          '双报告。进入终局节拍不足为凭；beat_timeout 不是完成结局；'
+          'FDX 可解析不等于剧本可读。'
       ),
       'conclusion_semantics': (
-          '诊断无验收门：报告只回答「障碍在哪」（逐轮五问、循环诊断、'
-          '结局条件核对、误拒嫌疑），不宣布 MVP 质量验收；若出现至少'
-          '一条完整合法结局轨迹，仅记为「完成轨迹已演示」，两次运行'
-          '不确立可靠性。'
+          '诊断无验收门，分别回答：工程/记账是否完整；裁决结果是否交付'
+          '到后续故事；重复判断是否符合实际贡献；干预是否只新增负担；'
+          '角色是否自主发展局势；完整合法结局与可读剧本是否出现。'
+          '不设置合并 overall_pass；不因零异常、更多干预、更高张力或'
+          '一条结局宣称 MVP 验收；一条合法完成轨迹仅记为「完成轨迹已'
+          '演示」。'
       ),
       'invocation': (
           'source venv/bin/activate; python -m'
           ' examples.story_enactment.s3_diagnostic_story'
-          ' --stage={freeze|run|summarize} --batch_dir=<batch directory>'
+          ' --stage={dry_run|freeze|run|summarize} --batch_dir=<batch'
+          ' directory>'
       ),
       'stop_boundary': (
           '本协议不发起调用：真实执行需工程审阅通过后由用户单独授权，'
@@ -1031,7 +1136,37 @@ def source_snapshot_payload(root: pathlib.Path = _REPO_ROOT) -> dict[str, Any]:
           ' production modules the real path touches, and the protocol'
           ' and design documents. Run stages re-verify these hashes'
           ' before each attempt and refuse to continue after drift.'
+          ' 只声明已列出文件受监视；静态清单不冒称任意第三方依赖的'
+          ' 全闭包，环境版本另记于报告 environment。'
       ),
+  }
+
+
+def environment_payload() -> dict[str, Any]:
+  """Records the freeze-time environment versions (recording only).
+
+  Protocol §3.2: the freeze report discloses the Python, platform,
+  NumPy and OpenAI-SDK versions the batch was frozen under. NumPy and
+  the OpenAI SDK are existing dependencies of the enactment chain
+  (``interactive_document.py`` / ``gpt_model.py``); importing them
+  touches no network. This is a record, not a runtime guard — nothing
+  later refuses to run because the interpreter changed.
+
+  Returns:
+    The ``environment`` block of the freeze report.
+  """
+  import platform  # pylint: disable=import-outside-toplevel
+  import sys  # pylint: disable=import-outside-toplevel
+
+  import numpy as np  # pylint: disable=import-outside-toplevel
+  import openai  # pylint: disable=import-outside-toplevel
+
+  return {
+      'python': sys.version,
+      'platform': platform.platform(),
+      'numpy': np.__version__,
+      'openai': openai.__version__,
+      'note': '冻结时刻的环境版本记录（recording only, not a runtime guard）。',
   }
 
 
@@ -1118,6 +1253,7 @@ def freeze_stage(batch_dir: pathlib.Path | str) -> None:
       'protocol_sha256': _file_sha256(batch_dir / _PROTOCOL_NAME),
       'source_snapshot_sha256': _file_sha256(batch_dir / _SNAPSHOT_NAME),
       'protocol_document_sha256': _file_sha256(_REPO_ROOT / _PROTOCOL_DOCUMENT),
+      'environment': environment_payload(),
       'budgets': {
           'turns_per_run': _DEFAULT_TURNS,
           'attempts_per_run': _DEFAULT_ATTEMPTS,
@@ -1152,7 +1288,8 @@ def freeze_stage(batch_dir: pathlib.Path | str) -> None:
 # ``finally`` block. Production stays byte-identical and keeps its whole
 # retry chain; every logical model call books exactly one ledger slot.
 #
-# Failure mapping (protocol §5): in-story terminal results — including a
+# Failure mapping (2026-10-30 protocol §4): in-story terminal results,
+# including a
 # semantic-review rejection recorded as ``reason='error'`` and a
 # ``budget_limit`` stop (either budget layer: the SDK stop names its
 # layer in the budget error) — are normal outcomes written to the report
@@ -1164,7 +1301,7 @@ def freeze_stage(batch_dir: pathlib.Path | str) -> None:
 # their summaries and never re-run. There is deliberately no resume
 # path: an interrupted run — a bare checkpoint without a summary, or
 # started-without-finish ledger slots — stops the run and pauses the
-# batch, marked ``interrupted``, for user review (protocol §5: no
+# batch, marked ``interrupted``, for user review (2026-10-30 protocol §4: no
 # auto-resume, no skipping pending slots, no re-sending; the S2 skip
 # rule does not apply to uncommitted story turns).
 # -----------------------------------------------------------------------------
@@ -1172,6 +1309,106 @@ def freeze_stage(batch_dir: pathlib.Path | str) -> None:
 
 # Loaded live settings: (api_key, api_base, secrets-to-redact).
 _Settings = tuple[str, str, list[str]]
+
+# Files whose presence proves this batch directory already carries an
+# execution — completed or interrupted: both ledgers' first artifacts,
+# the run state directories, and the one-time marker itself. A batch
+# that was executed or interrupted is never run again (2026-10-30
+# protocol §3.3/§4).
+_RUN_TRACE_NAMES = (
+    'requests.jsonl',
+    'sdk_ledger',
+    'run_started.json',
+    'R1',
+    'R2',
+)
+
+
+def _occupy_first_execution(batch_dir: pathlib.Path) -> None:
+  """Atomically occupies the batch's one-time real-execution marker.
+
+  Follows the C-2R-proven ``O_CREAT | O_EXCL`` pattern: exactly one
+  process wins the ``run_started.json`` creation and a concurrent
+  loser gets ``BatchStop``. Any failure after the marker exists keeps
+  it — the directory has spent its one real execution and is never
+  re-run.
+
+  Args:
+    batch_dir: the frozen batch directory about to execute.
+
+  Raises:
+    BatchStop: if the marker already exists (a concurrent or repeat
+      real run).
+  """
+  try:
+    marker_fd = os.open(
+        batch_dir / 'run_started.json',
+        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+        0o644,
+    )
+  except FileExistsError as error:
+    raise BatchStop(
+        f'concurrent run of {batch_dir}: run_started.json already exists'
+    ) from error
+  with os.fdopen(marker_fd, 'w', encoding='utf-8') as handle:
+    json.dump({'created_utc': _utc_now(), 'pid': os.getpid()}, handle, indent=2)
+    handle.write('\n')
+
+
+def _guard_first_real_execution(
+    batch_dir: pathlib.Path, runs: Sequence[str]
+) -> None:
+  """Real-entry prelude: verify frozen, demand fresh, occupy the marker.
+
+  Order (2026-10-30 protocol §3.3): read-only frozen verification
+  first; the real API accepts only the complete ``('R1', 'R2')``
+  order — no subsets, reordering or repeats, so R2 is never silently
+  started for an interrupted batch; the five run-trace names must be
+  absent and the batch report fresh (no run entries, no stop, zero
+  used counts); only then is the atomic one-time marker occupied, and
+  only after that may credentials be read. Every refusal on this path
+  writes nothing and reads no credentials.
+
+  Args:
+    batch_dir: the frozen batch directory to execute for real.
+    runs: the requested run ids (must equal ``_RUN_IDS`` in order).
+
+  Raises:
+    BatchStop: on frozen drift, a non-complete run order, any run
+      trace, a non-fresh report, or a lost marker race.
+  """
+  _verify_frozen(batch_dir)
+  if tuple(runs) != _RUN_IDS:
+    raise BatchStop(
+        f'the real entry requires the complete order {list(_RUN_IDS)};'
+        f' got {list(runs)}; subsets, reordering and repeats are'
+        ' refused — there is no auto-resume and R2 is never silently'
+        ' started for an interrupted batch.'
+    )
+  for name in _RUN_TRACE_NAMES:
+    if (batch_dir / name).exists():
+      raise BatchStop(
+          f'refusing to run {batch_dir}: {name} is already present; a'
+          ' directory that was executed or interrupted is never run'
+          ' again, and its ledgers and reports never change.'
+      )
+  report = _load_report(batch_dir)
+  counts = report.get('counts') or {}
+  fresh = (
+      not report.get('runs')
+      and report.get('stop') is None
+      and counts.get('planned_runs') == len(_RUN_IDS)
+      and counts.get('finished_runs') == 0
+      and counts.get('ledger_attempts') == 0
+      and not counts.get('by_run')
+  )
+  if not fresh:
+    raise BatchStop(
+        f'refusing to run {batch_dir}: the batch report is not fresh'
+        ' (existing run entries, a recorded stop, or used counts);'
+        ' an executed or interrupted batch is never run again.'
+    )
+  _occupy_first_execution(batch_dir)
 
 
 def _load_settings(
@@ -1324,7 +1561,7 @@ def _execute_run(
   ``LedgerLanguageModel`` together with the batch's SDK ledger; the
   original attribute is restored in ``finally`` even when the run
   raises. The run config is built here and passed explicitly, so the
-  frozen §3 director table travels with it — production defaults are
+  frozen §2 director table travels with it — production defaults are
   never relied upon. After the run returns, the ledger's per-run count
   is audited against the production attempt count before anything is
   reported: a fresh run books no slots before it starts (a checkpoint-
@@ -1380,7 +1617,7 @@ def _execute_run(
     wrapped_models.append(wrapped)
     return wrapped, retryable
 
-  # Protocol §3: the run config — including the frozen director table —
+  # 2026-10-30 protocol §2: the run config, including the frozen director table,
   # is built by the runner and passed explicitly; the limit/mode/
   # action-mode parameters of ``run`` are ignored when a run config is
   # given, and the live model identity still arrives through
@@ -1397,14 +1634,21 @@ def _execute_run(
   run_lib.make_language_model = factory
   try:
     started = time.time()
+    # Offline passes the stub scaffolding so the B adjudication chain is
+    # actually exercised in dry runs; the real path keeps the live
+    # OpenAI-compatible config. ``disable_language_model`` still follows
+    # the offline flag, unchanged.
+    model_config: Mapping[str, Any] | None
+    if offline:
+      model_config = _OFFLINE_STUB_MODEL_CONFIG
+    elif settings is None:
+      model_config = None
+    else:
+      model_config = _live_model_config(settings)
     result = run_lib.run(
         str(state_dir),
         disable_language_model=offline,
-        model_config=(
-            None
-            if offline or settings is None
-            else _live_model_config(settings)
-        ),
+        model_config=model_config,
         run_config=run_config,
     )
   finally:
@@ -1491,8 +1735,17 @@ def run_stage(
   semantic-review rejection recorded as ``reason='error'`` — are normal
   outcomes and the batch continues.
 
-  There is deliberately no resume and no skip authorization (protocol
-  §5): an interrupted run — a bare checkpoint without a summary, or
+  The real entry (``offline=False``) additionally passes a one-time
+  guard before any credential read (2026-10-30 protocol §3.3):
+  read-only frozen verification, the complete ``('R1', 'R2')`` order
+  demand, run-trace absence, a fresh report, then the atomically
+  occupied ``run_started.json`` marker. An executed or interrupted
+  batch directory is never run again; the offline test path keeps its
+  subset and idempotent-reentry behavior and never occupies the
+  marker.
+
+  There is deliberately no resume and no skip authorization (2026-10-30
+  protocol §4): an interrupted run — a bare checkpoint without a summary, or
   started-without-finish ledger slots — stops the run and pauses the
   batch, marked ``interrupted``, for user review. Interrupted evidence
   is never resent, refunded, skipped or re-generated, and the S2 skip
@@ -1514,6 +1767,14 @@ def run_stage(
   unknown = [run_id for run_id in runs if run_id not in _RUN_IDS]
   if unknown:
     raise BatchStop(f'unknown run ids: {unknown}; expected {list(_RUN_IDS)}.')
+  if not offline:
+    # Real-entry one-time guard (2026-10-30 protocol §3.3): read-only
+    # frozen verification, the complete R1→R2 order demand, the
+    # run-trace and fresh-report checks, and the atomic marker all
+    # precede any credential read. The offline test path keeps its
+    # subset and idempotent-reentry behavior and never occupies the
+    # marker.
+    _guard_first_real_execution(batch_dir, runs)
   settings = None if offline else _load_settings()
   secrets = () if settings is None else tuple(settings[2])
   _verify_frozen(batch_dir)
@@ -1555,7 +1816,8 @@ def run_stage(
       if slot not in set(sdk_counts['finished_slots'])
   )
   if pending:
-    # Interruption evidence (protocol §5): started-without-finish slots
+    # Interruption evidence (2026-10-30 protocol §4): started-without-finish
+    # slots
     # are reserved budget from a dead process. The batch pauses for user
     # review — nothing is resent, refunded, skipped or re-generated.
     report['stop'] = {
@@ -1586,7 +1848,7 @@ def run_stage(
             run_id, 'finished', summary, ledger
         )
       elif decision == 'interrupted':
-        # Protocol §5: a bare checkpoint is a mid-story interruption.
+        # 2026-10-30 protocol §4: a bare checkpoint is a mid-story interruption.
         # Mark the run, pause the batch, hand the scene to the user.
         report['runs'][run_id] = {'run_id': run_id, 'status': 'interrupted'}
         raise BatchStop(
@@ -1607,7 +1869,7 @@ def run_stage(
       # reason='error' is not proof of a semantic review rejection.
       _check_run_error(run_id, report['runs'][run_id])
     except Exception as error:  # pylint: disable=broad-except
-      # Infrastructure fault (protocol §5): record the stop, keep the
+      # Infrastructure fault (2026-10-30 protocol §4): record the stop, keep the
       # evidence and exit non-zero. In-story terminal reasons never
       # reach this path — they are results, not exceptions.
       report['stop'] = {
@@ -1637,7 +1899,7 @@ def run_stage(
 # so actual HTTP requests can be more; pending slots (started without
 # finished) are reserved-but-unobserved budget, listed as they are.
 #
-# Diagnostic semantics (protocol §6 conclusion semantics): the summary
+# Diagnostic semantics (2026-10-30 protocol §9 conclusion semantics): the summary
 # answers "where is the obstacle" and never declares acceptance — no
 # pass/fail field exists anywhere in the output. Any integrity failure
 # clears a previously saved summary before raising, so a stale summary
@@ -1837,7 +2099,7 @@ def summarize_stage(
 # collected from the artifacts alone — never from closed-over runtime
 # objects — and every one of them is recorded pass/fail in
 # ``dry_run_report.json`` before a failed dry run exits, so the evidence
-# always survives. They cover the frozen §3 configuration (the
+# always survives. They cover the frozen §2 configuration (the
 # checkpointed director_params must equal the frozen table — the
 # explicit run config, not a production default, was in effect), both
 # budget layers (Concordia and SDK caps), the archived prompts, the
@@ -1849,9 +2111,73 @@ def summarize_stage(
 
 _DRY_RUN_REPORT_NAME = 'dry_run_report.json'
 
+# Offline-only stub scaffolding (2026-10-30 protocol §3.6): injecting one
+# action intent makes the deterministic stub trigger the production
+# adjudication chain, so the B result-fidelity guidance actually reaches
+# generation prompts in the offline dry run. The config is passed only on
+# the offline branch of ``_execute_run`` — it never reaches the real
+# path, and it is a wiring stimulus, not narrative-legality evidence.
+_OFFLINE_STUB_MODEL_CONFIG: dict[str, Any] = {
+    'api_type': 'stub',
+    'prompt_stub': {'action_intents': {'陈默': '当众逐页宣读遗嘱全文'}},
+}
+# Prompt fingerprints of the two production repairs the dry run verifies.
+_B_GUIDANCE_MARK = "Deliver this turn's adjudicated result"
+_C_CONTRIBUTION_MARK = '## Current player contribution'
+# Per-run artifacts a completed dry run must retain on disk.
+_RUN_ARTIFACT_NAMES = (
+    'story_turns.jsonl',
+    'checkpoint.json',
+    'summary.json',
+    'script.fdx',
+    'script.fountain',
+    'script.txt',
+)
+
+
+def _bc_wiring_evidence(
+    dry_run_dir: pathlib.Path,
+    started_events: Sequence[Mapping[str, Any]],
+) -> dict[str, dict[str, int]]:
+  """Counts per-run B/C wiring evidence in the archived prompts.
+
+  Groups each Concordia ``started`` event by its ``group`` field (the
+  run id) and reads that slot's archived prompt: a slot counts toward
+  ``b_guidance_prompts`` when the B result-fidelity guidance mark
+  appears and toward ``c_contribution_prompts`` when the C current
+  contribution zone mark appears. Runs are counted individually — the
+  batch total never stands in for one run's missing wiring.
+
+  Args:
+    dry_run_dir: the dry-run batch directory holding ``raw/`` prompts.
+    started_events: the Concordia-layer ``started`` events of both
+      runs, as rebuilt from the batch ledger.
+
+  Returns:
+    ``{run_id: {'b_guidance_prompts': n, 'c_contribution_prompts': m}}``
+    for R1 and R2.
+  """
+  counts = {
+      run_id: {'b_guidance_prompts': 0, 'c_contribution_prompts': 0}
+      for run_id in _RUN_IDS
+  }
+  for event in started_events:
+    run_id = event.get('group')
+    if run_id not in counts:
+      continue
+    prompt_path = dry_run_dir / _RAW_DIRNAME / f"{event['slot_id']}.prompt.txt"
+    if not prompt_path.exists():
+      continue
+    prompt = prompt_path.read_text(encoding='utf-8', errors='replace')
+    if _B_GUIDANCE_MARK in prompt:
+      counts[run_id]['b_guidance_prompts'] += 1
+    if _C_CONTRIBUTION_MARK in prompt:
+      counts[run_id]['c_contribution_prompts'] += 1
+  return counts
+
 
 def _frozen_param_mismatches(dry_run_dir: pathlib.Path) -> list[str]:
-  """Compares each run's checkpointed director_params to the §3 table.
+  """Compares each run's checkpointed director_params to the follow-up §2 table.
 
   Args:
     dry_run_dir: the dry-run batch directory holding the run state dirs.
@@ -1878,6 +2204,48 @@ def _frozen_param_mismatches(dry_run_dir: pathlib.Path) -> list[str]:
   return mismatches
 
 
+def _event_whitelist_mismatches(dry_run_dir: pathlib.Path) -> list[str]:
+  """Compares each run's checkpointed event whitelist to the default five.
+
+  Args:
+    dry_run_dir: the dry-run batch directory holding the run state dirs.
+
+  Returns:
+    One human-readable entry per run whose checkpoint is missing, whose
+    effective story or director event whitelist differs from the current
+    default five events, or whose serialized run config still contains a
+    removed event string; empty when every checkpoint matches.
+  """
+  expected = list(story_config.make_example_config().allowed_environment_events)
+  mismatches = []
+  for run_id in _RUN_IDS:
+    checkpoint = dry_run_dir / run_id / 'checkpoint.json'
+    if not checkpoint.exists():
+      mismatches.append(f'{run_id}: checkpoint artifact missing')
+      continue
+    envelope = json.loads(checkpoint.read_text(encoding='utf-8'))
+    run_config = envelope['run_config']
+    story_events = run_config['story']['allowed_environment_events']
+    director_events = run_config['director_params'].get(
+        'allowed_environment_events'
+    )
+    if story_events != expected:
+      mismatches.append(
+          f'{run_id}: story events {story_events} != default {expected}'
+      )
+    if director_events != expected:
+      mismatches.append(
+          f'{run_id}: director events {director_events} != default {expected}'
+      )
+    blob = json.dumps(run_config, ensure_ascii=False)
+    mismatches.extend(
+        f'{run_id}: removed event still present: {event}'
+        for event in _REMOVED_EVENTS
+        if event in blob
+    )
+  return mismatches
+
+
 def dry_run_stage(dry_run_dir: pathlib.Path | str) -> None:
   """Runs the full batch offline and asserts the batch invariants.
 
@@ -1891,7 +2259,7 @@ def dry_run_stage(dry_run_dir: pathlib.Path | str) -> None:
   started ledger slot has its archived prompt on disk; the global
   ledger cap holds; every started slot is an offline ``stub_request``,
   proving the wrapped inner model was the production stub; each run's
-  checkpointed ``director_params`` equal the frozen §3 table; and the
+  checkpointed ``director_params`` equal the frozen §2 table; and the
   SDK ledger stays within its caps — at zero offline, since the stub
   exposes no SDK client.
 
@@ -1942,6 +2310,14 @@ def dry_run_stage(dry_run_dir: pathlib.Path | str) -> None:
   ]
   global_cap = ledger_caps()['global_cap']
   param_mismatches = _frozen_param_mismatches(dry_run_dir)
+  event_mismatches = _event_whitelist_mismatches(dry_run_dir)
+  bc_wiring = _bc_wiring_evidence(dry_run_dir, started)
+  missing_artifacts = [
+      f'{run_id}: {name}'
+      for run_id in _RUN_IDS
+      for name in _RUN_ARTIFACT_NAMES
+      if not (dry_run_dir / run_id / name).exists()
+  ]
   sdk_within_caps = sdk_counts['global'] <= sdk_caps['global_cap'] and all(
       count <= sdk_caps['group_caps'][run_id]
       for run_id, count in sdk_by_run.items()
@@ -1962,6 +2338,15 @@ def dry_run_stage(dry_run_dir: pathlib.Path | str) -> None:
           not param_mismatches,
           '; '.join(param_mismatches)
           or f'checkpointed params equal the frozen table {_FROZEN_DIRECTOR_PARAMS}',
+      ),
+      (
+          'story_event_whitelist_is_five',
+          not event_mismatches,
+          '; '.join(event_mismatches)
+          or (
+              'checkpointed event whitelist equals the default five of'
+              ' the admission fix'
+          ),
       ),
       (
           'every_started_slot_prompt_archived',
@@ -1996,6 +2381,35 @@ def dry_run_stage(dry_run_dir: pathlib.Path | str) -> None:
           stages == ['stub_request'],
           f"started-slot stages (expected ['stub_request']): {stages}",
       ),
+      (
+          'b_result_fidelity_guidance_prompt_present',
+          all(
+              counts_['b_guidance_prompts'] >= 1
+              for counts_ in bc_wiring.values()
+          ),
+          (
+              'per-run B result-fidelity guidance prompts'
+              f' (each run must be >= 1): {bc_wiring}'
+          ),
+      ),
+      (
+          'c_contribution_zone_prompt_present',
+          all(
+              counts_['c_contribution_prompts'] >= 1
+              for counts_ in bc_wiring.values()
+          ),
+          (
+              'per-run C current-contribution zone prompts'
+              f' (each run must be >= 1): {bc_wiring}'
+          ),
+      ),
+      (
+          'run_artifacts_retained',
+          not missing_artifacts,
+          f'missing run artifacts: {missing_artifacts}'
+          if missing_artifacts
+          else 'both runs retained all six artifact types',
+      ),
   ]
   findings = [detail for _, passed, detail in checks if not passed]
   report = {
@@ -2023,14 +2437,24 @@ def dry_run_stage(dry_run_dir: pathlib.Path | str) -> None:
           'by_run': sdk_by_run,
           'cap_per_run': sdk_caps['group_caps']['R1'],
       },
+      'bc_wiring': bc_wiring,
+      'offline_stub_scaffolding': {
+          'model_config': dict(_OFFLINE_STUB_MODEL_CONFIG),
+          'note': (
+              '离线接线刺激：仅在 offline=True 分支传入生产 run_lib.run 的'
+              ' stub 配置（注入一个动作意图使裁决链在离线运行中被实际走'
+              '到）；不进入真实路径，不提供任何叙事合法性或质量证据。'
+          ),
+      },
       'invariants': [
           {'check': name, 'passed': passed, 'detail': detail}
           for name, passed, detail in checks
       ],
       'findings': findings,
       'conclusion': (
-          '诊断无验收门：dry run 只证明布线与账本纪律，不宣布 MVP 质量'
-          '验收；真实 freeze/run 需按协议 §8 另获授权。'
+          '诊断无验收门：dry run 只证明接线（含逐运行 B 指引与 C 贡献区'
+          '提示及产物留存）与账本纪律，不宣布 MVP 质量验收；真实'
+          ' freeze/run 需按 2026-10-30 协议 §4 另获授权。'
       ),
   }
   _write_json_file(dry_run_dir / _DRY_RUN_REPORT_NAME, report)
@@ -2071,9 +2495,10 @@ flags.DEFINE_string(
     'reference_snapshot',
     '',
     'Optional reference source snapshot compared by the summarize'
-    ' stage (authorized round only; the control round froze'
-    ' run_results/story_enactment/full_story_control/'
-    '20261019T032409Z/source_snapshot.json).',
+    ' stage. For a new authorized batch the suggested reference is'
+    ' run_results/story_enactment/s3_diagnostic_story/'
+    '20261024T063748Z/source_snapshot.json (authorized execution only;'
+    ' CI does not depend on it).',
     flag_values=FLAGS,
 )
 flags.DEFINE_string(

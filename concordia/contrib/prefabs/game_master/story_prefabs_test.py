@@ -27,6 +27,7 @@ from concordia.components import game_master as gm_components
 from concordia.components.game_master import event_resolution as event_resolution_lib
 from concordia.contrib.components.agent import emotional_stance
 from concordia.contrib.components.agent import relationships as relationships_lib
+from concordia.contrib.components.game_master import audience_delivery as audience_delivery_lib
 from concordia.contrib.components.game_master import drama_director as drama_director_lib
 from concordia.contrib.components.game_master import story_action_adjudication
 from concordia.contrib.components.game_master import story_resolution
@@ -80,15 +81,19 @@ _BEAT_DICTS = (
 )
 
 _SPEECH = 'Quick brown fox jumps over a lazy dog'
-# Valid single-field JSON for the final resolution step: the mock
-# player's speech is assembled by the production step, not the model.
-_STAGE_RESPONSE = json.dumps({'stage_directions': ''})
+# Valid two-field JSON for the final resolution step: the mock
+# player's speech is assembled by the production step, not the model,
+# and the public track mirrors the full track (a fully public event).
+_STAGE_RESPONSE = json.dumps({
+    'stage_directions': '',
+    'public_stage_directions': '',
+})
 
 # Fingerprints of the core adjudication question (asked by the core
 # `attempt_to_result` helper) and of the director-note fusion questions.
 _ATTEMPT_QUESTION_MARK = 'What happens as a result of the attempted action?'
-# Fingerprint of the final output step's single-field JSON instruction.
-_FINAL_OUTPUT_MARK = 'Output a JSON object with exactly one string field'
+# Fingerprint of the final output step's two-field JSON instruction.
+_FINAL_OUTPUT_MARK = 'Output a JSON object with exactly two string fields'
 _ADJUDICATION_CONTEXT_MARK = '# Action adjudication (current turn only)'
 _COMPLICATION_MARK = 'Suggest five plausible in-story complications'
 
@@ -100,7 +105,7 @@ _REPETITION_MARK = (
 _SUGGEST_MARK = 'Suggest five plausible events'
 _MERGE_MARK = 'How does 2 modify'
 _REPETITION_CONTEXT_MARK = '# Repetition check (current turn candidate)'
-_HISTORY_MARK = '## Committed public events (oldest first)'
+_HISTORY_MARK = '## GM complete committed record (not common knowledge)'
 _CANDIDATE_MARK = '## Current candidate (not yet committed)'
 _MERGE_GIVEN_RE = re.compile(r'Given:\n(.*?)\n\nHow does 2 modify', re.S)
 _EVIDENCE_MARK = '## Resolution evidence (data)'
@@ -114,12 +119,17 @@ _CORE_ATTEMPT_ANSWER = 'The latch is loose; the window stays shut.'
 # The core helper's true return value: its causal-statement glue plus
 # the attempt answer.
 _CORE_RESULT = f'{_ACTION_INTENT} Because of that, {_CORE_ATTEMPT_ANSWER}'
-# Valid single-field JSON for the speech-and-action chain: narrating
+# Valid two-field JSON for the speech-and-action chain: narrating
 # the core-adjudicated result in the stage-directions track is required
 # (the canonical event is assembled from speech and approved stage
-# directions only), mirroring the example stub's evidence-driven draft.
+# directions only), mirroring the example stub's evidence-driven draft;
+# the public track mirrors the full result (a fully public action).
 _ACTION_STAGE_RESPONSE = json.dumps(
-    {'stage_directions': _CORE_RESULT}, ensure_ascii=False
+    {
+        'stage_directions': _CORE_RESULT,
+        'public_stage_directions': _CORE_RESULT,
+    },
+    ensure_ascii=False,
 )
 
 
@@ -451,6 +461,30 @@ class StoryGameMasterPrefabTest(absltest.TestCase):
         {'display_events', '__drama_director__', 'world_constraints'},
     )
 
+  def test_prefab_uses_audience_delivery_sender(self):
+    # 设计 6.1：prefab 用故事专用的 AudienceDelivery 适配器替换通用
+    # sender：组件表注册 AudienceDelivery（按受众选择完整/公开视图），
+    # 且不再含任何 SendEventToRelevantPlayers 实例（含旧的空字符串键）。
+    players = [_build_character(name) for name in _PLAYERS]
+    gm = _build_game_master(mock_model.MockModel(), players)
+    delivery = gm.get_component(
+        'audience_delivery', type_=audience_delivery_lib.AudienceDelivery
+    )
+    scene_tracker = gm.get_component(
+        gm_components.next_game_master.DEFAULT_NEXT_GAME_MASTER_COMPONENT_KEY
+    )
+    self.assertEqual(delivery._player_filter, scene_tracker.get_participants)  # pylint: disable=protected-access
+    self.assertEqual(
+        delivery._drama_director_component_key,  # pylint: disable=protected-access
+        drama_director_lib.DEFAULT_DRAMA_DIRECTOR_COMPONENT_KEY,
+    )
+    components = gm._context_components  # pylint: disable=protected-access
+    self.assertNotIn('', components)
+    for component in components.values():
+      self.assertNotIsInstance(
+          component, event_resolution_lib.SendEventToRelevantPlayers
+      )
+
   def test_supports_extra_components(self):
     players = [_build_character(name) for name in _PLAYERS]
     note = agent_components.constant.Constant(
@@ -502,7 +536,7 @@ class StoryGameMasterPrefabTest(absltest.TestCase):
     )
     environment = sequential.Sequential()
     environment.run_loop(game_masters=[gm], entities=players, max_steps=1)
-    # The final single-field output step must see the current beat and the
+    # The final two-field output step must see the current beat and the
     # world constraints in its prompt, proving the resolution chain is
     # conditioned on the drama director and the constraints component.
     resolution_prompts = [p for p in model.prompts if _FINAL_OUTPUT_MARK in p]
@@ -775,12 +809,12 @@ class StoryActionModeWiringTest(absltest.TestCase):
     self.assertIn('(beat b1)', final)
 
   def test_display_history_beyond_director_window_reaches_all_prompts(self):
-    # Design 8.1: a committed display fact outside the director's
+    # Design 6.2/8.1: a committed display fact outside the director's
     # stored window but within DisplayEvents' retrieval range must
     # reach the actual adjudication, generation and review prompts —
-    # via the marked history data section, not the window bullets —
-    # and generation with review must read the identical history
-    # frozen at step entry.
+    # via the GM complete history data section (the DisplayEvents full
+    # record), not the public sections — and generation with review
+    # must read the identical GM history frozen at step entry.
     players = [
         _build_character(name, response=_CONTRACT_RESPONSE) for name in _PLAYERS
     ]
@@ -824,27 +858,91 @@ class StoryActionModeWiringTest(absltest.TestCase):
     review = next(
         p for p in model.prompts if '# Story resolution semantic review' in p
     )
+    gm_mark = (
+        '## GM complete committed history (GM-only, not common knowledge, data)'
+    )
+    public_mark = '## Public history (data)'
 
-    def read_history(prompt: str) -> str:
-      mark = '## Public history (data)'
-      index = prompt.index(mark) + len(mark)
-      start = prompt.index('"', index)
-      value, _ = json.JSONDecoder().raw_decode(prompt[start:])
+    def read_gm_history(prompt: str) -> str:
+      index = prompt.index(gm_mark) + len(gm_mark)
+      value, _ = json.JSONDecoder().raw_decode(
+          prompt[prompt.index('"', index) :]
+      )
+      return value
+
+    def read_public_history(prompt: str) -> str:
+      index = prompt.index(public_mark) + len(public_mark)
+      value, _ = json.JSONDecoder().raw_decode(
+          prompt[prompt.index('"', index) :]
+      )
       return value
 
     for prompt in (adjudication, final, review):
       self.assertIn(self._OLD_SHOWN_FACT, prompt)
-      self.assertIn('## Public history (data)', prompt)
-    # The old fact arrives via the history data section, never as a
-    # director-window entry, and the director window itself stays.
-    mark = '## Committed public events (oldest first)'
-    window_data = adjudication.split(mark, 1)[1].lstrip()
-    decoded_window, _ = json.JSONDecoder().raw_decode(window_data)
-    self.assertNotIn(self._OLD_SHOWN_FACT, decoded_window)
+      self.assertIn(gm_mark, prompt)
+      self.assertIn(self._OLD_SHOWN_FACT, read_gm_history(prompt))
+      # The public history is the director's public sequence, which
+      # never received the old display fact.
+      self.assertNotIn(self._OLD_SHOWN_FACT, read_public_history(prompt))
+    # The adjudication's old full-window block is replaced by the GM
+    # complete history section: no public-labeled section may point at
+    # the complete record.
+    self.assertNotIn('## Committed public events (oldest first)', adjudication)
     self.assertIn('第16轮排练照常进行。', adjudication)
-    self.assertIn(self._OLD_SHOWN_FACT, read_history(final))
-    self.assertEqual(read_history(adjudication), read_history(final))
-    self.assertEqual(read_history(final), read_history(review))
+    self.assertEqual(read_gm_history(adjudication), read_gm_history(final))
+    self.assertEqual(read_gm_history(final), read_gm_history(review))
+
+  def test_prefab_binds_public_and_gm_history(self):
+    # 设计 6.2：prefab 绑定 public_history=director.get_public_history、
+    # gm_history=display_events.get_pre_act_value。跑真实 act 后，最终
+    # 生成提示（与评审）同时含公开 history（来自公开序列）与 GM 完整
+    # history（来自 DisplayEvents 完整记录）两段，且两者可区分（用
+    # 只有完整记录才有的标记串：植入 GM 记忆的私下日期）。
+    players = [_build_character(name) for name in _PLAYERS]
+    model = _PromptRecordingModel(_STAGE_RESPONSE)
+    gm = _build_game_master(model, players, player_names=list(_PLAYERS))
+    marker = 'GM完整记录独有：私下日期二〇一九年三月十二日。'
+    memory = gm.get_component('__memory__')
+    memory.add(f'[event] {marker}')
+    director = gm.get_component(
+        drama_director_lib.DEFAULT_DRAMA_DIRECTOR_COMPONENT_KEY,
+        type_=drama_director_lib.DramaDirector,
+    )
+    state = dict(director.get_state())
+    state['public_events'] = ['Alice: 公开事件一。']
+    director.set_state(state)
+    sequential.Sequential().run_loop(
+        game_masters=[gm], entities=players, max_steps=1
+    )
+    final = next(p for p in model.prompts if _FINAL_OUTPUT_MARK in p)
+    review = next(
+        p for p in model.prompts if '# Story resolution semantic review' in p
+    )
+    public_mark = '## Public history (data)'
+    gm_mark = (
+        '## GM complete committed history (GM-only, not common knowledge, data)'
+    )
+
+    def read_section(prompt: str, mark: str) -> str:
+      index = prompt.index(mark) + len(mark)
+      value, _ = json.JSONDecoder().raw_decode(
+          prompt[prompt.index('"', index) :]
+      )
+      return value
+
+    for prompt in (final, review):
+      self.assertIn(public_mark, prompt)
+      self.assertIn(gm_mark, prompt)
+      # GM 完整 history 段来自 DisplayEvents 完整记录（含标记串）……
+      self.assertIn(marker, read_section(prompt, gm_mark))
+      # ……公开 history 段来自公开序列（步骤入口快照），绝无该标记。
+      self.assertEqual(
+          read_section(prompt, public_mark), '0). Alice: 公开事件一。'
+      )
+      self.assertNotIn(marker, read_section(prompt, public_mark))
+    self.assertEqual(
+        read_section(final, gm_mark), read_section(review, gm_mark)
+    )
 
   def test_history_getter_is_wired_in_build_not_params(self):
     # The public-history getter is bound at build time to the built
@@ -1025,7 +1123,10 @@ class StoryRepetitionWiringTest(absltest.TestCase):
       evidence = _read_evidence(prompt)
       intervention = evidence.get('intervention')
       stage = _intervention_fact(intervention) if intervention else ''
-      return json.dumps({'stage_directions': stage}, ensure_ascii=False)
+      return json.dumps(
+          {'stage_directions': stage, 'public_stage_directions': stage},
+          ensure_ascii=False,
+      )
 
   def _build_with_repetition(self, model, **overrides):
     params = {

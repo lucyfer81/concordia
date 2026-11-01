@@ -23,9 +23,10 @@ demonstrated by
   components: a `DramaDirector` (fed scene and beat dictionaries plus the
   scoring, feedback and repetition configuration), an optional
   action-adjudication step, a `director_note` fusion step, a `repetition_push`
-  step (gated by the director's committed repetition state),
-  single-field stage-directions `story_resolution`, and a
-  `SceneOrStoryTerminator`. Resolutions are
+  step (gated by the director's committed repetition state), the two-field
+  `story_resolution` (`stage_directions` plus `public_stage_directions`), the
+  story-specific `AudienceDelivery` sender in place of the core
+  `SendEventToRelevantPlayers`, and a `SceneOrStoryTerminator`. Resolutions are
   conditioned on the beat, the world constraints (game-master-only facts and
   secrets), and the immutable facts. GM-only `character_constraints` maps all
   player names to their hard constraints; `public_facts` distinguishes initial
@@ -35,11 +36,16 @@ demonstrated by
   as a sequence of non-empty strings, with an empty default that preserves
   the old authorization boundary — forwards the story's public-NPC
   response authorization to both the action-adjudication and the
-  final-output factories. Inside `build`, the DisplayEvents pre-act value
-  (`display_events.get_pre_act_value`) is bound as the public-history
-  getter of both the action-adjudication and final-output steps, so the
-  adjudication's isolation from the upstream chain does not shrink the
-  history to the director's scoring window; no new serializable
+  final-output factories. Inside `build`, two zero-argument history getters
+  are bound to both the action-adjudication and final-output steps: the
+  public history comes from the director's committed public sequence
+  (`director.get_public_history`) and the GM complete history from the
+  DisplayEvents pre-act value (`display_events.get_pre_act_value`), so the
+  steps' document isolation never shrinks either history to the director's
+  scoring window (audience-delivery design 6.2). The `AudienceDelivery`
+  adapter is bound with `player_filter=scene_tracker.get_participants`,
+  delivering the validated full event to the acting character and the
+  public event to the other scene participants. No new serializable
   configuration field is added (getters never enter `params`). Players
   receive only their own private brief and public
   events. Failed-turn resolution diagnostics (intervention candidates,

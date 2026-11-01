@@ -376,7 +376,7 @@ FIXTURE_EVENT_SOURCES: dict[str, str] = {
 # Design §6: the S2 batch runs only AI_MODEL_4 / gpt-6.1-sol over the
 # eight REV samples; every attempt spends at most one real request (the
 # independent semantic review), with the generation answered from the
-# frozen single-field narration. Budget, archival and audit flow through
+# frozen two-field narration. Budget, archival and audit flow through
 # the Task-2 request ledger; the run/freeze/summarize stages arrive in
 # Tasks 7-8.
 # -----------------------------------------------------------------------------
@@ -425,9 +425,10 @@ class SlotPlan:
 def slot_plan(case: RevCase) -> tuple[SlotPlan, SlotPlan]:
   """Returns the ordered two-slot plan of one REV attempt.
 
-  The generation slot is frozen — the fixture's single-field narration
-  answers it with zero real requests — so only the independent semantic
-  review is forwarded to the live model.
+  The generation slot is frozen — the fixture's two-field narration
+  (the full track plus its public mirror; the REV fixtures are fully
+  public scenes) answers it with zero real requests — so only the
+  independent semantic review is forwarded to the live model.
   """
   sid = case.sample_id
   return (
@@ -435,7 +436,11 @@ def slot_plan(case: RevCase) -> tuple[SlotPlan, SlotPlan]:
           f'{sid}__{_MODEL_TAG}__s1_generation',
           'frozen',
           frozen_text=json.dumps(
-              {'stage_directions': case.stage_directions}, ensure_ascii=False
+              {
+                  'stage_directions': case.stage_directions,
+                  'public_stage_directions': case.stage_directions,
+              },
+              ensure_ascii=False,
           ),
       ),
       SlotPlan(f'{sid}__{_MODEL_TAG}__s2_review', 'real'),

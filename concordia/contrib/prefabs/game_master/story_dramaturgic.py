@@ -31,15 +31,29 @@ In `speech_and_action` mode (the `action_mode` prefab param, defaulting
 to pure speech) the resolution chain first adjudicates the current
 character's own action attempt through the core `attempt_to_result`
 helper; its true return value is recorded as resolution evidence that
-the director-note step, the single-field stage-directions final
-generation and the semantic review all consume, so only adjudicated
-outcomes — never unadjudicated intents — reach the public event.
+the director-note step, the two-field (full and public) stage-directions
+final generation and the semantic review all consume, so only
+adjudicated outcomes — never unadjudicated intents — reach the public
+event.
 
 Configured public NPC response rules (the `npc_response_rules` prefab
 param, design section 5.2) are validated at build time and forwarded as
 inert data to the adjudication and final-output factories: authorized
 NPC responses are generated within the configured scope by the same
 single core adjudication call, adding no model calls.
+
+Both history inputs of the adjudication and final-output steps are
+bound at build time (design 6.2): the public history getter reads the
+drama director's committed public event sequence, while the GM complete
+history getter keeps the DisplayEvents full record under its GM-only,
+not-common-knowledge label.
+
+Event delivery selects the view by audience (design 6.1): instead of
+the generic `SendEventToRelevantPlayers` sender, an `AudienceDelivery`
+adapter queues the validated full event for the acting character and
+the public event for every other scene participant, delivering each
+reviewed view verbatim after checking the whole contract and every
+recipient up front.
 """
 
 from collections.abc import Mapping, Sequence
@@ -51,6 +65,7 @@ from concordia.associative_memory import basic_associative_memory as associative
 from concordia.components import agent as actor_components
 from concordia.components import game_master as gm_components
 from concordia.components.game_master import event_resolution as thought_chains_lib
+from concordia.contrib.components.game_master import audience_delivery
 from concordia.contrib.components.game_master import director_note
 from concordia.contrib.components.game_master import drama_director
 from concordia.contrib.components.game_master import observation_queue
@@ -235,22 +250,8 @@ class GameMaster(prefab_lib.Prefab):
         observation_component_key=make_observation_key,
     )
 
-    # SendEventToRelevantPlayers handles notifying players about events.
-    # Use scene tracker's get_participants as a filter to limit
-    # notifications to the current scene's participants.
-    send_events_to_players_key = (
-        gm_components.event_resolution.DEFAULT_SEND_PRE_ACT_VALUES_TO_PLAYERS_PRE_ACT_LABEL
-    )
     scene_tracker_key = (
         gm_components.next_game_master.DEFAULT_NEXT_GAME_MASTER_COMPONENT_KEY
-    )
-    send_events_to_players = (
-        gm_components.event_resolution.SendEventToRelevantPlayers(
-            model=model,
-            player_names=player_names,
-            make_observation_component_key=make_observation_key,
-            player_filter=scene_tracker.get_participants,
-        )
     )
 
     next_actor_key = gm_components.next_acting.DEFAULT_NEXT_ACTING_COMPONENT_KEY
@@ -323,6 +324,20 @@ class GameMaster(prefab_lib.Prefab):
         repetition_check_interval=repetition_check_interval,
     )
 
+    # Design 6.1: the generic SendEventToRelevantPlayers sender is
+    # replaced by the story-specific AudienceDelivery adapter, which
+    # delivers the validated full event to the acting character and the
+    # public event to the other scene participants — no text-fragment
+    # dedup, no full-broadcast fallback — through the same
+    # make-observation queue and scene-participant filter.
+    audience_delivery_key = 'audience_delivery'
+    audience_delivery_component = audience_delivery.AudienceDelivery(
+        player_names=player_names,
+        make_observation_component_key=make_observation_key,
+        player_filter=scene_tracker.get_participants,
+        drama_director_component_key=drama_director_key,
+    )
+
     world_constraints = actor_components.constant.Constant(
         state='\n'.join(self.params.get('world_constraints', ())),
         pre_act_label=WORLD_CONSTRAINTS_PRE_ACT_LABEL,
@@ -337,22 +352,26 @@ class GameMaster(prefab_lib.Prefab):
     # core `maybe_inject_narrative_push` helper on its own document
     # (identity when the director's gate is closed — the gate keeps a
     # turn to at most one intervention path); finally ask for the
-    # single-field stage-directions output that respects the immutable
-    # facts, with the verbatim speech entering the canonical event by
-    # assembly. Turns without an action intent skip the adjudication
+    # two-field stage-directions output (the full track and its public
+    # counterpart) that respects the immutable facts, with the verbatim
+    # speech entering the canonical event by assembly. Turns without an action intent skip the adjudication
     # model call; the repetition step uses the same budget- and
     # retry-wrapped model as the rest of the chain.
     remove_prefix = thought_chains_lib.RemoveSpecificText(
         substring_to_remove='Putative event to resolve: '
     )
-    # The adjudication is conditioned on the initial public facts and,
-    # via the DisplayEvents pre-act value (bound here, never serialized
-    # into params), the retrieved public history — isolation must not shrink
-    # the history to the director's scoring window (design 4.1).
+    # Design 6.2: the chain conditions on two separately labeled
+    # histories, both bound here (never serialized into params) and
+    # each read once per step entry — the public history is the
+    # director's committed public sequence, and the GM complete history
+    # is the DisplayEvents pre-act value (the full record from GM
+    # memory), so isolation must not shrink either to the director's
+    # scoring window (design 4.1).
     adjudication_step = story_action_adjudication.make_action_adjudication_step(
         director,
         public_facts=self.params.get('public_facts', ()),
-        public_history=display_events.get_pre_act_value,
+        public_history=director.get_public_history,
+        gm_history=display_events.get_pre_act_value,
         npc_response_rules=npc_response_rules,
     )
     director_note_step = director_note.make_director_note_step(director)
@@ -370,7 +389,8 @@ class GameMaster(prefab_lib.Prefab):
         ),
         npc_response_rules=npc_response_rules,
         public_facts=self.params.get('public_facts', ()),
-        public_history=display_events.get_pre_act_value,
+        public_history=director.get_public_history,
+        gm_history=display_events.get_pre_act_value,
     )
 
     event_resolution_key = (
@@ -413,10 +433,8 @@ class GameMaster(prefab_lib.Prefab):
         next_actor_key: next_actor,
         next_action_spec_key: next_action_spec,
         event_resolution_key: event_resolution,
+        audience_delivery_key: audience_delivery_component,
     }
-    components_of_game_master[send_events_to_players_key] = (
-        send_events_to_players  # pyrefly: ignore[unsupported-operation]
-    )
 
     component_order = list(components_of_game_master.keys())
 

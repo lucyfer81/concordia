@@ -70,6 +70,12 @@ from examples.story_enactment import testing_stubs
 # The public conflict-start marker of the appendix-C example story.
 _CONFLICT_MARK = '周律师当众启封遗嘱并宣读'
 
+# 2026-10-24 事件准入设计：从默认白名单删去的两条完整事件。
+_REMOVED_EVENTS = (
+    '周律师的手机响起，来电显示是遗产登记处',
+    '邮差冒雨敲门，送来一封老人生前寄出的旧信',
+)
+
 # Distinctive substrings of hidden knowledge (isolation carry-over).
 _GM_TRUTH_MARK = '调包'
 
@@ -664,7 +670,12 @@ class _EndingAwareStub(testing_stubs.PromptStubModel):
 
   def _wanted_option(self, prompt: str) -> str:
     if '允许结局之一' in prompt:
-      events = prompt.split('## Recent events (oldest first)', 1)
+      # The completion question's event window is the GM complete
+      # committed record (audience-delivery design 6.2 relabeled the
+      # section); the marker scan itself is unchanged.
+      events = prompt.split(
+          '## GM complete committed record (not common knowledge)', 1
+      )
       window = (
           events[1].split('## Completion criteria', 1)[0]
           if len(events) == 2
@@ -769,7 +780,7 @@ class AllowedEndingsWiringTest(unittest.TestCase):
     )
     self.assertEqual(stub.sample_text(speech_last), '我有话说。')
 
-  def test_final_output_route_returns_only_stage_directions(self):
+  def test_final_output_route_returns_both_fields(self):
     stub = testing_stubs.PromptStubModel()
     prompt = (
         'Question: What would a person like 林雪 do in a situation like '
@@ -780,13 +791,19 @@ class AllowedEndingsWiringTest(unittest.TestCase):
         '## Original speech (verbatim)\n'
         '遗嘱的封印从未核验。\n'
         '## Output\n'
-        'Output a JSON object with exactly one string field:\n'
+        'Output a JSON object with exactly two string fields:\n'
         '- "stage_directions"\n'
+        '- "public_stage_directions"\n'
         'Answer: '
     )
     payload = json.loads(stub.sample_text(prompt))
-    self.assertEqual(set(payload), {'stage_directions'})
+    self.assertEqual(
+        set(payload), {'stage_directions', 'public_stage_directions'}
+    )
     self.assertEqual(payload['stage_directions'], '窗外的雷声滚过，烛火摇曳。')
+    self.assertEqual(
+        payload['public_stage_directions'], payload['stage_directions']
+    )
 
   def test_choice_maps_by_beat_completion_answer_with_shuffled_letters(
       self,
@@ -939,6 +956,43 @@ class EndToEndShortRunTest(_StateDirTestCase):
     self.assertEqual(result.reason, 'step_limit')
     self.assertEqual(result.committed_turn_id, 2)
     self.assertEqual(self.summary()['mode'], 'director')
+
+  def test_effective_event_whitelist_is_five_everywhere(self):
+    # 设计 §3/§6.1-3：同一共享链——make_gm_params 的授权 world_constraints
+    # 文字、make_run_config 的 gm/director params、build_simulation 实际
+    # 构建、最终 checkpoint envelope——必须同为五项且无被删事件残留。
+    story = story_config.make_example_config()
+    five = list(story.allowed_environment_events)
+    gm = run_lib.make_gm_params(story)
+    self.assertEqual(gm['allowed_environment_events'], five)
+    constraints = '\n'.join(gm['world_constraints'])
+    self.assertIn('；'.join(five), constraints)
+    for removed in _REMOVED_EVENTS:
+      self.assertNotIn(removed, constraints)
+
+    config = run_lib.make_run_config(
+        story,
+        total_turn_limit=1,
+        total_model_attempt_limit=100,
+        mode='director',
+        model_config={'api_type': 'stub'},
+    )
+    config['scene_dicts'][0]['num_rounds'] = 8
+    self.assertEqual(config['gm_params']['allowed_environment_events'], five)
+    self.assertEqual(
+        config['director_params']['allowed_environment_events'], five
+    )
+    result = run_lib.run(self.state_dir, run_config=config)
+    self.assertEqual(result.committed_turn_id, 1)
+    effective = self.envelope()['run_config']
+    self.assertEqual(effective['story']['allowed_environment_events'], five)
+    self.assertEqual(effective['gm_params']['allowed_environment_events'], five)
+    self.assertEqual(
+        effective['director_params']['allowed_environment_events'], five
+    )
+    blob = json.dumps(effective, ensure_ascii=False)
+    for removed in _REMOVED_EVENTS:
+      self.assertNotIn(removed, blob)
 
   def test_tension_observe_mode_records_scores_without_feedback(self):
     config = run_lib.make_run_config(
@@ -2109,7 +2163,7 @@ class ActionModeRunTest(_StateDirTestCase):
     for record in old_records:
       self.assertEqual(record['speech'], '这宅子的事，急不得。')
     for record in records[2:]:
-      self.assertEqual(record['schema_version'], 2)
+      self.assertEqual(record['schema_version'], 3)
     self.assertEqual(
         builder.call_args_list[-1].kwargs['run_config']['action_mode'],
         'speech_only',
@@ -2279,7 +2333,7 @@ _WILL_DATE = '二〇一九年三月十二日'
 
 # Fingerprints for locating real prompts of the action chain.
 _ATTEMPT_QUESTION = 'What happens as a result of the attempted action?'
-_FINAL_OUTPUT_MARK = 'Output a JSON object with exactly one string field'
+_FINAL_OUTPUT_MARK = 'Output a JSON object with exactly two string fields'
 _REVIEW_MARK = '# Story resolution semantic review'
 
 
@@ -2485,7 +2539,7 @@ class ActionPipelineIntegrationTest(_ActionChainTestCase):
     self.assertEqual(lawyer['action_intent'], self._LAWYER_INTENT)
     speech, intent = story_action.decode_action(lawyer['raw_action'])
     self.assertEqual((speech, intent), (self._LAWYER_LINE, self._LAWYER_INTENT))
-    self.assertEqual(lawyer['schema_version'], 2)
+    self.assertEqual(lawyer['schema_version'], 3)
     # The core helper's true return value (its causal glue included) is
     # the whole narrator track and reaches the canonical event verbatim.
     core_result = (
@@ -3230,6 +3284,118 @@ class PublicNpcResponseIntegrationTest(_ActionChainTestCase):
     self.assertIsNone(state['directive'])
 
 
+# Fingerprint of the contribution data section added by
+# concordia.contrib.components.game_master.repetition_push (design C).
+_CONTRIBUTION_MARK = '## Current player contribution (not yet committed, data)'
+
+
+def _read_contribution(prompt: str) -> dict[str, Any]:
+  """Decodes the JSON contribution data section of one prompt."""
+  start = prompt.index(_CONTRIBUTION_MARK) + len(_CONTRIBUTION_MARK)
+  payload, _ = json.JSONDecoder().raw_decode(prompt[prompt.index('{', start) :])
+  return payload
+
+
+class FidelityAndContributionIntegrationTest(_ActionChainTestCase):
+  """Design B/C reach the real prefab chain (plumbing only)."""
+
+  _INTENT = '林雪取出手机，打开手电照亮桌面上的遗嘱。'
+  _RESULT = (
+      '林雪成功打开手电，光照在遗嘱封面上，纸面字迹清晰可辨；未移动遗嘱，'
+      '也未触碰其他物品。'
+  )
+  _KNOCK = '隔壁邻居被争执声惊动，前来敲门探问'
+
+  def _repetition_config(self) -> dict[str, Any]:
+    # Mirrors PublicNpcResponseIntegrationTest._neighbor_config, built
+    # inline because that helper is not on this class's parents.
+    config = self._action_config()
+    story = story_config.make_example_config()
+    config['mode'] = 'director'
+    config['director_params'] = {
+        'eval_interval': 1,
+        'scoring_window': 8,
+        'tolerance': 1,
+        'feedback_enabled': True,
+        'cooldown_turns': 3,
+        'allowed_environment_events': list(story.allowed_environment_events),
+        'immutable_facts': list(story.immutable_facts),
+        'repetition_push_enabled': True,
+        'repetition_check_interval': 2,
+    }
+    return config
+
+  def test_generation_guidance_reaches_real_chain_and_result_flows(self):
+    config = self._action_config(total_turn_limit=2)
+    stub = testing_stubs.PromptStubModel(
+        action_intents={'林雪': self._INTENT},
+        action_result=self._RESULT,
+        stage_directions='',
+    )
+    result = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(result.committed_turn_id, 2)
+    generations = _prompts_containing(stub, 'Deliver this turn')
+    self.assertEqual(len(generations), 1)
+    self.assertIn(self._RESULT, generations[0])
+    # The guidance is generation-only: every committed turn's review
+    # prompt (two reviews for two turns) never has it.
+    reviews = _prompts_containing(stub, _REVIEW_MARK)
+    self.assertEqual(len(reviews), 2)
+    for review in reviews:
+      self.assertNotIn('Deliver this turn', review)
+    # The faithful stub draft (echo of the evidence) commits verbatim
+    # and reaches the exports — unchanged propagation contract.
+    record = self.turn_log().load()[0]
+    self.assertEqual(
+        record['stage_directions'],
+        f'{self._INTENT} Because of that, {self._RESULT}',
+    )
+    self.assertIn('清晰可辨', self.read_script('script.txt'))
+
+  def test_repetition_check_sees_current_turn_speech(self):
+    config = self._repetition_config()
+    line = (
+        '陈默：我先问清楚，昨夜后院到底烧没烧纸？还有，这份遗嘱对老宅'
+        '往后还有没有别的交代？'
+    )
+    stub = testing_stubs.PromptStubModel(
+        dialogue_lines={'陈默': line},
+        stage_directions='',
+        scoring_answer='5',
+        repetition_answer='Yes',
+        push_events=self._KNOCK,
+        push_merged='',
+    )
+    result = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(result.committed_turn_id, 4)
+    # The judgment the model actually received carries this turn's
+    # contribution: the player-authored line, not the candidate.
+    judgments = [p for p in stub.choice_prompts if _REPETITION_QUESTION in p]
+    self.assertEqual(len(judgments), 1)
+    self.assertEqual(
+        _read_contribution(judgments[0]),
+        {
+            'active_player_name': '陈默',
+            'original_speech': line,
+            'action_intent': '',
+        },
+    )
+    # The internal suggestion prompt (Yes path) carries it too.
+    self.assertTrue(any(_CONTRIBUTION_MARK in p for p in stub.text_prompts))
+    # The speech commits exactly once as the speech line; the
+    # narration never copies it.
+    record = self.turn_log().load()[1]
+    self.assertTrue(record['resolved_event'].startswith(f'陈默: {line}'))
+    self.assertNotIn('烧没烧纸', record['stage_directions'])
+    # Next player (周律师, turn 3) observed the actual committed
+    # content of turn 2 in its action prompt: the speech line and the
+    # committed knock from the repetition intervention.
+    lawyer_prompts = _exercise_prompts_of(stub, '周律师')
+    self.assertEqual(len(lawyer_prompts), 1)
+    self.assertIn('烧没烧纸', lawyer_prompts[0])
+    self.assertIn('隔壁邻居', lawyer_prompts[0])
+
+
 class ActionChainBudgetTest(_ActionChainTestCase):
   """Budget paths of the adjudicated chain (spec section 11.3).
 
@@ -3645,9 +3811,11 @@ class ActionAuthorizationBoundaryTest(_ActionChainTestCase):
     self.assertNotIn('action_adjudication', self.read_script('script.fdx'))
 
 
-# A whitelisted environmental event of the example story: a legal new
-# fact the repetition push may introduce (task-12 pipeline tests).
-_PUSH_EVENT = '邮差冒雨敲门，送来一封老人生前寄出的旧信'
+# A retained whitelisted environmental event of the example story (the
+# 2026-10-24 admission fix removed the phone call and courier events):
+# a legal new fact the repetition push may introduce (task-12 pipeline
+# tests).
+_PUSH_EVENT = '堂屋的旧收音机自己响了起来，播报暴雨红色预警'
 
 # Fingerprints of the core repetition helper's questions.
 _REPETITION_QUESTION = (
@@ -3768,6 +3936,18 @@ class RepetitionPipelineIntegrationTest(_StateDirTestCase):
     # the two committed turns (real history, not a stuffed window).
     repetition_prompts = self._repetition_choice_prompts(stub)
     self.assertEqual(len(repetition_prompts), 1)
+    # 2026-10-24 事件准入 §6.1-4：重复路径真实提示的授权区恰为五项，
+    # 被删的两个完整事件不得出现（stub verdict 只证明接线）。
+    story = story_config.make_example_config()
+    five = '; '.join(story.allowed_environment_events)
+    for prompt in repetition_prompts:
+      self.assertIn(f'Allowed means for any new event: {five}', prompt)
+      for removed in _REMOVED_EVENTS:
+        self.assertNotIn(removed, prompt)
+    for prompt in _prompts_routed_to(stub, _PUSH_SUGGEST_QUESTION):
+      self.assertIn(five, prompt)
+      for removed in _REMOVED_EVENTS:
+        self.assertNotIn(removed, prompt)
     self.assertIn('- 林雪: 这宅子的事，急不得。', repetition_prompts[0])
     self.assertIn('not yet committed', repetition_prompts[0])
     self.assertEqual(len(_prompts_routed_to(stub, _PUSH_SUGGEST_QUESTION)), 1)
@@ -3919,6 +4099,32 @@ class RepetitionPipelineIntegrationTest(_StateDirTestCase):
     )
     self.assertEqual(state['repetition_check_count'], 1)
     self.assertEqual(state['repetition_execution_count'], 0)
+
+  def test_tension_intervention_prompts_authorize_only_five_events(self):
+    # 设计 §6.1-4 张力入口：P3 指令生成与 P4 融合（complication 与
+    # merge）的真实提示授权区恰为五项；重复入口在此场景被张力抑制。
+    config = self._director_config(repetition_check_interval=1)
+    stub = testing_stubs.PromptStubModel(
+        scoring_answer='9',
+        repetition_answer='No',
+        stage_directions='',
+    )
+    result = self._run_with_stub(self.state_dir, config, stub)
+    self.assertEqual(result.committed_turn_id, 4)
+    story = story_config.make_example_config()
+    five = '; '.join(story.allowed_environment_events)
+    directives = _prompts_routed_to(
+        stub, 'Write one short director instruction'
+    )
+    complications = _prompts_routed_to(stub, _COMPLICATION_QUESTION)
+    merges = _prompts_routed_to(stub, 'Chosen complication to weave in')
+    self.assertTrue(directives)
+    self.assertTrue(complications)
+    self.assertTrue(merges)
+    for prompt in (*directives, *complications, *merges):
+      self.assertIn(five, prompt)
+      for removed in _REMOVED_EVENTS:
+        self.assertNotIn(removed, prompt)
 
   def test_dropped_push_is_rejected_without_consumption(self):
     # The core helper really introduces the new event, the final draft

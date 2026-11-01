@@ -25,6 +25,7 @@ from concordia.agents import entity_agent_with_logging
 from concordia.components.agent import concat_act_component
 from concordia.components.agent import constant as constant_lib
 from concordia.contrib.components.agent import emotional_stance
+from concordia.contrib.components.game_master import story_resolution
 from concordia.environment import step_controller as step_controller_lib
 from concordia.testing import mock_model
 from concordia.typing import entity as entity_lib
@@ -34,6 +35,16 @@ from examples.story_enactment import collector
 _ACTOR = '李强'
 _SPEECH = '这一页必须找回来。'
 _EMOTIONS = ('紧张', '愤怒', '平静')
+
+# Narrator tracks of a two-view turn (audience-delivery design 4.1):
+# the full track carries a concrete private finding, the public track
+# describes only the visible act.
+_FULL_STAGE = (
+    '档案室没有别人。李强翻开底档，看清落款日期是二〇一九年三月十二日，'
+    '与公示文本不一致。'
+)
+_PUBLIC_STAGE = '李强独自在档案桌前翻看了片刻底档。'
+_PRIVATE_DATE = '二〇一九年三月十二日'
 
 
 def _make_turn(turn_id=1, actor=_ACTOR, speech=_SPEECH, **overrides):
@@ -49,6 +60,38 @@ def _make_turn(turn_id=1, actor=_ACTOR, speech=_SPEECH, **overrides):
       'tension': None,
       'budget_stopped': False,
   }
+  turn.update(overrides)
+  return turn
+
+
+def _assemble(actor: str, speech: str, stage_directions: str) -> str:
+  """Assembles one canonical event with the production assembly rule."""
+  return story_resolution.assemble_canonical_event(
+      active_player_name=actor,
+      original_speech=speech,
+      stage_directions=stage_directions,
+  )
+
+
+def _make_schema3_turn(turn_id=1, actor=_ACTOR, speech=_SPEECH, **overrides):
+  """Builds a schema-3 director turn with consistent canonical views.
+
+  Both canonical events are the exact assembly of the same actor and
+  original speech with their narrator tracks, the contract the schema-3
+  collector check enforces (audience-delivery design 7.1).
+  """
+  turn = _make_turn(
+      turn_id=turn_id,
+      actor=actor,
+      speech=speech,
+      schema_version=3,
+      raw_action=speech,
+      action_intent='',
+      stage_directions=_FULL_STAGE,
+      resolved_event=_assemble(actor, speech, _FULL_STAGE),
+      public_stage_directions=_PUBLIC_STAGE,
+      public_resolved_event=_assemble(actor, speech, _PUBLIC_STAGE),
+  )
   turn.update(overrides)
   return turn
 
@@ -459,6 +502,77 @@ class ActionRecordTest(unittest.TestCase):
     # The approved action result reaches the record unchanged.
     self.assertEqual(record['resolved_event'], resolved_event)
     self.assertEqual(record['stage_directions'], stage_directions)
+
+
+class Schema3AudienceFieldsTest(unittest.TestCase):
+  """Schema-3 collection of the two-view audience-delivery fields.
+
+  The collector must archive the public fields of every schema-3 turn
+  beside the unchanged full record, and must verify that both canonical
+  events are the exact assembly of the same actor and original speech
+  with their narrator tracks (audience-delivery design 7.1). Every
+  rejection asserts that no file was written: validation completes
+  before the turn log or the checkpoint is touched.
+  """
+
+  def setUp(self):
+    super().setUp()
+    self.tmpdir = self.enterContext(tempfile.TemporaryDirectory())
+
+  def _assert_nothing_written(self, harness):
+    self.assertEqual(harness.turn_log.load(), [])
+    self.assertFalse(os.path.exists(harness.checkpoint_path))
+
+  def test_schema3_record_carries_public_fields(self):
+    turn = _make_schema3_turn()
+    harness = _Harness(self.tmpdir, turn)
+    harness.callback()(harness.step_data())
+    record = harness.turn_log.load()[0]
+    self.assertEqual(record['schema_version'], 3)
+    # The two public fields travel into the record exactly as the
+    # director's committed turn holds them.
+    self.assertEqual(
+        record['public_resolved_event'], turn['public_resolved_event']
+    )
+    self.assertEqual(
+        record['public_stage_directions'], turn['public_stage_directions']
+    )
+    # The full record keeps the complete narration with the private
+    # finding; the public view is archived beside it, never over it.
+    self.assertEqual(record['resolved_event'], turn['resolved_event'])
+    self.assertEqual(record['stage_directions'], _FULL_STAGE)
+    self.assertIn(_PRIVATE_DATE, record['resolved_event'])
+    self.assertNotIn(_PRIVATE_DATE, record['public_resolved_event'])
+    self.assertEqual(harness.read_checkpoint()['committed_turn_id'], 1)
+
+  def test_canonical_assembly_consistency_checked(self):
+    # Full side: the recorded resolved_event is not what assembling the
+    # same actor, speech and full narrator track builds.
+    full_mismatch = _make_schema3_turn(resolved_event=f'{_ACTOR}说：{_SPEECH}')
+    harness = _Harness(self.tmpdir, full_mismatch)
+    with self.assertRaisesRegex(ValueError, 'resolved_event'):
+      harness.callback()(harness.step_data())
+    self._assert_nothing_written(harness)
+
+    # Public side: the recorded public event is not what assembling the
+    # same actor, speech and public narrator track builds.
+    public_mismatch = _make_schema3_turn(
+        public_resolved_event=_assemble(_ACTOR, _SPEECH, _FULL_STAGE)
+    )
+    harness = _Harness(self.tmpdir, public_mismatch)
+    with self.assertRaisesRegex(ValueError, 'public_resolved_event'):
+      harness.callback()(harness.step_data())
+    self._assert_nothing_written(harness)
+
+  def test_missing_public_fields_rejected(self):
+    for missing in ('public_resolved_event', 'public_stage_directions'):
+      with self.subTest(missing=missing):
+        turn = _make_schema3_turn()
+        del turn[missing]
+        harness = _Harness(self.tmpdir, turn)
+        with self.assertRaisesRegex(ValueError, missing):
+          harness.callback()(harness.step_data())
+        self._assert_nothing_written(harness)
 
 
 class EmotionCollectionTest(unittest.TestCase):

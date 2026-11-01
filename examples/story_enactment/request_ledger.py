@@ -68,6 +68,36 @@ class LedgerBudgetError(Exception):
   """A rebuilt budget would exceed its configured cap."""
 
 
+def redact(value: Any, secrets: Sequence[str]) -> Any:
+  """Recursively replaces secret literals with ``[REDACTED]``.
+
+  The single redaction primitive of the harness: strings have every
+  non-empty secret literal replaced, mappings and sequences are rebuilt
+  with redacted items, and every other value passes through unchanged.
+  Both the :class:`RequestLedger` archives and any derived artifact a
+  caller persists from a run scrub through this function, so no second
+  redaction implementation can drift from the ledger's behavior.
+
+  Args:
+    value: the payload to scrub (str, mapping, sequence, other).
+    secrets: literal values replaced with ``[REDACTED]``.
+
+  Returns:
+    The scrubbed value; containers are new objects, scalars and
+    secret-free strings pass through as-is.
+  """
+  if isinstance(value, str):
+    for secret in secrets:
+      if secret:
+        value = value.replace(secret, '[REDACTED]')
+    return value
+  if isinstance(value, Mapping):
+    return {key: redact(item, secrets) for key, item in value.items()}
+  if isinstance(value, (list, tuple)):
+    return [redact(item, secrets) for item in value]
+  return value
+
+
 def load_events(path: Path) -> list[dict[str, Any]]:
   """Loads a JSONL ledger file into a list of event dicts.
 
@@ -675,16 +705,7 @@ class RequestLedger:
 
   def _redact(self, value: Any) -> Any:
     """Recursively replaces secret literals in strings within a value."""
-    if isinstance(value, str):
-      for secret in self._secrets:
-        if secret:
-          value = value.replace(secret, '[REDACTED]')
-      return value
-    if isinstance(value, Mapping):
-      return {key: self._redact(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-      return [self._redact(item) for item in value]
-    return value
+    return redact(value, self._secrets)
 
   def _append_event(self, event: Mapping[str, Any]) -> None:
     """Appends one complete JSON line to the ledger file."""

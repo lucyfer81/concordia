@@ -244,15 +244,19 @@ class _FixedActor(entity_component.ContextComponent):
 class _ResolutionAct(entity_component.ActingComponent):
   """Replaces only resolution generation; lifecycle remains real."""
 
-  def __init__(self, director):
+  def __init__(self, director, public_event=None):
     self._director = director
+    # None mirrors the full event (a fully public scripted turn); a
+    # configured value stands in for the turn's public canonical event.
+    self._public_event = public_event
 
   def get_action_attempt(self, contexts, action_spec):
     if action_spec.output_type != entity_lib.OutputType.RESOLVE:
       return 'No'
     speech = self._director.get_current_original_speech()
     event = f'Alice: {speech}'
-    self._director.set_validated_resolution(event, '')
+    public = event if self._public_event is None else self._public_event
+    self._director.set_validated_resolution(event, '', public, '')
     return f'Event: {event}\n'
 
   def get_state(self):
@@ -262,7 +266,13 @@ class _ResolutionAct(entity_component.ActingComponent):
     del state
 
 
-def _make_director(model, beats=BEATS, extra_context=None, **director_params):
+def _make_director(
+    model,
+    beats=BEATS,
+    extra_context=None,
+    act_public_event=None,
+    **director_params,
+):
   director = drama_director.DramaDirector(
       model=model, beats=beats, **director_params
   )
@@ -274,7 +284,7 @@ def _make_director(model, beats=BEATS, extra_context=None, **director_params):
     context_components.update(extra_context)
   gm = entity_agent_with_logging.EntityAgentWithLogging(
       agent_name='story rules',
-      act_component=_ResolutionAct(director),
+      act_component=_ResolutionAct(director, public_event=act_public_event),
       context_components=context_components,
   )
   return director, gm
@@ -355,7 +365,9 @@ class LifecycleTest(unittest.TestCase):
     self.assertIn('# Current story beat', prompt)
     self.assertIn('Current beat "b1": setup', prompt)
     self.assertIn('Completion question: Is the evidence revealed?', prompt)
-    self.assertIn('## Recent events (oldest first)', prompt)
+    self.assertIn(
+        '## GM complete committed record (not common knowledge)', prompt
+    )
     self.assertIn('- Alice: I hid the letter.', prompt)
     self.assertIn('## Completion criteria', prompt)
     self.assertIn(
@@ -367,11 +379,39 @@ class LifecycleTest(unittest.TestCase):
     self.assertIn('if evidence is missing, answer No', prompt)
     self.assertLess(
         prompt.index('Completion question:'),
-        prompt.index('## Recent events'),
+        prompt.index('## GM complete committed record'),
     )
     self.assertLess(
         prompt.index('## Completion criteria'),
         prompt.index('Question:'),
+    )
+
+  def test_beat_completion_prompt_labels_gm_complete_and_private_note(self):
+    # 设计 6.2：完成问题保留完整 GM 事件窗口（连续性与裁决依据），
+    # 但 events 段改标为 GM 完整已提交记录（非共同知识），且完成判据
+    # 末尾追加私下结果限定句：私下结果可为已发生事实，但要求公开
+    # 告知或当事人同意的条件不能仅凭完整记录中的内容判定成立。
+    model = _BeatModel(False)
+    director, gm = _make_director(model, act_public_event='Alice: （公开动作）')
+    _complete_turn(gm, 'I privately read the date 二〇一九年三月十二日.')
+    prompt = model.choice_prompts[0]
+    self.assertIn(
+        '## GM complete committed record (not common knowledge)', prompt
+    )
+    self.assertNotIn('## Recent events (oldest first)', prompt)
+    # 完整窗口保留：本轮完整事件（公开序列没有的私下日期文本）仍
+    # 条件完成问题。
+    self.assertIn(
+        '- Alice: I privately read the date 二〇一九年三月十二日.', prompt
+    )
+    self.assertNotIn('（公开动作）', prompt)
+    flat = ' '.join(prompt.split())
+    self.assertIn(
+        'A privately resolved outcome may be an established fact that'
+        ' actually happened, but a condition requiring public disclosure or'
+        " the involved party's consent cannot be judged satisfied merely"
+        ' because its content appears in this complete record.',
+        flat,
     )
 
   def test_max_turns_marks_timeout_without_advancing(self):
@@ -618,6 +658,44 @@ class TensionScoringTest(unittest.TestCase):
     # entity's memory component is never read (verified by spy).
     self.assertEqual(probe.accesses, [])
 
+  def test_tension_scoring_reads_public_window(self):
+    # 设计 6.2：张力评分改用公开序列尾部，不再读完整 GM 窗口。构造
+    # 两序列内容不同（完整记录含私下日期、公开序列不含），断言评分
+    # 提示的窗口来自公开序列尾部且不含私下日期；公开序列共三个事件
+    # （窗口为 2），最旧事件被 [-scoring_window:] 截断而不入提示。
+    model = _ScoringModel(False, '5')
+    director, gm = _make_director(
+        model,
+        eval_interval=1,
+        scoring_window=2,
+        act_public_event='Alice: 公开结果。',
+    )
+    state = director.get_state()
+    state['recent_events'] = [
+        'Alice: 完整记录一，私下日期二〇一九年三月十二日。',
+        'Alice: 完整记录二，私下日期二〇一九年三月十二日。',
+    ]
+    state['public_events'] = ['Alice: 公开最旧事件。', 'Alice: 公开旧事件。']
+    director.set_state(state)
+    _complete_turn(gm, 'three')
+    prompt = model.text_prompts[0]
+    self.assertIn('## Recent events (oldest first)', prompt)
+    self.assertIn('- Alice: 公开旧事件。', prompt)
+    self.assertIn('- Alice: 公开结果。', prompt)
+    self.assertLess(
+        prompt.index('- Alice: 公开旧事件。'),
+        prompt.index('- Alice: 公开结果。'),
+    )
+    # 三个公开事件、评分窗口为 2：最旧的公开事件被尾部截断，绝不
+    # 出现在评分提示里（钉住 [-scoring_window:] 切片）。
+    self.assertNotIn('公开最旧事件', prompt)
+    self.assertNotIn('完整记录', prompt)
+    self.assertNotIn('私下日期', prompt)
+    # 完整窗口确实含私下日期（两序列可区分）。
+    self.assertTrue(
+        any('私下日期' in event for event in director.get_committed_events())
+    )
+
   def test_invalid_scoring_config_rejected(self):
     model = mock_model.MockModel()
     invalid_configs: tuple[dict[str, Any], ...] = (
@@ -726,6 +804,32 @@ class DirectiveGenerationTest(unittest.TestCase):
     self.assertIn('novelty for its own sake', prompt)
     self.assertIn('verification or registration chore', prompt)
     self.assertIn('Never make players agree', prompt)
+
+  def test_directive_generation_reads_public_window(self):
+    # 设计 6.2：P3 生成提示的 "Recent public events" 段改由公开序列
+    # 供给：完整记录独有的私下日期不得进入指令生成提示。
+    model = _DirectiveModel(False)
+    director, gm = _make_director(
+        model, act_public_event='Alice: 公开结果。', **_DIRECTOR_FEEDBACK_PARAMS
+    )
+    state = director.get_state()
+    state['recent_events'] = [
+        'Alice: 完整记录一，私下日期二〇一九年三月十二日。',
+        'Alice: 完整记录二，私下日期二〇一九年三月十二日。',
+    ]
+    state['public_events'] = ['Alice: 公开旧事件。']
+    director.set_state(state)
+    _complete_turn(gm, 'three')
+    prompt = next(p for p in model.text_prompts if _DIRECTIVE_MARK in p)
+    self.assertIn('## Recent public events (oldest first)', prompt)
+    self.assertIn('- Alice: 公开旧事件。', prompt)
+    self.assertIn('- Alice: 公开结果。', prompt)
+    self.assertNotIn('完整记录', prompt)
+    self.assertNotIn('私下日期', prompt)
+    # 完整窗口确实含私下日期（两序列可区分）。
+    self.assertTrue(
+        any('私下日期' in event for event in director.get_committed_events())
+    )
 
   def test_low_score_directive_asks_to_raise_tension(self):
     beat = dataclasses.replace(BEATS[0], tension_range=(6, 8))
@@ -1395,6 +1499,125 @@ class RepetitionStateTest(unittest.TestCase):
               repetition_push_enabled=True,
               repetition_check_interval=interval,
           )
+
+
+class AudienceDeliveryTest(unittest.TestCase):
+  """Two-view approval data and the bounded public event sequence."""
+
+  def test_set_validated_resolution_binds_actor_and_version(self):
+    # putative event 后调用 4 参 set_validated_resolution：批准数据
+    # 绑定当轮行动者与受众投递契约版本；getter 返回深拷贝，修改
+    # 返回值不影响内部状态。
+    director, gm = _make_director(_BeatModel(False))
+    gm.observe('[putative_event] Alice: 我私下查看原件。')
+    director.set_validated_resolution(
+        'Alice: 我私下查看原件。\n完整事件保留私下日期。',
+        '完整事件保留私下日期。',
+        'Alice: 我私下查看原件。',
+        '',
+    )
+    data = director.get_validated_delivery_data()
+    assert data is not None
+    self.assertEqual(
+        set(data),
+        {
+            'audience_delivery_version',
+            'actor',
+            'resolved_event',
+            'stage_directions',
+            'public_resolved_event',
+            'public_stage_directions',
+        },
+    )
+    self.assertEqual(data['actor'], 'Alice')
+    self.assertEqual(data['audience_delivery_version'], 1)
+    self.assertEqual(
+        data['resolved_event'],
+        'Alice: 我私下查看原件。\n完整事件保留私下日期。',
+    )
+    self.assertEqual(data['public_resolved_event'], 'Alice: 我私下查看原件。')
+    self.assertEqual(data['public_stage_directions'], '')
+    data['actor'] = 'tampered'
+    data['resolved_event'] = 'tampered'
+    self.assertEqual(director.get_validated_delivery_data()['actor'], 'Alice')
+    self.assertEqual(
+        director.get_validated_delivery_data()['resolved_event'],
+        'Alice: 我私下查看原件。\n完整事件保留私下日期。',
+    )
+
+  def test_new_putative_event_clears_validated_data(self):
+    # 验证后不发 [event]，再送新 putative event：上一轮未提交的
+    # 批准数据被清空，不能读到上轮已批准数据。
+    director, gm = _make_director(_BeatModel(False))
+    gm.observe('[putative_event] Alice: first')
+    director.set_validated_resolution('Alice: first', '', 'Alice: first', '')
+    self.assertIsNotNone(director.get_validated_delivery_data())
+    gm.observe('[putative_event] Alice: second')
+    self.assertIsNone(director.get_validated_delivery_data())
+
+  def test_story_turn_schema3_carries_public_fields(self):
+    # 完整提交一轮后：story turn 升为 schema_version 3，携带
+    # public_resolved_event 与 public_stage_directions；
+    # resolved_event 仍是完整记录，不覆盖为公开文本。
+    director, gm = _make_director(_BeatModel(False))
+    _complete_turn(gm, 'one')
+    turn = director.get_last_story_turn()
+    self.assertEqual(turn['schema_version'], 3)
+    self.assertEqual(turn['resolved_event'], 'Alice: one')
+    self.assertEqual(turn['stage_directions'], '')
+    self.assertEqual(turn['public_resolved_event'], 'Alice: one')
+    self.assertEqual(turn['public_stage_directions'], '')
+
+  def test_public_events_appended_only_on_update_and_bounded(self):
+    # 验证后、update 前：公开序列不含本轮；提交后含本轮
+    # public_resolved_event；空公开事件不入序列；序列最多保留
+    # _PUBLIC_EVENT_WINDOW（100）项（直接构造 101 项数据验证截尾）。
+    director, gm = _make_director(_BeatModel(False))
+    gm.observe('[putative_event] Alice: one')
+    result = gm.act(_RESOLVE_SPEC)
+    self.assertEqual(director.get_public_events(), ())
+    gm.observe(f'[event] {result}')
+    self.assertEqual(director.get_public_events(), ('Alice: one',))
+    # 空公开事件（纯私下轮）不入序列。
+    private_director, private_gm = _make_director(
+        _BeatModel(False), act_public_event=''
+    )
+    _complete_turn(private_gm, 'secret')
+    self.assertEqual(private_director.get_public_events(), ())
+    # 截尾：预置 101 项后提交一轮，序列只留最近 100 项。
+    bounded_director, bounded_gm = _make_director(_BeatModel(False))
+    state = bounded_director.get_state()
+    state['public_events'] = [f'e{i}' for i in range(101)]
+    bounded_director.set_state(state)
+    _complete_turn(bounded_gm, 'new')
+    events = bounded_director.get_public_events()
+    self.assertEqual(len(events), 100)
+    self.assertEqual(events[0], 'e2')
+    self.assertEqual(events[-1], 'Alice: new')
+
+  def test_state_roundtrip_restores_public_events(self):
+    # get_state/set_state 往返后公开序列与编号呈现一致，state 携带
+    # audience_delivery_version == 1，随 checkpoint 恢复。
+    director, gm = _make_director(_BeatModel(False))
+    _complete_turn(gm, 'one')
+    _complete_turn(gm, 'two')
+    state = director.get_state()
+    self.assertEqual(state['audience_delivery_version'], 1)
+    self.assertEqual(state['public_events'], ['Alice: one', 'Alice: two'])
+    fresh, _ = _make_director(_BeatModel(False))
+    fresh.set_state(state)
+    self.assertEqual(fresh.get_state(), state)
+    self.assertEqual(fresh.get_public_events(), director.get_public_events())
+    self.assertEqual(fresh.get_public_history(), director.get_public_history())
+
+  def test_get_public_history_numbered_presentation(self):
+    # 编号呈现与 DisplayEvents 相同：'0). evt1\n1). evt2'。
+    director, gm = _make_director(_BeatModel(False))
+    _complete_turn(gm, 'one')
+    _complete_turn(gm, 'two')
+    self.assertEqual(
+        director.get_public_history(), '0). Alice: one\n1). Alice: two'
+    )
 
 
 class ActionContractParsingTest(unittest.TestCase):

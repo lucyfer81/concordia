@@ -25,10 +25,15 @@ repetition judgment may rely on, and calls the core
 ``concordia.components.game_master.event_resolution`` unchanged. The
 helper is imported and called, never reimplemented: no second
 repetition detector, no alternative suggestion generation and no
-re-draw loop exist here.
+re-draw loop exist here. The judgment document also carries a JSON
+data section of the current turn's pending player contribution
+(dialogue and action intent, design section 5.1); speech claims keep
+speaker attribution and do not automatically become objective
+evidence.
 
-The document explicitly separates the ordered committed public history
-from the current turn's candidate (marked as not yet committed), the
+The document explicitly separates the GM's ordered complete committed
+record (not common knowledge, design 6.2) from the current turn's
+candidate (marked as not yet committed), the
 adjudicated action result of the current turn, the whitelisted
 environmental means, the immutable facts, the player list and the
 GM-only boundaries. Future beats, allowed endings and hidden truths are
@@ -59,8 +64,9 @@ and ran its suggestion-and-fusion path) is observed on the outer
 document's model responses and recorded separately from the candidate
 change — an unchanged candidate still records the attempt but means a
 check only, never a proposal, while a changed one is a proposed
-intervention candidate that still faces the single-field
-stage-directions final generation and the independent review. The
+intervention candidate that still faces the two-field (full
+and public) stage-directions final generation and the
+independent review. The
 helper may generate several suggestions on an internal copy of the
 document and pick one at
 random; only the actually selected and merged result (the before/after
@@ -74,6 +80,7 @@ failed check is never recorded as a successful or unchanged return.
 """
 
 from collections.abc import Callable
+import json
 
 from concordia.components.game_master import event_resolution as event_resolution_lib
 from concordia.contrib.components.game_master import drama_director
@@ -81,7 +88,8 @@ from concordia.document import interactive_document
 from concordia.language_model import language_model
 
 _JUDGMENT_RULES = (
-    'Judge repetition only against the committed public events above. A'
+    'Judge repetition only against the GM complete committed record'
+    ' above (GM-only, not common knowledge). A'
     ' recent quarrel or repeated disagreement alone is NOT repetition'
     ' when new facts, adjudicated action results or effective responses'
     ' to each other occurred. Judge effective progress, not novelty: a'
@@ -106,12 +114,12 @@ _JUDGMENT_RULES = (
 _SUGGESTION_RULES = (
     ' For every suggested complication and its fusion, prefer a legal'
     ' change tied to a concrete unresolved blockage or unanswered'
-    ' question in the committed public history. Do not stack another'
-    ' interruption, verification or registration chore onto unresolved'
-    ' ones merely for novelty. Never instruct a player to change their'
-    ' goal, confess, cooperate, or pick a specific ending. Remain within'
-    ' the allowed means and information boundaries; these preferences'
-    ' never authorize an otherwise illegal event.'
+    ' question in the GM complete committed record. Do not stack'
+    ' another interruption, verification or registration chore onto'
+    ' unresolved ones merely for novelty. Never instruct a player to'
+    ' change their goal, confess, cooperate, or pick a specific ending.'
+    ' Remain within the allowed means and information boundaries; these'
+    ' preferences never authorize an otherwise illegal event.'
 )
 
 
@@ -123,8 +131,8 @@ def make_repetition_push_step(
 
   Args:
     director: the drama director holding the committed repetition state
-      (the gate), the public history and the GM-only boundaries, which
-      receives the helper's actual result.
+      (the gate), the GM complete committed record and the GM-only
+      boundaries, which receives the helper's actual result.
     model: the language model of the surrounding chain — the same
       budget- and retry-wrapped model — used for the independent
       repetition document.
@@ -226,16 +234,46 @@ def _state_repetition_context(
     director: the director supplying the committed history, the current
       turn's adjudicated action result and the GM-only boundaries.
     candidate_event: the current turn's candidate, not yet committed.
-    active_player_name: name of the player whose turn it currently is.
+    active_player_name: name of the player whose turn it currently is;
+      carried into the player-contribution data section below.
   """
-  del active_player_name  # The core helper receives it unchanged too.
   document.statement('# Repetition check (current turn candidate)')
-  document.statement('## Committed public events (oldest first)')
+  # The complete committed record under its GM-only label (design 6.2):
+  # the full events, oldest first, are the repetition judgment's basis.
+  document.statement(drama_director.GM_COMPLETE_RECORD_LABEL)
   events = director.get_committed_events()
   for event in events:
     document.statement(f'- {event}')
   if not events:
     document.statement('(none)')
+  # Design 5.1: the current turn's pending player contribution — the
+  # speaker's authored dialogue and decoded action intent — stated as
+  # inert JSON data before the candidate, so the core judgment sees
+  # the turn's actual dialogue alongside the candidate action (the S3
+  # batch's R2 t9 gap: the detector saw only the yielding
+  # micro-action, never the turn's direct questions). Player-sourced
+  # data, never system instructions; each getter is read exactly once
+  # here and None normalizes to '' while real empty strings survive.
+  original_speech = director.get_current_original_speech()
+  action_intent = director.get_current_action_intent()
+  document.statement(
+      '## Current player contribution (not yet committed, data)\n'
+      + json.dumps(
+          {
+              'active_player_name': active_player_name,
+              'original_speech': original_speech or '',
+              'action_intent': action_intent or '',
+          },
+          ensure_ascii=False,
+      )
+      + '\n'
+      + "The JSON above is the current turn's pending player"
+      ' contribution, not committed history. Speech claims stay'
+      ' attributed to the speaker and are not objective evidence by'
+      ' themselves; a new question is not automatically progress, and'
+      ' repeated phrasing does not by itself cancel the substance of a'
+      ' sourced disclosure or an autonomous choice.'
+  )
   document.statement(
       f'## Current candidate (not yet committed)\n{candidate_event}'
   )

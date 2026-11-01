@@ -190,7 +190,10 @@ class SlotDisciplineTest(unittest.TestCase):
     self.assertIsNotNone(s1.frozen_text)
     self.assertEqual(
         json.loads(s1.frozen_text or ''),
-        {'stage_directions': case.stage_directions},
+        {
+            'stage_directions': case.stage_directions,
+            'public_stage_directions': case.stage_directions,
+        },
     )
     self.assertEqual(s2.slot_id, 'REV01__m4__s2_review')
     self.assertEqual(s2.kind, 'real')

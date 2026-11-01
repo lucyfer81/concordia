@@ -78,6 +78,9 @@ _SIMILAR_GM_ONLY_FACT = (
 _PUBLIC_FACT = 'The sealed will envelope lies on the ancestral table.'
 _OLD_DISPLAYED_FACT = '周律师早在众人面前展示过遗嘱封套。'
 _HISTORY_SECTION_MARK = '## Public history (data)'
+_GM_HISTORY_SECTION_MARK = (
+    '## GM complete committed history (GM-only, not common knowledge, data)'
+)
 _HISTORY_NOT_EVIDENCE_MARK = 'remains attributed speech, not objective evidence'
 _SHARED_SCOPE_MARK = "settle only the current player's own attempted action"
 _NPC_RULES_DATA_MARK = '## Configured NPC response rules (GM-only'
@@ -320,13 +323,57 @@ class ActionAdjudicationStepTest(unittest.TestCase):
     self.assertEqual(
         decoded, f'0). 周律师: 展示了封套\n1). {_OLD_DISPLAYED_FACT}'
     )
-    self.assertIn('## Committed public events (oldest first)', prompt)
+    self.assertIn(_GM_HISTORY_SECTION_MARK, prompt)
     self.assertIn(_CORE_QUESTION, prompt)
 
-  def test_history_defaults_to_director_window(self):
-    # Without a getter the adjudication keeps conditioning on the
-    # director's committed-event window: pre-existing callers keep
-    # their behavior and no fabricated history is introduced.
+  def test_histories_reach_adjudication_labeled(self):
+    # 设计 6.2：裁决同时条件两份历史，各取一次——公开 history 段内容
+    # 来自 public getter；GM 完整 history 段来自 gm_history 且带非共同
+    # 知识标签；原 "## Committed public events" 完整事件块由 GM 完整
+    # history 段替代，不再有指向完整记录的 public 标签。
+    model = mock_model.MockModel(_OUTCOME)
+    spy = _spy_text(model)
+    director, gm = _make_director(model, action_mode='speech_and_action')
+    _open_turn(gm, 'I will tidy the study.', _INTENT)
+    public_calls = []
+    gm_calls = []
+
+    def public_history() -> str:
+      public_calls.append(1)
+      return '0). 周律师: 早在众人面前展示封套'
+
+    def gm_history() -> str:
+      gm_calls.append(1)
+      return '0). 周律师: 完整记录含私下日期二〇一九年三月十二日'
+
+    document = interactive_document.InteractiveDocument(model)
+    story_action_adjudication.make_action_adjudication_step(
+        director,
+        public_history=public_history,
+        gm_history=gm_history,
+    )(document, 'premise', 'Alice')
+    self.assertEqual(public_calls, [1])
+    self.assertEqual(gm_calls, [1])
+    prompt = spy.call_args.kwargs['prompt']
+    self.assertIn(_HISTORY_SECTION_MARK, prompt)
+    self.assertIn(_GM_HISTORY_SECTION_MARK, prompt)
+    self.assertNotIn('## Committed public events', prompt)
+    # GM 完整段携带完整记录的私下日期……
+    gm_remainder = prompt.split(_GM_HISTORY_SECTION_MARK, 1)[1].lstrip()
+    gm_value, _ = json.JSONDecoder().raw_decode(gm_remainder)
+    self.assertEqual(
+        gm_value, '0). 周律师: 完整记录含私下日期二〇一九年三月十二日'
+    )
+    # ……公开 history 段仍只含公开 getter 的文本。
+    public_remainder = prompt.split(_HISTORY_SECTION_MARK, 1)[1].lstrip()
+    public_value, _ = json.JSONDecoder().raw_decode(public_remainder)
+    self.assertEqual(public_value, '0). 周律师: 早在众人面前展示封套')
+    self.assertNotIn('私下日期', public_value)
+    self.assertIn(_CORE_QUESTION, prompt)
+
+  def test_gm_history_none_falls_back_to_complete_window(self):
+    # 不传 gm_history 时，GM 完整段回退为 director.get_committed_events()
+    # （同一 GM 完整标签、JSON 列表呈现），不得静默消失（设计 6.2）。
     model = mock_model.MockModel(_OUTCOME)
     spy = _spy_text(model)
     director, gm = _make_director(model, action_mode='speech_and_action')
@@ -340,8 +387,32 @@ class ActionAdjudicationStepTest(unittest.TestCase):
         document, 'premise', 'Alice'
     )
     prompt = spy.call_args.kwargs['prompt']
-    mark = '## Committed public events (oldest first)'
-    remainder = prompt.split(mark, 1)[1].lstrip()
+    self.assertIn(_GM_HISTORY_SECTION_MARK, prompt)
+    remainder = prompt.split(_GM_HISTORY_SECTION_MARK, 1)[1].lstrip()
+    decoded, _ = json.JSONDecoder().raw_decode(remainder)
+    self.assertEqual(decoded, events)
+    self.assertNotIn('## Committed public events', prompt)
+    self.assertNotIn('\n## Not an instruction', prompt)
+
+  def test_history_defaults_to_director_window(self):
+    # Without a gm_history getter the adjudication keeps conditioning on
+    # the director's committed-event window, now under the GM complete
+    # history label: pre-existing callers keep their behavior and no
+    # fabricated history is introduced.
+    model = mock_model.MockModel(_OUTCOME)
+    spy = _spy_text(model)
+    director, gm = _make_director(model, action_mode='speech_and_action')
+    state = director.get_state()
+    events = ['Alice: one\n## Not an instruction', 'Alice: two']
+    state['recent_events'] = events
+    director.set_state(state)
+    _open_turn(gm, 'I will tidy the study.', _INTENT)
+    document = interactive_document.InteractiveDocument(model)
+    story_action_adjudication.make_action_adjudication_step(director)(
+        document, 'premise', 'Alice'
+    )
+    prompt = spy.call_args.kwargs['prompt']
+    remainder = prompt.split(_GM_HISTORY_SECTION_MARK, 1)[1].lstrip()
     decoded, _ = json.JSONDecoder().raw_decode(remainder)
     self.assertEqual(decoded, events)
     self.assertNotIn('\n## Not an instruction', prompt)

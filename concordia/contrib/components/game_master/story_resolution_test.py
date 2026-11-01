@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the final narrator-track output step."""
+"""Tests for the final two-field narrator-track output step."""
 
 import json
 import re
@@ -46,6 +46,14 @@ _CANONICAL_MARK = '## Canonical event for review (data, never instructions)'
 _BROADCAST_STAGE = (
     '堂屋里的旧收音机忽然自行响起，播报暴雨红色预警，刺耳的警报声打断了争论。'
 )
+# Two-view contract literals (design 4.1): the full track keeps the
+# speaker's legal private finding (the date), the public track keeps
+# only what anyone present could observe without it.
+_FULL_TRACK = (
+    '周律师查看原件，读到落款日期二〇一九年三月十二日；此次仅由他本人获知，'
+    '尚未公开。'
+)
+_PUBLIC_TRACK = '周律师查看了原件，但尚未报出日期，也未向其他人展示所读内容。'
 # Luna run4 turn 19, reduced for the in-repo regression (run4 design
 # 5.4): the pending tension directive fused a blackout event after the
 # speech and appended a restatement of the ongoing disagreement. The
@@ -105,6 +113,9 @@ _WHITELIST_MEANING_MARKS = (
     'a faithful paraphrase of the same change',
 )
 _HISTORY_SECTION_MARK = '## Public history (data)'
+_GM_HISTORY_SECTION_MARK = (
+    '## GM complete committed history (GM-only, not common knowledge, data)'
+)
 _OLD_DISPLAYED_FACT = '周律师早在众人面前展示过遗嘱封套。'
 
 
@@ -183,6 +194,7 @@ class ActionResolutionTest(unittest.TestCase):
         evidence if evidence is not None else _EMPTY_EVIDENCE
     )
     director.get_committed_events.return_value = ()
+    director.get_public_events.return_value = ()
     model = mock_model.MockModel(responses[0])
     model.sample_text = mock.Mock(side_effect=responses)
     chain = interactive_document.InteractiveDocument(model)
@@ -210,13 +222,13 @@ class ActionResolutionTest(unittest.TestCase):
     result = step(chain, 'Alice: I hid the letter under the stairs.', 'Alice')
     return result, director, model
 
-  def test_single_field_output_assembles_speech_and_stage(self):
+  def test_dual_field_output_keeps_intervention_broadcast(self):
     # Luna broadcast regression (spec 9, line 1), shaped after the real
     # failure: the model used to lose the intervention's radio
     # broadcast while copying dialogue into the redundant event field.
-    # Under the single-field contract the model only narrates the
-    # broadcast and the canonical event is assembled programmatically,
-    # so the broadcast can no longer be dropped.
+    # Under the two-field contract the model only narrates the
+    # broadcast and both canonical events are assembled
+    # programmatically, so the broadcast can no longer be dropped.
     speech = '都什么时候了，还在翻旧账。'
     intervention = {
         'reason': 'tension',
@@ -226,7 +238,10 @@ class ActionResolutionTest(unittest.TestCase):
     director, model, chain, step = self._make(
         speech=speech,
         responses=[
-            json.dumps({'stage_directions': _BROADCAST_STAGE}),
+            json.dumps({
+                'stage_directions': _BROADCAST_STAGE,
+                'public_stage_directions': _BROADCAST_STAGE,
+            }),
             _APPROVAL,
         ],
         evidence={'action_result': None, 'intervention': intervention},
@@ -235,7 +250,7 @@ class ActionResolutionTest(unittest.TestCase):
     expected = f'王婶: {speech}\n' + _BROADCAST_STAGE
     self.assertEqual(result, expected)
     director.set_validated_resolution.assert_called_once_with(
-        expected, _BROADCAST_STAGE
+        expected, _BROADCAST_STAGE, expected, _BROADCAST_STAGE
     )
     generation, review = [
         call.kwargs['prompt'] for call in model.sample_text.call_args_list
@@ -243,7 +258,201 @@ class ActionResolutionTest(unittest.TestCase):
     canonical = _read_canonical_section(review)
     self.assertEqual(canonical['resolved_event'], expected)
     self.assertEqual(canonical['stage_directions'], _BROADCAST_STAGE)
-    self.assertIn('exactly one string field', generation)
+    self.assertIn('exactly two string fields', generation)
+
+  def test_dual_field_output_assembles_both_canonicals(self):
+    # 双字段契约（设计 4.1）：同一次生成给出完整与公开两条旁白，
+    # 代码用同一份 original_speech 分别拼装两份 canonical；完整
+    # 事件保留私下日期，公开事件只保留可观察的查看行为。
+    speech = '我当着大家的面，把原件拿稳了仔细看。'
+    director, model, chain, step = self._make(
+        speech=speech,
+        responses=[
+            json.dumps(
+                {
+                    'stage_directions': _FULL_TRACK,
+                    'public_stage_directions': _PUBLIC_TRACK,
+                },
+                ensure_ascii=False,
+            ),
+            _APPROVAL,
+        ],
+    )
+    result = step(chain, f'周律师: {speech}', '周律师')
+    self.assertEqual(result, f'周律师: {speech}\n{_FULL_TRACK}')
+    director.set_validated_resolution.assert_called_once_with(
+        f'周律师: {speech}\n{_FULL_TRACK}',
+        _FULL_TRACK,
+        f'周律师: {speech}\n{_PUBLIC_TRACK}',
+        _PUBLIC_TRACK,
+    )
+    _, review = [
+        call.kwargs['prompt'] for call in model.sample_text.call_args_list
+    ]
+    canonical = _read_canonical_section(review)
+    self.assertEqual(
+        canonical['resolved_event'], f'周律师: {speech}\n{_FULL_TRACK}'
+    )
+    self.assertEqual(canonical['stage_directions'], _FULL_TRACK)
+    self.assertEqual(
+        canonical['public_resolved_event'], f'周律师: {speech}\n{_PUBLIC_TRACK}'
+    )
+    self.assertEqual(canonical['public_stage_directions'], _PUBLIC_TRACK)
+
+  def test_mixed_result_keeps_public_action_and_private_finding_separate(self):
+    # Scripted approval verifies the prompt and view wiring, not a
+    # real model's ability to judge the audience boundary.
+    speech = '我先看一眼落款。'
+    public_action = '周律师在众人面前翻开原件并查看落款。'
+    private_finding = '只有他本人读到日期二〇一九年三月十二日，尚未公开。'
+    full = public_action + private_finding
+    public = public_action + '他尚未报出日期，也未展示所读内容。'
+    director, model, chain, step = self._make(
+        speech=speech,
+        action_intent='翻开原件查看落款，不向其他人展示所读内容。',
+        evidence={'action_result': full, 'intervention': None},
+        responses=[
+            json.dumps({
+                'stage_directions': full,
+                'public_stage_directions': public,
+            }),
+            _APPROVAL,
+        ],
+    )
+    result = step(chain, f'周律师: {speech}', '周律师')
+    director.set_validated_resolution.assert_called_once_with(
+        result, full, f'周律师: {speech}\n{public}', public
+    )
+    self.assertEqual(model.sample_text.call_count, 2)
+    generation, review = [
+        call.kwargs['prompt'] for call in model.sample_text.call_args_list
+    ]
+    for prompt in (generation, review):
+      self.assertEqual(_read_evidence_section(prompt)['action_result'], full)
+      rule4 = ' '.join(
+          prompt.split('4. Respect', 1)[1].split('\n5.', 1)[0].split()
+      )
+      self.assertIn('only the portions learned privately', rule4)
+      self.assertIn(
+          'publicly visible portions also support the PUBLIC view', rule4
+      )
+    canonical = _read_canonical_section(review)
+    self.assertEqual(canonical['stage_directions'], full)
+    self.assertEqual(canonical['public_stage_directions'], public)
+    self.assertIn(public_action, canonical['resolved_event'])
+    self.assertIn(public_action, canonical['public_resolved_event'])
+    self.assertIn(private_finding, canonical['resolved_event'])
+    self.assertNotIn('二〇一九年三月十二日', canonical['public_resolved_event'])
+
+  def test_strict_dual_key_set(self):
+    # 缺 public_stage_directions、多 resolved_event、非字符串值、
+    # 重复键都判格式失败：结构校验发生在评审之前，且
+    # director.set_validated_resolution 不被调用。
+    bad_responses = (
+        ('missing public', json.dumps({'stage_directions': 'y'})),
+        (
+            'extra resolved_event',
+            json.dumps({
+                'resolved_event': 'x',
+                'stage_directions': 'y',
+                'public_stage_directions': 'z',
+            }),
+        ),
+        (
+            'extra note',
+            json.dumps({
+                'stage_directions': 'y',
+                'public_stage_directions': 'z',
+                'note': 1,
+            }),
+        ),
+        (
+            'non-string public',
+            json.dumps({'stage_directions': 'y', 'public_stage_directions': 5}),
+        ),
+        (
+            'non-string full',
+            json.dumps(
+                {'stage_directions': ['y'], 'public_stage_directions': 'z'}
+            ),
+        ),
+        (
+            'duplicate key',
+            (
+                '{"stage_directions": "a", "public_stage_directions": "b",'
+                ' "public_stage_directions": "c"}'
+            ),
+        ),
+    )
+    for label, response in bad_responses:
+      with self.subTest(label=label):
+        director, model, chain, step = self._make(
+            speech=None, responses=[response, _APPROVAL]
+        )
+        with self.assertRaises(story_resolution.StoryOutputError):
+          step(chain, 'Alice: I hid the letter under the stairs.', 'Alice')
+        self.assertEqual(model.sample_text.call_count, 1)
+        director.set_validated_resolution.assert_not_called()
+
+  def test_empty_public_track_for_speech_turn_keeps_public_event_speech(self):
+    # 纯对白 + 公开旁白空串：公开事件仍逐字保留公开发言，非空
+    # （设计 4.1：speech 是场景内公开发言，所有在场者收到）。
+    speech = '都什么时候了，还在翻旧账。'
+    result, director, _ = self._run(
+        json.dumps({'stage_directions': '', 'public_stage_directions': ''}),
+        speech=speech,
+    )
+    self.assertEqual(result, f'Alice: {speech}')
+    director.set_validated_resolution.assert_called_once_with(
+        f'Alice: {speech}', '', f'Alice: {speech}', ''
+    )
+
+  def test_generation_and_review_token_limits_unchanged(self):
+    # 双字段加长了输出，但预算边界不动（设计 5：截断必须记为
+    # 真实格式失败，不能暗中提限）：生成仍 2000、评审仍 1000。
+    speech = '都什么时候了，还在翻旧账。'
+    director, model, chain, step = self._make(
+        speech=speech,
+        responses=[
+            json.dumps({
+                'stage_directions': _BROADCAST_STAGE,
+                'public_stage_directions': _BROADCAST_STAGE,
+            }),
+            _APPROVAL,
+        ],
+    )
+    step(chain, f'王婶: {speech}', '王婶')
+    generation_call, review_call = model.sample_text.call_args_list
+    self.assertEqual(generation_call.kwargs['max_tokens'], 2000)
+    self.assertEqual(review_call.kwargs['max_tokens'], 1000)
+
+  def test_call_counts_one_generation_one_review(self):
+    # 成功路径与拒绝路径各恰好一次生成加一次评审；双字段契约
+    # 不新增任何模型调用（设计 5、8）。
+    speech = '都什么时候了，还在翻旧账。'
+    payload = json.dumps({
+        'stage_directions': _BROADCAST_STAGE,
+        'public_stage_directions': _BROADCAST_STAGE,
+    })
+    _, director, model = self._run(payload, speech=speech)
+    self.assertEqual(model.sample_text.call_count, 2)
+    director.set_validated_resolution.assert_called_once()
+    director2, model2, chain2, step2 = self._make(
+        speech=speech,
+        responses=[
+            payload,
+            json.dumps({
+                'valid': False,
+                'reason': 'The public view leaked the private date.',
+            }),
+        ],
+    )
+    with self.assertRaisesRegex(
+        story_resolution.StoryOutputError, 'leaked the private date'
+    ):
+      step2(chain2, f'王婶: {speech}', '王婶')
+    self.assertEqual(model2.sample_text.call_count, 2)
+    director2.set_validated_resolution.assert_not_called()
 
   def test_reviewed_event_equals_committed_event(self):
     # Distinctness check (spec 9): the event the review judges, the
@@ -258,7 +467,10 @@ class ActionResolutionTest(unittest.TestCase):
     director, model, chain, step = self._make(
         speech=speech,
         responses=[
-            json.dumps({'stage_directions': _BROADCAST_STAGE}),
+            json.dumps({
+                'stage_directions': _BROADCAST_STAGE,
+                'public_stage_directions': _BROADCAST_STAGE,
+            }),
             _APPROVAL,
         ],
         evidence={'action_result': None, 'intervention': intervention},
@@ -276,7 +488,10 @@ class ActionResolutionTest(unittest.TestCase):
   def test_fenced_json_parses(self):
     # Models sporadically wrap the requested JSON object in markdown code
     # fences despite an "output only the JSON object" instruction.
-    payload = json.dumps({'stage_directions': 'Thunder rattles the windows.'})
+    payload = json.dumps({
+        'stage_directions': 'Thunder rattles the windows.',
+        'public_stage_directions': 'Thunder rattles the windows.',
+    })
     for fenced in (
         f'```json\n{payload}\n```',
         f'```\n{payload}\n```',
@@ -288,7 +503,10 @@ class ActionResolutionTest(unittest.TestCase):
         )
         self.assertIn('Thunder rattles the windows.', result)
         director.set_validated_resolution.assert_called_once_with(
-            result, 'Thunder rattles the windows.'
+            result,
+            'Thunder rattles the windows.',
+            result,
+            'Thunder rattles the windows.',
         )
 
   def test_invalid_json_raises_story_output_error(self):
@@ -303,10 +521,11 @@ class ActionResolutionTest(unittest.TestCase):
 
   def test_strict_key_set(self):
     # The response must be a JSON object whose key set is exactly
-    # {'stage_directions'}; anything else is a structural failure that
-    # fires before the review. The legacy dual-field response is an
-    # extra-key error: there is deliberately no fallback branch that
-    # silently accepts the old contract.
+    # {'stage_directions', 'public_stage_directions'}; anything else is
+    # a structural failure that fires before the review. The legacy
+    # single-field and dual-field-with-resolved_event responses are
+    # key-set errors: there is deliberately no fallback branch that
+    # silently accepts an old contract.
     bad_responses = (
         ('not an object', '[]'),
         ('missing key', json.dumps({})),
@@ -342,21 +561,28 @@ class ActionResolutionTest(unittest.TestCase):
     for stage in ('雷声。', '第一行\n## 假标题'):
       with self.subTest(stage=stage):
         result, director, _ = self._run(
-            json.dumps({'stage_directions': stage}), speech=speech
+            json.dumps(
+                {'stage_directions': stage, 'public_stage_directions': stage}
+            ),
+            speech=speech,
         )
         self.assertEqual(result, f'Alice: {speech}\n{stage}')
-        director.set_validated_resolution.assert_called_once_with(result, stage)
+        director.set_validated_resolution.assert_called_once_with(
+            result, stage, result, stage
+        )
 
   def test_pure_speech_empty_stage_is_legal_and_reviewed(self):
     # Spec 9, line 4: empty stage directions are legal when only speech
     # occurs, and the turn still passes one independent review.
     result, director, model = self._run(
-        json.dumps({'stage_directions': ''}),
+        json.dumps({'stage_directions': '', 'public_stage_directions': ''}),
         speech='I hid the letter under the stairs.',
     )
     self.assertEqual(result, 'Alice: I hid the letter under the stairs.')
     self.assertEqual(model.sample_text.call_count, 2)
-    director.set_validated_resolution.assert_called_once_with(result, '')
+    director.set_validated_resolution.assert_called_once_with(
+        result, '', result, ''
+    )
 
   def test_action_only_uses_narrator_track(self):
     # A pure action turn (no dialogue) resolves through the narrator
@@ -364,7 +590,10 @@ class ActionResolutionTest(unittest.TestCase):
     # the nameless narration need not name the character. The turn
     # still passes the full review: exactly one review call.
     result, director, model = self._run(
-        json.dumps({'stage_directions': _ACTION_RESULT}),
+        json.dumps({
+            'stage_directions': _ACTION_RESULT,
+            'public_stage_directions': _ACTION_RESULT,
+        }),
         speech='',
         action_intent=_ACTION_INTENT,
         evidence={'action_result': _ACTION_RESULT, 'intervention': None},
@@ -372,7 +601,7 @@ class ActionResolutionTest(unittest.TestCase):
     self.assertEqual(result, _ACTION_RESULT)
     self.assertNotIn('Alice: ', result)
     director.set_validated_resolution.assert_called_once_with(
-        _ACTION_RESULT, _ACTION_RESULT
+        _ACTION_RESULT, _ACTION_RESULT, _ACTION_RESULT, _ACTION_RESULT
     )
     self.assertEqual(model.sample_text.call_count, 2)
 
@@ -380,7 +609,10 @@ class ActionResolutionTest(unittest.TestCase):
     # The intent is a proposal, never an outcome: without the core's
     # adjudicated result the step must fail before generation. The
     # reviewer is scripted to approve, yet is never even consulted.
-    payload = json.dumps({'stage_directions': 'The lock opens.'})
+    payload = json.dumps({
+        'stage_directions': 'The lock opens.',
+        'public_stage_directions': 'The lock opens.',
+    })
     for missing in (None, ''):
       with self.subTest(missing=missing):
         director, model, chain, step = self._make(
@@ -436,7 +668,13 @@ class ActionResolutionTest(unittest.TestCase):
         }
         director, model, chain, step = self._make(
             speech='I hid the letter under the stairs.',
-            responses=[json.dumps({'stage_directions': stage}), _APPROVAL],
+            responses=[
+                json.dumps({
+                    'stage_directions': stage,
+                    'public_stage_directions': stage,
+                }),
+                _APPROVAL,
+            ],
             action_intent=intent,
             evidence=evidence,
         )
@@ -453,7 +691,10 @@ class ActionResolutionTest(unittest.TestCase):
     # approving verdict can bypass it.
     director, model, chain, step = self._make(
         speech='',
-        responses=[json.dumps({'stage_directions': ''}), _APPROVAL],
+        responses=[
+            json.dumps({'stage_directions': '', 'public_stage_directions': ''}),
+            _APPROVAL,
+        ],
     )
     with self.assertRaisesRegex(
         story_resolution.StoryOutputError, 'canonical event is empty'
@@ -476,7 +717,10 @@ class ActionResolutionTest(unittest.TestCase):
         director, model, chain, step = self._make(
             speech='I hid the letter under the stairs.',
             responses=[
-                json.dumps({'stage_directions': stage}),
+                json.dumps({
+                    'stage_directions': stage,
+                    'public_stage_directions': stage,
+                }),
                 json.dumps({
                     'valid': False,
                     'reason': 'The adjudicated action result was not kept.',
@@ -513,7 +757,10 @@ class ActionResolutionTest(unittest.TestCase):
     director, model, chain, step = self._make(
         speech='I hid the letter under the stairs.',
         responses=[
-            json.dumps({'stage_directions': 'The candles flicker.'}),
+            json.dumps({
+                'stage_directions': 'The candles flicker.',
+                'public_stage_directions': 'The candles flicker.',
+            }),
             json.dumps({
                 'valid': False,
                 'reason': 'The intervention candidate was silently dropped.',
@@ -536,7 +783,10 @@ class ActionResolutionTest(unittest.TestCase):
     director, model, chain, step = self._make(
         speech='I hid the letter under the stairs.',
         responses=[
-            json.dumps({'stage_directions': 'The hidden letter stays hidden.'}),
+            json.dumps({
+                'stage_directions': 'The hidden letter stays hidden.',
+                'public_stage_directions': 'The hidden letter stays hidden.',
+            }),
             json.dumps({
                 'valid': False,
                 'reason': 'Rephrasing is not intervention integration.',
@@ -553,8 +803,9 @@ class ActionResolutionTest(unittest.TestCase):
     director.commit_directive.assert_not_called()
 
   def test_invalid_output_is_not_stored_in_director(self):
-    # The legacy dual-field response is a structural error under the
-    # single-field contract, and nothing is stored in the director.
+    # A response carrying the forbidden 'resolved_event' key is a
+    # structural error under the two-field contract, and nothing is
+    # stored in the director.
     director = mock.MagicMock()
     director.get_current_original_speech.return_value = (
         'I hid the letter under the stairs.'
@@ -562,6 +813,7 @@ class ActionResolutionTest(unittest.TestCase):
     director.get_current_action_intent.return_value = None
     director.get_current_resolution_evidence.return_value = _EMPTY_EVIDENCE
     director.get_committed_events.return_value = ()
+    director.get_public_events.return_value = ()
     model = mock_model.MockModel(
         json.dumps({
             'resolved_event': 'x',
@@ -620,6 +872,9 @@ class ActionResolutionTest(unittest.TestCase):
         'stage_directions': (
             'The lock holds. A storm cuts the power to the house.'
         ),
+        'public_stage_directions': (
+            'The lock holds. A storm cuts the power to the house.'
+        ),
     })
     result, director, model = self._run(
         payload,
@@ -654,7 +909,10 @@ class ActionResolutionTest(unittest.TestCase):
     # exactly the current speaker's own explicitly proposed, adjudicated
     # action and its result, and keep the others'-autonomy and secret
     # boundaries.
-    payload = json.dumps({'stage_directions': 'The lock holds.'})
+    payload = json.dumps({
+        'stage_directions': 'The lock holds.',
+        'public_stage_directions': 'The lock holds.',
+    })
     _, _, model = self._run(
         payload,
         speech='I hid the letter under the stairs.',
@@ -690,7 +948,10 @@ class ActionResolutionTest(unittest.TestCase):
     director, model, chain, step = self._make(
         speech='我先看看那个花瓶。',
         responses=[
-            json.dumps({'stage_directions': '林雪取下了空花瓶。'}),
+            json.dumps({
+                'stage_directions': '林雪取下了空花瓶。',
+                'public_stage_directions': '林雪取下了空花瓶。',
+            }),
             json.dumps({
                 'valid': False,
                 'reason': 'The adjudicated outcome fabricated paper ash.',
@@ -756,14 +1017,22 @@ class ActionResolutionTest(unittest.TestCase):
         }
         director, model, chain, step = self._make(
             speech='我先确认一下。',
-            responses=[json.dumps({'stage_directions': stage}), _APPROVAL],
+            responses=[
+                json.dumps({
+                    'stage_directions': stage,
+                    'public_stage_directions': stage,
+                }),
+                _APPROVAL,
+            ],
             action_intent=intent,
             evidence=evidence,
         )
         director.get_committed_events.return_value = history
         result = step(chain, 'candidate', actor)
         self.assertEqual(result, f'{actor}: 我先确认一下。\n{stage}')
-        director.set_validated_resolution.assert_called_once_with(result, stage)
+        director.set_validated_resolution.assert_called_once_with(
+            result, stage, result, stage
+        )
         review = model.sample_text.call_args_list[1].kwargs['prompt']
         decoded = _read_evidence_section(review)
         self.assertEqual(decoded['active_player_name'], actor)
@@ -784,7 +1053,12 @@ class ActionResolutionTest(unittest.TestCase):
     }
     director, model, chain, _ = self._make(
         speech='我先听听。',
-        responses=[json.dumps({'stage_directions': event}), _APPROVAL],
+        responses=[
+            json.dumps(
+                {'stage_directions': event, 'public_stage_directions': event}
+            ),
+            _APPROVAL,
+        ],
         evidence={'action_result': None, 'intervention': intervention},
     )
     step = story_resolution.make_final_output_step(
@@ -841,6 +1115,9 @@ class ActionResolutionTest(unittest.TestCase):
                     'stage_directions': (
                         '各方一致同意暂停处理；笔记内容均为已证实的客观事实。'
                     ),
+                    'public_stage_directions': (
+                        '各方一致同意暂停处理；笔记内容均为已证实的客观事实。'
+                    ),
                 }),
                 json.dumps({'valid': False, 'reason': reason}),
             ],
@@ -855,6 +1132,198 @@ class ActionResolutionTest(unittest.TestCase):
         director.commit_directive.assert_not_called()
 
 
+# Heading fingerprint of the generation-only result-fidelity guidance
+# (design 4.2). All content marks are asserted after whitespace
+# normalization (' '.join(prompt.split())) because pyink wraps the
+# constant at column 80, splitting phrases across lines.
+_RESULT_GUIDANCE_MARK = 'Deliver this turn'
+_RESULT_GUIDANCE_MARKS = (
+    _RESULT_GUIDANCE_MARK,
+    'no witness signature was found anywhere in the document',
+    'Do not narrow the examined scope back to an earlier partial',
+    'you need not copy the `action_result` verbatim',
+    'Fidelity never overrides authorization and audience boundaries',
+)
+
+# Frozen excerpts of the S3 batch R1 t8 failure (design 2.1), sources:
+# run_results/story_enactment/s3_diagnostic_story/20261024T063748Z/
+# raw/R1__a000061.response.txt (adjudicated result) and
+# raw/R1__a000062.response.txt (omitting draft), trimmed for the test.
+_R1T8_INTENT = '周律师调整自己持握的原件角度，仔细查阅全文书写形式与签署情况。'
+_R1T8_RESULT = (
+    '周律师完成了调整原件角度并仔细阅看的动作，纸张始终由他持握。他'
+    '核对到全文落款为二〇一九年三月十二日，有陈望山的签名与手印，全文'
+    '未见见证人署名。现有可确认的文书内容不足以确定正文是否由陈望山'
+    '亲笔书写。'
+)
+_R1T8_OMITTING_DRAFT = json.dumps(
+    {
+        'stage_directions': '周律师核对了全文的落款与签署情况。',
+        'public_stage_directions': '周律师核对了全文的落款与签署情况。',
+    },
+    ensure_ascii=False,
+)
+
+
+class ResultFidelityGuidanceTest(unittest.TestCase):
+  """The generation-only guidance rides the existing single-call path."""
+
+  def _make(
+      self,
+      *,
+      speech: str | None,
+      responses: list[str],
+      action_intent: str | None = None,
+      evidence: dict[str, Any] | None = None,
+  ) -> tuple[mock.MagicMock, Any, Any, Any]:
+    """Builds the director, model, chain and step for one resolution.
+
+    Args:
+      speech: the turn's original speech held by the director.
+      responses: the model's answers, in call order (generation first,
+        then the semantic review).
+      action_intent: the turn's decoded action intent, if any.
+      evidence: the turn's resolution evidence, if any.
+
+    Returns:
+      A (director, model, chain, step) tuple.
+    """
+    director = mock.MagicMock()
+    director.get_current_original_speech.return_value = speech
+    director.get_current_action_intent.return_value = action_intent
+    director.get_current_resolution_evidence.return_value = (
+        evidence if evidence is not None else _EMPTY_EVIDENCE
+    )
+    director.get_committed_events.return_value = ()
+    director.get_public_events.return_value = ()
+    model = mock_model.MockModel(responses[0])
+    model.sample_text = mock.Mock(side_effect=responses)
+    chain = interactive_document.InteractiveDocument(model)
+    step = story_resolution.make_final_output_step(
+        director, allowed_environment_events=('Thunder rattles the windows.',)
+    )
+    return director, model, chain, step
+
+  def test_guidance_reaches_generation_only_with_action_result(self):
+    # With an adjudicated action result, the generation prompt carries
+    # the guidance (whitespace-normalized exact text) between the
+    # evidence and the output section; the review prompt, the semantic
+    # rules and no-evidence turns never do.
+    payload = json.dumps({
+        'stage_directions': 'The lock holds.',
+        'public_stage_directions': 'The lock holds.',
+    })
+    director, model, chain, step = self._make(
+        speech='I hid the letter under the stairs.',
+        responses=[payload, _APPROVAL],
+        action_intent=_ACTION_INTENT,
+        evidence={'action_result': _ACTION_RESULT, 'intervention': None},
+    )
+    step(chain, 'candidate', 'Alice')
+    generation, review = [
+        call.kwargs['prompt'] for call in model.sample_text.call_args_list
+    ]
+    flat_generation = ' '.join(generation.split())
+    flat_review = ' '.join(review.split())
+    for mark in _RESULT_GUIDANCE_MARKS:
+      self.assertIn(mark, flat_generation)
+      self.assertNotIn(mark, flat_review)
+    # The exact approved guidance text reaches the generation prompt.
+    self.assertIn(
+        ' '.join(story_resolution._RESULT_FIDELITY_GUIDANCE.split()),
+        flat_generation,
+    )
+    self.assertNotIn(
+        _RESULT_GUIDANCE_MARK,
+        ' '.join(story_resolution._SEMANTIC_RULES.split()),
+    )
+    # Positioned after the evidence data section, before the output.
+    self.assertLess(
+        generation.index(_EVIDENCE_MARK),
+        generation.index(_RESULT_GUIDANCE_MARK),
+    )
+    self.assertLess(
+        generation.index(_RESULT_GUIDANCE_MARK),
+        generation.index('## Output'),
+    )
+    # Intervention-only turn (no action result): no guidance block.
+    _, model2, chain2, step2 = self._make(
+        speech='I hid the letter under the stairs.',
+        responses=[payload, _APPROVAL],
+        evidence={'action_result': None, 'intervention': _INTERVENTION},
+    )
+    step2(chain2, 'candidate', 'Alice')
+    flat2 = ' '.join(
+        model2.sample_text.call_args_list[0].kwargs['prompt'].split()
+    )
+    self.assertNotIn(_RESULT_GUIDANCE_MARK, flat2)
+
+  def test_r1t8_shaped_turn_gets_result_and_guidance(self):
+    # The R1 t8 shape: the real generation prompt must receive the raw
+    # adjudicated result verbatim (in the evidence data section) plus
+    # the guidance; the review receives the same raw evidence and the
+    # actual canonical assembled from the omitting draft; the scripted
+    # rejection commits nothing.
+    director, model, chain, step = self._make(
+        speech='我当着大家的面，把原件拿稳了仔细看。',
+        responses=[
+            _R1T8_OMITTING_DRAFT,
+            json.dumps({
+                'valid': False,
+                'reason': 'The narration omitted the full-scope finding.',
+            }),
+        ],
+        action_intent=_R1T8_INTENT,
+        evidence={'action_result': _R1T8_RESULT, 'intervention': None},
+    )
+    with self.assertRaises(story_resolution.StoryOutputError):
+      step(chain, 'candidate', '周律师')
+    generation, review = [
+        call.kwargs['prompt'] for call in model.sample_text.call_args_list
+    ]
+    self.assertIn(_R1T8_RESULT, generation)
+    self.assertIn(_RESULT_GUIDANCE_MARK, ' '.join(generation.split()))
+    self.assertEqual(
+        _read_evidence_section(review)['action_result'], _R1T8_RESULT
+    )
+    canonical = _read_canonical_section(review)['resolved_event']
+    self.assertIn('核对了全文的落款与签署情况', canonical)
+    self.assertNotIn('全文未见见证人署名', canonical)
+    director.set_validated_resolution.assert_not_called()
+
+  _PUBLIC_SCOPE_MARKS = (
+      'must not be dropped from `public_stage_directions`',
+      'must NOT be copied into the public view',
+      'Never repair a leak by deleting',
+  )
+
+  def test_fidelity_guidance_scopes_public_view(self):
+    # 保真指引按视图分工（设计 4.3）：公开可见结果不得从公开旁白
+    # 丢失；仅本人获知的内容不得为“两份都完整”而复制进公开视图；
+    # 不得用删除完整记录中的值来修泄露。该指引仍只进生成提示，
+    # 不进评审提示（沿用既有断言模式）。
+    payload = json.dumps({
+        'stage_directions': 'The lock holds.',
+        'public_stage_directions': 'The lock holds.',
+    })
+    director, model, chain, step = self._make(
+        speech='I hid the letter under the stairs.',
+        responses=[payload, _APPROVAL],
+        action_intent=_ACTION_INTENT,
+        evidence={'action_result': _ACTION_RESULT, 'intervention': None},
+    )
+    step(chain, 'candidate', 'Alice')
+    generation, review = [
+        call.kwargs['prompt'] for call in model.sample_text.call_args_list
+    ]
+    flat_generation = ' '.join(generation.split())
+    flat_review = ' '.join(review.split())
+    for mark in self._PUBLIC_SCOPE_MARKS:
+      self.assertIn(mark, flat_generation)
+      self.assertNotIn(mark, flat_review)
+    self.assertNotIn(_RESULT_GUIDANCE_MARK, flat_review)
+
+
 class SharedAuthorizationRuleTest(unittest.TestCase):
   """The shared authorization copy and updated rules 2/4/5/7/8."""
 
@@ -867,10 +1336,14 @@ class SharedAuthorizationRuleTest(unittest.TestCase):
         'intervention': None,
     }
     director.get_committed_events.return_value = ()
+    director.get_public_events.return_value = ()
     model = mock_model.MockModel()
     model.sample_text = mock.Mock(
         side_effect=[
-            json.dumps({'stage_directions': 'The lock holds.'}),
+            json.dumps({
+                'stage_directions': 'The lock holds.',
+                'public_stage_directions': 'The lock holds.',
+            }),
             _APPROVAL,
         ]
     )
@@ -920,6 +1393,130 @@ class SharedAuthorizationRuleTest(unittest.TestCase):
     for prompt in (generation, review):
       self.assertIn(_HISTORY_SECTION_MARK, prompt)
       self.assertIn(expected, prompt)
+
+  def test_gm_history_section_labeled_in_both_prompts(self):
+    # 设计 6.2：生成与评审各含一次 GM 完整 history 数据段（GM-only、
+    # 非共同知识），gm_history 恰取一次；"## Committed public events"
+    # 段内容改为 director.get_public_events()——用含/不含私下日期的
+    # 样本区分两列表。
+    calls = []
+
+    def gm_history() -> str:
+      calls.append(1)
+      return '0). 周律师: 完整记录含私下日期二〇一九年三月十二日'
+
+    director = mock.MagicMock()
+    director.get_current_original_speech.return_value = '我先看看那个花瓶。'
+    director.get_current_action_intent.return_value = '取下花瓶。'
+    director.get_current_resolution_evidence.return_value = {
+        'action_result': _ACTION_RESULT,
+        'intervention': None,
+    }
+    director.get_committed_events.return_value = ()
+    director.get_public_events.return_value = ('周律师: 早已公开展示封套。',)
+    model = mock_model.MockModel()
+    model.sample_text = mock.Mock(
+        side_effect=[
+            json.dumps({
+                'stage_directions': 'The lock holds.',
+                'public_stage_directions': 'The lock holds.',
+            }),
+            _APPROVAL,
+        ]
+    )
+    chain = interactive_document.InteractiveDocument(model)
+    step = story_resolution.make_final_output_step(
+        director, gm_history=gm_history
+    )
+    step(chain, 'candidate', 'Alice')
+    self.assertEqual(calls, [1])
+    generation, review = [
+        call.kwargs['prompt'] for call in model.sample_text.call_args_list
+    ]
+    for prompt in (generation, review):
+      self.assertEqual(prompt.count(_GM_HISTORY_SECTION_MARK), 1)
+      remainder = prompt.split(_GM_HISTORY_SECTION_MARK, 1)[1].lstrip()
+      value, _ = json.JSONDecoder().raw_decode(remainder)
+      self.assertEqual(
+          value, '0). 周律师: 完整记录含私下日期二〇一九年三月十二日'
+      )
+      # 公开事件段来自公开序列，永不携带完整记录的私下日期。
+      events = prompt.split('## Committed public events (oldest first)', 1)[
+          1
+      ].split(_GM_HISTORY_SECTION_MARK, 1)[0]
+      self.assertIn('周律师: 早已公开展示封套。', events)
+      self.assertNotIn('私下日期', events)
+
+  def test_gm_history_none_falls_back_to_complete_window(self):
+    # 不传 gm_history 时，生成与评审仍各含一次 GM 完整段，回退为
+    # director.get_committed_events()（同一 GM 完整标签、JSON 列表），
+    # 不得静默消失（设计 6.2）。
+    director = mock.MagicMock()
+    director.get_current_original_speech.return_value = '我先看看那个花瓶。'
+    director.get_current_action_intent.return_value = '取下花瓶。'
+    director.get_current_resolution_evidence.return_value = {
+        'action_result': _ACTION_RESULT,
+        'intervention': None,
+    }
+    director.get_committed_events.return_value = ('周律师: 完整记录事件。',)
+    director.get_public_events.return_value = ('周律师: 公开事件。',)
+    model = mock_model.MockModel()
+    model.sample_text = mock.Mock(
+        side_effect=[
+            json.dumps({
+                'stage_directions': 'The lock holds.',
+                'public_stage_directions': 'The lock holds.',
+            }),
+            _APPROVAL,
+        ]
+    )
+    chain = interactive_document.InteractiveDocument(model)
+    step = story_resolution.make_final_output_step(director)
+    step(chain, 'candidate', 'Alice')
+    generation, review = [
+        call.kwargs['prompt'] for call in model.sample_text.call_args_list
+    ]
+    for prompt in (generation, review):
+      self.assertEqual(prompt.count(_GM_HISTORY_SECTION_MARK), 1)
+      remainder = prompt.split(_GM_HISTORY_SECTION_MARK, 1)[1].lstrip()
+      decoded, _ = json.JSONDecoder().raw_decode(remainder)
+      self.assertEqual(decoded, ['周律师: 完整记录事件。'])
+      # 公开事件段与 GM 段两列表可区分。
+      events = prompt.split('## Committed public events (oldest first)', 1)[
+          1
+      ].split(_GM_HISTORY_SECTION_MARK, 1)[0]
+      self.assertIn('周律师: 公开事件。', events)
+      self.assertNotIn('完整记录事件', events)
+
+  def test_rules_scope_result_parts_by_audience(self):
+    # Only privately learned portions are limited to the full view.
+    # Visible action results still support the public view; neither
+    # view may disclose unauthorized GM secrets. Raw-result legality
+    # checks remain independent of what the narration includes.
+    generation, review = self._prompts()
+    for prompt in (generation, review):
+      flat = ' '.join(prompt.split())
+      # Rule 3: the actor's own exemption enters the full track only,
+      # the public track discloses no privately learned content, and a
+      # legal own result in the full narration is not a rejection.
+      self.assertIn('may appear in the full `stage_directions`', flat)
+      self.assertIn('discloses no privately learned content', flat)
+      self.assertIn(
+          'Do not reject the full narration merely because it carries', flat
+      )
+      # Rule 4 distinguishes portions of the same adjudicated result,
+      # rather than forbidding all of it from the public view.
+      self.assertIn('only the portions learned privately', flat)
+      self.assertIn(
+          'publicly visible portions also support the PUBLIC view', flat
+      )
+      self.assertNotIn(
+          'supports the FULL view and the speaker alone, never the public view',
+          flat,
+      )
+      # Rule 7: a legal own private result is lawful in the full view
+      # and must be excluded from the public one.
+      self.assertIn('the public view MUST exclude it', flat)
 
 
 # World-response baseline fixtures (design 5.2/6/7.2): the shared NPC
@@ -975,6 +1572,7 @@ class NpcRulesAndEvidenceProvenanceTest(unittest.TestCase):
         evidence if evidence is not None else _EMPTY_EVIDENCE
     )
     director.get_committed_events.return_value = ()
+    director.get_public_events.return_value = ()
     model = mock_model.MockModel(responses[0])
     model.sample_text = mock.Mock(side_effect=responses)
     chain = interactive_document.InteractiveDocument(model)
@@ -988,9 +1586,13 @@ class NpcRulesAndEvidenceProvenanceTest(unittest.TestCase):
     director.get_current_action_intent.return_value = None
     director.get_current_resolution_evidence.return_value = _EMPTY_EVIDENCE
     director.get_committed_events.return_value = ()
+    director.get_public_events.return_value = ()
     model = mock_model.MockModel()
     model.sample_text = mock.Mock(
-        side_effect=[json.dumps({'stage_directions': ''}), _APPROVAL]
+        side_effect=[
+            json.dumps({'stage_directions': '', 'public_stage_directions': ''}),
+            _APPROVAL,
+        ]
     )
     chain = interactive_document.InteractiveDocument(model)
     step = story_resolution.make_final_output_step(director, **step_kwargs)
@@ -1047,7 +1649,7 @@ class NpcRulesAndEvidenceProvenanceTest(unittest.TestCase):
     director, model, chain, step = self._make(
         speech=_CLAIM_SPEECH,
         responses=[
-            json.dumps({'stage_directions': ''}),
+            json.dumps({'stage_directions': '', 'public_stage_directions': ''}),
             '{"valid": true, "reason": "Only attributed speech occurs."}',
         ],
         action_intent=_CLAIM_INTENT,
@@ -1056,7 +1658,7 @@ class NpcRulesAndEvidenceProvenanceTest(unittest.TestCase):
     self.assertIn(_CLAIM_SPEECH, committed_event)
     self.assertNotIn('记录客观存在', committed_event)
     director.set_validated_resolution.assert_called_once_with(
-        committed_event, ''
+        committed_event, '', committed_event, ''
     )
     # The reviewer judged the claim where it traveled: attributed speech
     # in the marked evidence section, never an inspectable object.
@@ -1078,14 +1680,20 @@ class NpcRulesAndEvidenceProvenanceTest(unittest.TestCase):
       with self.subTest(label=label):
         director, model, chain, step = self._make(
             speech='',
-            responses=[json.dumps({'stage_directions': result}), _APPROVAL],
+            responses=[
+                json.dumps({
+                    'stage_directions': result,
+                    'public_stage_directions': result,
+                }),
+                _APPROVAL,
+            ],
             action_intent=intent,
             evidence={'action_result': result, 'intervention': None},
         )
         committed_event = step(chain, 'candidate', '周律师')
         self.assertEqual(committed_event, result)
         director.set_validated_resolution.assert_called_once_with(
-            committed_event, result
+            committed_event, result, committed_event, result
         )
         review = model.sample_text.call_args_list[1].kwargs['prompt']
         decoded = _read_evidence_section(review)
@@ -1097,7 +1705,10 @@ class NpcRulesAndEvidenceProvenanceTest(unittest.TestCase):
     director, model, chain, step = self._make(
         speech='',
         responses=[
-            json.dumps({'stage_directions': _RECORD_RESULT}),
+            json.dumps({
+                'stage_directions': _RECORD_RESULT,
+                'public_stage_directions': _RECORD_RESULT,
+            }),
             json.dumps({
                 'valid': False,
                 'reason': 'The raw outcome certified the unverified record.',
@@ -1127,7 +1738,10 @@ class NpcRulesAndEvidenceProvenanceTest(unittest.TestCase):
     director, model, chain, step = self._make(
         speech='我先把他的话记下来。',
         responses=[
-            json.dumps({'stage_directions': _RECORD_RESULT}),
+            json.dumps({
+                'stage_directions': _RECORD_RESULT,
+                'public_stage_directions': _RECORD_RESULT,
+            }),
             json.dumps({
                 'valid': False,
                 'reason': (
@@ -1166,7 +1780,10 @@ class SemanticReviewTest(unittest.TestCase):
     director.get_committed_events.return_value = (
         'Bob: The envelope is still sealed.',
     )
-    payload = json.dumps({'stage_directions': ''})
+    director.get_public_events.return_value = ()
+    payload = json.dumps(
+        {'stage_directions': '', 'public_stage_directions': ''}
+    )
     model = mock_model.MockModel()
     model.sample_text = mock.Mock(
         side_effect=[
@@ -1246,7 +1863,10 @@ class SemanticReviewTest(unittest.TestCase):
       with self.subTest(actor=actor):
         director, model, chain, step = self._setup(speech=speech)
         model.sample_text.side_effect = [
-            json.dumps({'stage_directions': f'{added}{stage}'}),
+            json.dumps({
+                'stage_directions': f'{added}{stage}',
+                'public_stage_directions': f'{added}{stage}',
+            }),
             json.dumps({'valid': False, 'reason': reason}),
         ]
         with self.assertRaisesRegex(story_resolution.StoryOutputError, reason):
@@ -1284,7 +1904,9 @@ class SemanticReviewTest(unittest.TestCase):
         director, _, chain, step = self._setup(speech=speech)
         result = step(chain, 'candidate', 'Alice')
         self.assertEqual(result, f'Alice: {speech}')
-        director.set_validated_resolution.assert_called_once_with(result, '')
+        director.set_validated_resolution.assert_called_once_with(
+            result, '', result, ''
+        )
 
   def test_review_api_error_propagates_without_commit(self):
     director, model, chain, step = self._setup()
@@ -1310,7 +1932,7 @@ class SemanticReviewTest(unittest.TestCase):
     self.assertEqual(model.sample_text.call_count, 1)
     director.set_validated_resolution.assert_not_called()
 
-  def test_generation_prompt_requests_single_field_and_carries_evidence(self):
+  def test_generation_prompt_requests_two_fields_and_carries_evidence(self):
     director = mock.MagicMock()
     director.get_current_original_speech.return_value = (
         'I hid the letter under the stairs.'
@@ -1321,10 +1943,14 @@ class SemanticReviewTest(unittest.TestCase):
         'intervention': _INTERVENTION,
     }
     director.get_committed_events.return_value = ()
+    director.get_public_events.return_value = ()
     model = mock_model.MockModel()
     model.sample_text = mock.Mock(
         side_effect=[
-            json.dumps({'stage_directions': 'The lock holds.'}),
+            json.dumps({
+                'stage_directions': 'The lock holds.',
+                'public_stage_directions': 'The lock holds.',
+            }),
             _APPROVAL,
         ]
     )
@@ -1333,7 +1959,7 @@ class SemanticReviewTest(unittest.TestCase):
     step(chain, 'Alice: I hid the letter under the stairs.', 'Alice')
     generation = model.sample_text.call_args_list[0].kwargs['prompt']
     self.assertIn(
-        'Output a JSON object with exactly one string field', generation
+        'Output a JSON object with exactly two string fields', generation
     )
     # The legacy field is named only inside the sentence forbidding it.
     self.assertIn('do NOT generate a "resolved_event"', generation)
@@ -1384,6 +2010,54 @@ class SemanticReviewTest(unittest.TestCase):
         'whether it comes from the action result or the narration', flat
     )
 
+  _AUDIENCE_MARKS = (
+      'receives the FULL canonical event',
+      'receives the PUBLIC canonical event',
+      'never a GM-only truth that no action legally produced',
+      'must not become knowledge of everyone present',
+      'must stay compatible with the full event',
+      'must not deliver an empty `public_stage_directions`',
+      'preserved verbatim in BOTH canonical events',
+  )
+
+  def test_review_sees_both_views_and_audience_rules(self):
+    # 同一次评审覆盖两份 canonical（设计 5）：评审提示的
+    # canonical 数据段同时携带四键；两类受众定义与受众规则
+    # （私下获知不得进公开视图、公开动作不得用空串规避、两份
+    # canonical 均逐字保留原始对白、公开视图与完整事件相容）
+    # 同时进入生成与评审提示。
+    director, model, chain, step = self._setup(speech='我先看看原件。')
+    model.sample_text.side_effect = [
+        json.dumps(
+            {
+                'stage_directions': _FULL_TRACK,
+                'public_stage_directions': _PUBLIC_TRACK,
+            },
+            ensure_ascii=False,
+        ),
+        _APPROVAL,
+    ]
+    step(chain, 'candidate', '周律师')
+    generation, review = [
+        call.kwargs['prompt'] for call in model.sample_text.call_args_list
+    ]
+    canonical = _read_canonical_section(review)
+    self.assertEqual(
+        set(canonical),
+        {
+            'resolved_event',
+            'stage_directions',
+            'public_resolved_event',
+            'public_stage_directions',
+        },
+    )
+    self.assertIn('二〇一九年三月十二日', canonical['resolved_event'])
+    self.assertNotIn('二〇一九年三月十二日', canonical['public_resolved_event'])
+    for prompt in (generation, review):
+      flat = ' '.join(prompt.split())
+      for mark in self._AUDIENCE_MARKS:
+        self.assertIn(mark, flat)
+
 
 class Rule8InterventionBoundaryTest(unittest.TestCase):
   """The calibrated rule-8 boundary on the reduced Luna turn-19 case.
@@ -1410,9 +2084,15 @@ class Rule8InterventionBoundaryTest(unittest.TestCase):
         'intervention': intervention or _LUNA_INTERVENTION,
     }
     director.get_committed_events.return_value = _LUNA_COMMITTED_HISTORY
+    director.get_public_events.return_value = ()
     model = mock_model.MockModel()
     model.sample_text = mock.Mock(
-        side_effect=[json.dumps({'stage_directions': stage}), review]
+        side_effect=[
+            json.dumps(
+                {'stage_directions': stage, 'public_stage_directions': stage}
+            ),
+            review,
+        ]
     )
     chain = interactive_document.InteractiveDocument(model)
     step = story_resolution.make_final_output_step(
@@ -1463,7 +2143,7 @@ class Rule8InterventionBoundaryTest(unittest.TestCase):
     canonical = _read_canonical_section(review_prompt)
     self.assertEqual(canonical['resolved_event'], result)
     director.set_validated_resolution.assert_called_once_with(
-        result, _LUNA_STAGE_KEPT
+        result, _LUNA_STAGE_KEPT, result, _LUNA_STAGE_KEPT
     )
 
   def test_faithful_paraphrase_is_legal(self):

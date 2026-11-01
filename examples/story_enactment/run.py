@@ -51,6 +51,12 @@ The run config archives the run's action contract (``action_mode``):
 schema-1 configs predate it and are read as pure speech on a copy,
 and a resume keeps the checkpointed contract — a contradicting
 explicit mode is rejected before any model request (spec section 9).
+Every config must also carry the audience-delivery contract marker
+``audience_delivery_version = 1``: a config (or checkpoint) without it
+predates the two-view delivery contract and is rejected on both entry
+points before any model is constructed, with guidance to start a fresh
+run — offline read-only export of existing records is unaffected
+(audience-delivery design 7.2).
 
 Example:
   python -m examples.story_enactment.run --state_dir /tmp/story-demo \
@@ -656,6 +662,16 @@ def _normalize_run_config(
   Turns and archives produced after normalization carry the effective
   values.
 
+  The audience-delivery contract marker is checked right after the
+  schema version (audience-delivery design 7.1/7.2): a config missing
+  ``audience_delivery_version = 1`` predates the two-view delivery
+  contract and is rejected on both entry points with fresh-run
+  guidance — old checkpoints cannot be honestly continued under the
+  new contract (their character memories may already be
+  over-delivered), while offline read-only export of existing records
+  stays unrestricted. The gate sits before the resume branch builds
+  any model, so no request can precede the rejection.
+
   Args:
     run_config: the run config to normalize.
 
@@ -663,16 +679,35 @@ def _normalize_run_config(
     The normalized copy of the run config.
 
   Raises:
-    ValueError: if the schema version is unknown, a recorded action
-      mode does not name a known mode, a schema-2 config lacks its
-      action mode, or a schema-2 config's nested action contract
-      contradicts the recorded mode.
+    ValueError: if the schema version is unknown, the config lacks the
+      ``audience_delivery_version = 1`` contract marker or holds a
+      different value, a recorded action mode does not name a known
+      mode, a schema-2 config lacks its action mode, or a schema-2
+      config's nested action contract contradicts the recorded mode.
   """
   version = run_config.get('schema_version')
   if version not in _KNOWN_RUN_CONFIG_SCHEMAS:
     raise ValueError(
         'unknown run config schema version '
         f'{version!r}; expected one of {_KNOWN_RUN_CONFIG_SCHEMAS}.'
+    )
+  # The audience-delivery contract marker: missing or wrong values
+  # belong to a pre-audience run, which cannot be continued here.
+  marker = run_config.get('audience_delivery_version')
+  if marker != drama_director.AUDIENCE_DELIVERY_VERSION:
+    detail = (
+        "does not carry the required 'audience_delivery_version' marker"
+        if marker is None
+        else (
+            f'carries audience_delivery_version {marker!r} instead of'
+            f' {drama_director.AUDIENCE_DELIVERY_VERSION}'
+        )
+    )
+    raise ValueError(
+        'run config is incompatible with the audience-delivery'
+        f' contract: it {detail}. 请另开 fresh 运行；旧 checkpoint'
+        ' 不支持继续（其角色记忆可能已被过度投递，补字段不能撤销）；'
+        '离线只读导出不受影响。'
     )
   config = dict(run_config)
   if 'action_mode' in config:
@@ -746,8 +781,9 @@ def make_run_config(
   Returns:
       The run-config dictionary with the schema version, the full story
       data, scene and beat dictionaries, character and game-master prefab
-      params, both total limits, the mode, the action mode, the director
-      parameters (scoring configuration) and the model identity.
+      params, both total limits, the mode, the action mode, the
+      audience-delivery contract version, the director parameters
+      (scoring configuration) and the model identity.
 
   Raises:
       ValueError: if the mode or the action mode is unknown, or the
@@ -806,6 +842,9 @@ def make_run_config(
       'total_model_attempt_limit': total_model_attempt_limit,
       'mode': mode,
       'action_mode': action_mode,
+      # The two-view audience-delivery contract this run enacts under
+      # (design 7.1): resumes refuse configs without this marker.
+      'audience_delivery_version': drama_director.AUDIENCE_DELIVERY_VERSION,
       'director_params': director_params,
       'model_config': _public_model_identity(model_config),
   }
@@ -1571,7 +1610,10 @@ def run(
   Raises:
     ValueError: on resume validation failures (missing or mismatched
       checkpoint, mismatched limits, mode, action mode or model
-      identity, budget-exhausted summary, unknown run config schema),
+      identity, budget-exhausted summary, unknown run config schema, or
+      a run config lacking the ``audience_delivery_version = 1``
+      audience-delivery contract marker — including the checkpoint
+      envelope's saved config, rejected before any model construction),
       when starting over an existing run, or when the requested mode or
       action mode is unknown.
     RuntimeError: when the invocation was archived but its final

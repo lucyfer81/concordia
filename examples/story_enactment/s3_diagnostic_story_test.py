@@ -14,12 +14,14 @@
 
 """Tests for the S3 diagnostic ledger runner (offline, no network)."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent import futures
+import contextlib
 import hashlib
 import json
 import os
 import pathlib
+import shutil
 import tempfile
 import threading
 import types
@@ -30,13 +32,17 @@ from unittest import mock
 from concordia.contrib.language_models import budget_wrapper
 from concordia.contrib.language_models import retry_stats_wrapper
 from concordia.contrib.language_models.openai import base_gpt_model
+from concordia.contrib.language_models.openai import gpt_model
 from concordia.language_model import language_model
 import httpx
+import numpy as np
 import openai
 
 from examples.story_enactment import request_ledger as rl
 from examples.story_enactment import run as run_lib
 from examples.story_enactment import s3_diagnostic_story as s3
+from examples.story_enactment import story_config
+from examples.story_enactment import testing_stubs
 
 
 def _tmp_dir() -> tempfile.TemporaryDirectory:
@@ -53,6 +59,164 @@ def _fake_repo_root() -> tempfile.TemporaryDirectory:
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(f'fake {relative}', encoding='utf-8')
   return tmp
+
+
+# The real repository root, captured before any test patches it.
+_REAL_REPO_ROOT = pathlib.Path(
+    s3._REPO_ROOT  # pylint: disable=protected-access
+)
+
+
+@contextlib.contextmanager
+def _forbid_checkout_history() -> Iterator[None]:
+  """Fails any read of the real checkout's ``docs/``/``run_results/``.
+
+  The mirror repo (``_isolated_repo``) replaces those reads with tmp
+  stand-ins; this guard proves a full offline batch never reaches the
+  checkout's ignored experiment history, so CI depends on neither the
+  protocol documents nor the old batch artifacts.
+  """
+  real_root = _REAL_REPO_ROOT
+
+  def guard(name: str, original: Callable[..., Any]) -> Callable[..., Any]:
+    def read(self: pathlib.Path, *args: Any, **kwargs: Any) -> Any:
+      try:
+        resolved = self.resolve()
+      except OSError:
+        resolved = None
+      if (
+          resolved is not None
+          and real_root in resolved.parents
+          and resolved.relative_to(real_root).parts[0]
+          in ('docs', 'run_results')
+      ):
+        raise AssertionError(
+            f'checkout history read forbidden ({name}): {resolved}'
+        )
+      return original(self, *args, **kwargs)
+
+    return read
+
+  with mock.patch.object(
+      pathlib.Path,
+      'read_text',
+      guard('read_text', pathlib.Path.read_text),
+  ), mock.patch.object(
+      pathlib.Path,
+      'read_bytes',
+      guard('read_bytes', pathlib.Path.read_bytes),
+  ):
+    yield
+
+
+def _dir_state(root: pathlib.Path) -> dict[str, str]:
+  """Hashes every file under ``root`` for no-write refusal proofs."""
+  state: dict[str, str] = {}
+  for item in sorted(root.rglob('*')):
+    if item.is_file():
+      state[str(item.relative_to(root))] = hashlib.sha256(
+          item.read_bytes()
+      ).hexdigest()
+  return state
+
+
+_CODE_PREFIXES = ('examples/', 'concordia/')
+
+
+def _make_mirror_root(base: pathlib.Path) -> pathlib.Path:
+  """Builds a tmp mirror of every snapshot file the stages can touch.
+
+  Code files copy their actual checkout bytes; every document under
+  ``docs/`` becomes a clearly-labelled stand-in, so tests never read the
+  checkout's protocol documents or experiment history. The real
+  production code still executes from the checkout module — the mirror
+  only feeds the snapshot/drift verification seam.
+  """
+  root = base / 'mirror_repo'
+  root.mkdir()
+  for relative in s3._SNAPSHOT_FILES:  # pylint: disable=protected-access
+    target = root / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if relative.startswith(_CODE_PREFIXES):
+      shutil.copyfile(_REAL_REPO_ROOT / relative, target)
+    else:
+      target.write_text(
+          f'stand-in document for {relative} (mirror repo)\n', encoding='utf-8'
+      )
+  return root
+
+
+@contextlib.contextmanager
+def _isolated_repo() -> Iterator[pathlib.Path]:
+  """Points every snapshot/verify read at a fresh tmp mirror repo.
+
+  The default ``root`` arguments of ``source_snapshot_payload`` and
+  ``_verify_frozen`` were bound at function-definition time, so
+  replacing ``s3._REPO_ROOT`` alone is not enough: thin wrappers pass
+  the mirror root whenever a caller used the default, and forward any
+  explicitly-given root unchanged (the independent fake-root drift
+  tests keep their own roots). ``s3._REPO_ROOT`` is patched as well so
+  ``freeze_stage`` hashes the mirror's stand-in protocol document, and
+  everything restores on normal and exceptional paths.
+  """
+  base = pathlib.Path(tempfile.mkdtemp(prefix='s3_mirror_'))
+  try:
+    mirror = _make_mirror_root(base)
+    real_snapshot = s3.source_snapshot_payload
+    real_verify = s3._verify_frozen  # pylint: disable=protected-access
+    real_repo_root = s3._REPO_ROOT  # pylint: disable=protected-access
+    snapshot_defaults = real_snapshot.__defaults__ or ()
+    verify_defaults = real_verify.__defaults__ or ()
+    snapshot_default = snapshot_defaults[0] if snapshot_defaults else None
+    verify_default = verify_defaults[0] if verify_defaults else None
+
+    def snapshot_payload(root=snapshot_default):  # pylint: disable=unused-argument
+      if root is snapshot_default:
+        root = mirror
+      assert root is not None
+      return real_snapshot(root=root)
+
+    def verify_frozen(batch_dir, root=verify_default):  # pylint: disable=unused-argument
+      if root is verify_default:
+        root = mirror
+      assert root is not None
+      return real_verify(batch_dir, root=root)
+
+    s3.source_snapshot_payload = snapshot_payload
+    s3._verify_frozen = verify_frozen  # pylint: disable=protected-access
+    s3._REPO_ROOT = mirror  # pylint: disable=protected-access
+    try:
+      yield mirror
+    finally:
+      s3.source_snapshot_payload = real_snapshot
+      s3._verify_frozen = real_verify  # pylint: disable=protected-access
+      s3._REPO_ROOT = real_repo_root  # pylint: disable=protected-access
+  finally:
+    shutil.rmtree(base, ignore_errors=True)
+
+
+class MirrorRepoTestCase(unittest.TestCase):
+  """Shared isolation: every freeze/verify/run goes through the mirror.
+
+  All freeze-stage, run-stage, summarize-stage and dry-run tests enter
+  the mirror context, so none of them reads the checkout's ``docs/`` or
+  ``run_results/``; the production code under test still executes from
+  the checkout module.
+  """
+
+  def setUp(self) -> None:
+    super().setUp()
+    self.mirror_root = self.enterContext(_isolated_repo())
+
+  def _batch_path(self) -> pathlib.Path:
+    """A fresh non-existent batch dir inside a managed tmp dir."""
+    return pathlib.Path(self.enterContext(_tmp_dir())) / 'batch'
+
+  def _frozen_batch(self) -> pathlib.Path:
+    """Freezes a fresh batch against the mirror repo (offline path)."""
+    path = self._batch_path()
+    s3.freeze_stage(path)
+    return path
 
 
 class _FakeInner(language_model.LanguageModel):
@@ -520,7 +684,7 @@ class WrapperTest(unittest.TestCase):
 
 
 class SdkLedgerTest(unittest.TestCase):
-  """SDK 第二层账本（协议 §4）：逐次预扣、上限先阻断、按运行独立、镜像。"""
+  """SDK 第二层账本（新协议 §2）：逐次预扣、上限先阻断、按运行独立、镜像。"""
 
   def _ledgers(self, sdk_attempt_limit=400):
     """A tmp batch dir with the Concordia ledger and the SDK gate."""
@@ -679,7 +843,7 @@ class SdkLedgerTest(unittest.TestCase):
     self.assertEqual(rebuilt, sdk.counts)
 
 
-class FreezeStageTest(unittest.TestCase):
+class FreezeStageTest(MirrorRepoTestCase):
   """Freeze stage: offline capture of protocol, snapshot and report."""
 
   def _fake_root(self) -> pathlib.Path:
@@ -715,15 +879,23 @@ class FreezeStageTest(unittest.TestCase):
     )
     return batch
 
-  def _batch_path(self) -> pathlib.Path:
-    """A fresh non-existent batch dir inside a managed tmp dir."""
-    return pathlib.Path(self.enterContext(_tmp_dir())) / 'batch'
-
   def test_freeze_refuses_existing_dir(self):
     path = self._batch_path()
     s3.freeze_stage(path)
     with self.assertRaises(s3.BatchStop):
       s3.freeze_stage(path)
+
+  def test_freeze_run_summarize_without_checkout_history(self):
+    # CI 禁读真实 checkout 的 docs/ 与 run_results/：探针下完整零网络
+    # 批次仍能 freeze、执行两次 stub 故事并 summarize，对账正确。
+    batch = self._batch_path()
+    with _forbid_checkout_history():
+      s3.freeze_stage(batch)
+      s3.run_stage(batch, offline=True)
+      summary = s3.summarize_stage(batch)
+    self.assertEqual(sorted(summary['runs']), ['R1', 'R2'])
+    for entry in summary['runs'].values():
+      self.assertEqual(entry['ledger_attempts'], entry['production_attempts'])
 
   def test_freeze_writes_hashed_payloads_and_initial_report(self):
     path = self._batch_path()
@@ -755,7 +927,7 @@ class FreezeStageTest(unittest.TestCase):
     self.assertEqual(report['deviations'], [])
     s3._verify_frozen(path)  # pylint: disable=protected-access
 
-  def test_protocol_declares_confirmed_numbers(self):
+  def test_protocol_declares_configured_numbers(self):
     protocol = s3.protocol_payload()
     self.assertEqual(protocol['model_scope'], 'Sol-only')
     self.assertEqual(protocol['runs'], ['R1', 'R2'])
@@ -765,8 +937,65 @@ class FreezeStageTest(unittest.TestCase):
     self.assertIn('beat_timeout 不是完成结局', protocol['evaluation_criteria'])
     self.assertIn('诊断无验收门', protocol['conclusion_semantics'])
 
+  def test_protocol_binds_post_c2r_full_story_protocol(self):
+    protocol = s3.protocol_payload()
+    self.assertEqual(
+        protocol['protocol_document']['path'],
+        (
+            'docs/superpowers/plans/'
+            '2026-10-30-story-enactment-post-c2r-full-story-diagnostic-protocol.md'
+        ),
+    )
+    self.assertIn('2026-10-30', protocol['protocol_document']['confirmation'])
+    self.assertIn(
+        '待用户单独授权', protocol['protocol_document']['confirmation']
+    )
+    self.assertEqual(
+        protocol['design_document'],
+        (
+            'docs/superpowers/specs/'
+            '2026-10-24-story-enactment-fidelity-and-repetition-context-design.md'
+        ),
+    )
+
+  def test_protocol_payload_drops_single_variable_claim(self):
+    payload = s3.protocol_payload()
+    self.assertNotIn('single_story_variable', payload)
+    blob = json.dumps(payload, ensure_ascii=False)
+    self.assertNotIn('唯一故事变量', blob)
+    # 新定位：当前版本两次完整故事诊断，非 A/B，禁止单变量归因。
+    self.assertIn('不是改前/改后的严格 A/B', payload['diagnostic_positioning'])
+    self.assertIn(
+        '不将变化归因于单个提示修复', payload['diagnostic_positioning']
+    )
+    # C-2R 配对 RNG 不得移入完整故事生产链。
+    self.assertIn('配对 RNG', payload['diagnostic_positioning'])
+
+  def test_protocol_payload_discloses_history_and_conclusion_boundary(self):
+    payload = s3.protocol_payload()
+    self.assertIn('20261024T063748Z', payload['historical_reference'])
+    self.assertIn('非同次随机轨迹', payload['historical_reference'])
+    self.assertIn('不沿用', payload['historical_reference'])
+    # C-2R 九条标注状态的如实披露（协议 §9）。
+    self.assertIn(
+        'human_annotation_status.json', payload['c2r_annotation_disclosure']
+    )
+    self.assertIn('不据此宣布', payload['c2r_annotation_disclosure'])
+    conclusion = payload['conclusion_semantics']
+    self.assertIn('不设置合并 overall_pass', conclusion)
+    self.assertIn('MVP 验收', conclusion)
+    self.assertIn('完成轨迹已演示', conclusion)
+    # 模型接口参数实值披露 + 未控随机性。
+    interface = payload['model_interface_params']
+    self.assertEqual(interface['defaults']['temperature'], 1.0)
+    self.assertEqual(interface['defaults']['max_tokens'], 5000)
+    self.assertIn('passed_params', interface['note'])
+
+  def test_protocol_invocation_includes_dry_run(self):
+    self.assertIn('dry_run', s3.protocol_payload()['invocation'])
+
   def test_protocol_declares_frozen_director_table(self):
-    # 协议 §3 七参数冻结表逐键照实转写进 payload；runner 以 run_config
+    # 新协议 §2 七参数冻结表逐键照实转写进 payload；runner 以 run_config
     # 显式传入，不依赖生产默认值（dry-run 核对 checkpoint 实际生效值）。
     self.assertEqual(
         s3.protocol_payload()['director_params']['values'],  # pylint: disable=protected-access
@@ -827,14 +1056,107 @@ class FreezeStageTest(unittest.TestCase):
     with self.assertRaises(s3.BatchStop):
       s3.source_snapshot_payload(root=root)
 
+  def test_snapshot_files_cover_bc_repair_chain(self):
+    required = {
+        'concordia/contrib/components/game_master/repetition_push.py',
+        'concordia/contrib/components/game_master/director_note.py',
+        'concordia/contrib/components/game_master/story_resolution.py',
+        'concordia/components/game_master/event_resolution.py',
+        'concordia/document/interactive_document.py',
+        'concordia/document/document.py',
+        'concordia/language_model/retry_wrapper.py',
+        (
+            'docs/superpowers/specs/'
+            '2026-10-24-story-enactment-fidelity-and-repetition-context-design.md'
+        ),
+        s3._PROTOCOL_DOCUMENT,  # pylint: disable=protected-access
+    }
+    self.assertTrue(
+        required.issubset(set(s3._SNAPSHOT_FILES)),  # pylint: disable=protected-access
+        required - set(s3._SNAPSHOT_FILES),  # pylint: disable=protected-access
+    )
 
-class RunStageTest(unittest.TestCase):
+  def test_verify_frozen_refuses_bc_source_drift(self):
+    # B/C 两生产文件逐个注入漂移：冻结校验必须拒绝（假仓库根注入）。
+    for relative in (
+        'concordia/contrib/components/game_master/repetition_push.py',
+        'concordia/contrib/components/game_master/story_resolution.py',
+    ):
+      with self.subTest(relative=relative):
+        root = self._fake_root()
+        batch = self._frozen_fake_batch(root)
+        target = root / relative
+        target.write_text(
+            target.read_text(encoding='utf-8') + ' drifted', encoding='utf-8'
+        )
+        with self.assertRaises(s3.BatchStop):
+          s3._verify_frozen(batch, root=root)  # pylint: disable=protected-access
+
+  def test_freeze_records_environment_versions(self):
+    path = self._batch_path()
+    s3.freeze_stage(path)
+    report = json.loads((path / 'report.json').read_text(encoding='utf-8'))
+    environment = report['environment']
+    for key in ('python', 'platform', 'numpy', 'openai'):
+      self.assertTrue(environment[key], key)
+    self.assertIn('runtime guard', environment['note'])
+
+  def test_event_whitelist_mismatches_flags_drift_and_removed_events(self):
+    with _tmp_dir() as tmp:
+      root = pathlib.Path(tmp)
+      expected = list(
+          story_config.make_example_config().allowed_environment_events
+      )
+      r1 = root / 'R1'
+      r1.mkdir()
+      good = {
+          'run_config': {
+              'story': {'allowed_environment_events': expected},
+              'director_params': {'allowed_environment_events': expected},
+          }
+      }
+      (r1 / 'checkpoint.json').write_text(
+          json.dumps(good, ensure_ascii=False), encoding='utf-8'
+      )
+      # R2 缺 checkpoint：恰一条 finding。
+      self.assertEqual(
+          s3._event_whitelist_mismatches(root),  # pylint: disable=protected-access
+          ['R2: checkpoint artifact missing'],
+      )
+      # R1 混入被删事件：新增 story 与 removed 两条 finding。
+      bad = json.loads(json.dumps(good))
+      bad['run_config']['story']['allowed_environment_events'] = [
+          *expected,
+          '周律师的手机响起，来电显示是遗产登记处',
+      ]
+      (r1 / 'checkpoint.json').write_text(
+          json.dumps(bad, ensure_ascii=False), encoding='utf-8'
+      )
+      findings = s3._event_whitelist_mismatches(root)  # pylint: disable=protected-access
+      self.assertEqual(len(findings), 3)
+      self.assertTrue(any('story events' in f for f in findings))
+      self.assertTrue(any('removed event' in f for f in findings))
+
+
+class RunStageTest(MirrorRepoTestCase):
   """Run stage: injection, interruption pausing, failure mapping, pending."""
 
-  def _frozen_batch(self) -> pathlib.Path:
-    path = pathlib.Path(self.enterContext(_tmp_dir())) / 'batch'
-    s3.freeze_stage(path)
-    return path
+  def _assert_real_entry_refused(self, batch: pathlib.Path) -> None:
+    """The real entry refuses before credentials and writes nothing.
+
+    Every file hash under the batch directory must be identical across
+    the refusal — no marker, no ledger, no report rewrite — and
+    ``_load_settings`` must never run.
+    """
+    before = _dir_state(batch)
+
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+      raise AssertionError('_load_settings must not be reached')
+
+    with mock.patch.object(s3, '_load_settings', side_effect=forbidden):
+      with self.assertRaises(s3.BatchStop):
+        s3.run_stage(batch, offline=False)
+    self.assertEqual(_dir_state(batch), before)
 
   def test_run_stage_offline_executes_both_runs_with_stub(self):
     batch = self._frozen_batch()
@@ -987,7 +1309,7 @@ class RunStageTest(unittest.TestCase):
     self.assertEqual((batch / 'requests.jsonl').read_text(), events_before)
 
   def test_interrupted_run_pauses_batch_for_review(self):
-    # 协议 §5：裸 checkpoint（有 checkpoint 无 summary）= 运行中断：
+    # 新协议 §2：裸 checkpoint（有 checkpoint 无 summary）= 运行中断：
     # 标记 interrupted、暂停批次交用户审阅；不自动 resume，后续运行
     # 不启动；重入因批次已停仍被拒。
     batch = self._frozen_batch()
@@ -1011,7 +1333,7 @@ class RunStageTest(unittest.TestCase):
 
   def test_pending_slot_refuses_continuation(self):
     # started 无 finished 是中断证据：拒绝继续并暂停批次。S2 式
-    # 跳过授权已按协议 §5 移除——无参数可绕过，重入仍拒，不记
+    # 跳过授权已按新协议 §2 移除——无参数可绕过，重入仍拒，不记
     # deviations，被拒 slot 的预算保持已预扣状态。
     batch = self._frozen_batch()
     ledger = rl.RequestLedger(  # pylint: disable=protected-access
@@ -1158,14 +1480,331 @@ class RunStageTest(unittest.TestCase):
           os.environ['OPENAI_BASE_URL'], 'https://example.invalid/v1'
       )
 
+  def test_real_entry_refuses_frozen_drift_before_marker_and_credentials(self):
+    # 冻结输入漂移：在标记/凭据之前拒绝（只读校验先行）。
+    batch = self._frozen_batch()
+    protocol = batch / 'protocol.json'
+    protocol.write_text(
+        protocol.read_text(encoding='utf-8') + ' ', encoding='utf-8'
+    )
+    self._assert_real_entry_refused(batch)
 
-class SummarizeStageTest(unittest.TestCase):
+  def test_real_entry_refuses_run_traces_without_reading_credentials(self):
+    # 五类运行痕迹逐一注入：均须在凭据之前拒绝且零写入。
+    for name in s3._RUN_TRACE_NAMES:  # pylint: disable=protected-access
+      with self.subTest(trace=name):
+        batch = self._frozen_batch()
+        trace = batch / name
+        if name in ('sdk_ledger', 'R1', 'R2'):
+          trace.mkdir()
+        else:
+          trace.write_text(
+              'residue from an earlier execution', encoding='utf-8'
+          )
+        self._assert_real_entry_refused(batch)
+
+  def test_real_entry_refuses_story_state_without_ledgers(self):
+    # 无标记/账本、仅有故事状态文件：仍拒绝，不读取或猜测其内容来恢复。
+    for relative, content in (
+        ('R1/checkpoint.json', '{"committed_turn_id": 3}'),
+        ('R2/summary.json', '{"reason": "beat_timeout"}'),
+    ):
+      with self.subTest(state=relative):
+        batch = self._frozen_batch()
+        target = batch / relative
+        target.parent.mkdir()
+        target.write_text(content, encoding='utf-8')
+        self._assert_real_entry_refused(batch)
+        self.assertEqual(target.read_text(encoding='utf-8'), content)
+
+  def test_real_entry_refuses_nonfresh_report(self):
+    # 报告中的既有执行证据（runs/stop/已用计数）也构成非 fresh 拒绝。
+    def with_runs(report):
+      report['runs'] = {'R1': {'run_id': 'R1', 'status': 'interrupted'}}
+
+    def with_stop(report):
+      report['stop'] = {'utc': '2026-10-30T00:00:00Z', 'run': None}
+
+    def with_used_counts(report):
+      report['counts'] = {
+          'planned_runs': 2,
+          'finished_runs': 1,
+          'ledger_attempts': 2,
+          'by_run': {'R1': 2},
+      }
+
+    def with_missing_counts(report):
+      del report['counts']
+
+    for label, mutate in (
+        ('runs', with_runs),
+        ('stop', with_stop),
+        ('used counts', with_used_counts),
+        ('missing counts', with_missing_counts),
+    ):
+      with self.subTest(report=label):
+        batch = self._frozen_batch()
+        report_path = batch / 'report.json'
+        report = json.loads(report_path.read_text(encoding='utf-8'))
+        mutate(report)
+        report_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2) + '\n',
+            encoding='utf-8',
+        )
+        self._assert_real_entry_refused(batch)
+
+  def test_real_entry_requires_complete_order(self):
+    # 真实入口只接受完整 ('R1', 'R2')：子集、单跑、倒序、重复 ID、空
+    # 序列都在标记/凭据之前拒绝。
+    for runs in (('R2',), ('R1',), ('R2', 'R1'), ('R1', 'R1'), ()):
+      with self.subTest(runs=runs):
+        batch = self._frozen_batch()
+        before = _dir_state(batch)
+
+        def forbidden(*args: Any, **kwargs: Any) -> None:
+          raise AssertionError('_load_settings must not be reached')
+
+        with mock.patch.object(s3, '_load_settings', side_effect=forbidden):
+          with self.assertRaises(s3.BatchStop):
+            s3.run_stage(batch, offline=False, runs=runs)
+        self.assertEqual(_dir_state(batch), before)
+
+  def test_real_entry_occupies_marker_before_reading_credentials(self):
+    # 顺序合同：_load_settings 运行时标记必须已在磁盘上；随后的失败
+    # 保留标记且不写任何账本。
+    batch = self._frozen_batch()
+
+    def hook(*args: Any, **kwargs: Any) -> None:
+      self.assertTrue((batch / 'run_started.json').exists())
+      raise RuntimeError('stop right after the guard')
+
+    with mock.patch.object(s3, '_load_settings', side_effect=hook):
+      with self.assertRaises(RuntimeError):
+        s3.run_stage(batch, offline=False)
+    self.assertTrue((batch / 'run_started.json').exists())
+    self.assertFalse((batch / 'requests.jsonl').exists())
+    self.assertFalse((batch / 'sdk_ledger').exists())
+
+  def test_atomic_marker_has_one_winner(self):
+    # 两线程竞争同一目录的占标记 helper：恰一成功、一 BatchStop。
+    batch = self._batch_path()
+    batch.mkdir()
+    outcomes: list[str] = []
+    lock = threading.Lock()
+
+    def occupy() -> None:
+      try:
+        s3._occupy_first_execution(batch)  # pylint: disable=protected-access
+        outcome = 'won'
+      except s3.BatchStop:
+        outcome = 'stopped'
+      with lock:
+        outcomes.append(outcome)
+
+    threads = [threading.Thread(target=occupy) for _ in range(2)]
+    for thread in threads:
+      thread.start()
+    for thread in threads:
+      thread.join(5)
+    self.assertEqual(sorted(outcomes), ['stopped', 'won'])
+    marker = json.loads(
+        (batch / 'run_started.json').read_text(encoding='utf-8')
+    )
+    self.assertIn('created_utc', marker)
+    self.assertIn('pid', marker)
+
+  def test_real_entry_refused_after_first_execution(self):
+    # 首次执行（哪怕随后失败）留下的标记使第二次真实调用零写入拒绝。
+    batch = self._frozen_batch()
+    s3._occupy_first_execution(batch)  # pylint: disable=protected-access
+    self._assert_real_entry_refused(batch)
+
+  def test_offline_path_never_occupies_marker(self):
+    # 离线路径与真实入口守卫无关：完整执行、幂等重入、零新请求且
+    # 永不创建真实入口标记。
+    batch = self._frozen_batch()
+    s3.run_stage(batch, offline=True)
+    events_before = (batch / 'requests.jsonl').read_text()
+    s3.run_stage(batch, offline=True)
+    self.assertEqual((batch / 'requests.jsonl').read_text(), events_before)
+    self.assertFalse((batch / 'run_started.json').exists())
+
+  def test_real_path_executes_batch_offline_with_stub_inner(self):
+    # 真实分支（offline=False）的配置转发：_load_settings 给假值、
+    # embedder 固定、provider 工厂记录实际收到的配置。R1/R2 各一次
+    # 工厂调用，收到 openai/Sol 配置且无 prompt_stub；返回 stub inner
+    # 以零网络完成整个故事编排；真实入口标记保留。
+    batch = self._frozen_batch()
+    seen: list[tuple[dict[str, Any], bool]] = []
+    settings_calls: list[Any] = []
+
+    def factory(model_config, *, disable_language_model=False):
+      seen.append((dict(model_config or {}), disable_language_model))
+      return testing_stubs.PromptStubModel(), (testing_stubs.TransientAPIError,)
+
+    def fake_settings(*args: Any, **kwargs: Any):
+      settings_calls.append((args, kwargs))
+      return (
+          'k-real-path-test',
+          'https://offline.invalid/v1',
+          [
+              'k-real-path-test',
+          ],
+      )
+
+    stub_embedder = lambda _text: np.ones(  # pylint: disable=unnecessary-lambda-assignment
+        run_lib._STUB_EMBEDDER_DIM,  # pylint: disable=protected-access
+        dtype=np.float32,
+    )
+    with mock.patch.object(
+        run_lib, 'make_language_model', side_effect=factory
+    ), mock.patch.object(
+        run_lib, '_make_embedder', return_value=stub_embedder
+    ), mock.patch.object(
+        s3, '_load_settings', side_effect=fake_settings
+    ):
+      s3.run_stage(batch, offline=False)
+    self.assertEqual(len(settings_calls), 1)
+    self.assertEqual(len(seen), 2)
+    for config, disable in seen:
+      self.assertEqual(
+          config,
+          {
+              'api_type': 'openai',
+              'model_name': 'gpt-6.1-sol',
+              'api_key': 'k-real-path-test',
+          },
+      )
+      self.assertNotIn('prompt_stub', config)
+      self.assertFalse(disable)
+    report = json.loads((batch / 'report.json').read_text(encoding='utf-8'))
+    self.assertEqual(sorted(report['runs']), ['R1', 'R2'])
+    for entry in report['runs'].values():
+      self.assertIn(entry['reason'], s3._TERMINAL_REASONS)  # pylint: disable=protected-access
+    self.assertTrue((batch / 'run_started.json').exists())
+    # 这只验证 live 分支和配置转发，不冒称已验证真实 SDK 适配器
+    # （那由 test_real_adapter_factory_uses_guarded_fake_client 分列）。
+
+  def test_real_adapter_factory_uses_guarded_fake_client(self):
+    # 小规模真实适配器探针：经实际 run_lib.make_language_model 构造
+    # GptLanguageModel，仅在构造前替换 openai.OpenAI 工厂为记录型假
+    # 客户端；不读 .env、不建真实客户端。一次 sample_text + 一次
+    # sample_choice（先非法项再合法字母）→ Concordia=2、SDK=3。
+    path = pathlib.Path(self.enterContext(_tmp_dir()))
+    ledger = rl.RequestLedger(path, batch_id='t', **s3.ledger_caps())
+    sdk = s3._SdkCreateLedger(path)  # pylint: disable=protected-access
+    creates: list[dict[str, Any]] = []
+    replies = iter((
+        'fixed adapter text',
+        'not-one-of-the-options',
+        'a',
+    ))
+
+    class GuardedCompletions:
+
+      def create(self, **kwargs: Any) -> Any:
+        creates.append(dict(kwargs))
+        # 两层 started 均在转发前落盘：SDK started 数恰等于本次在内
+        # 的 create 数，Concordia prompt 已在磁盘上。
+        sdk_started = list((path / 'sdk_ledger' / 'raw').glob('*.started.json'))
+        assert len(sdk_started) == len(creates), 'SDK started missing'
+        assert list(
+            (path / 'raw').glob('*.prompt.txt')
+        ), 'Concordia prompt missing'
+        return types.SimpleNamespace(
+            model='gpt-6.1-solx',
+            usage=None,
+            choices=[
+                types.SimpleNamespace(
+                    message=types.SimpleNamespace(content=next(replies))
+                )
+            ],
+        )
+
+    class GuardedClient:
+      chat = types.SimpleNamespace(completions=GuardedCompletions())
+
+    with mock.patch.object(
+        gpt_model.openai, 'OpenAI', side_effect=lambda **kw: GuardedClient()
+    ):
+      provider, retryable = run_lib.make_language_model(
+          {
+              'api_type': 'openai',
+              'model_name': 'gpt-6.1-sol',
+              'api_key': 'k-adapter-probe',
+          },
+          disable_language_model=False,
+      )
+    self.assertIsInstance(provider, gpt_model.GptLanguageModel)
+    self.assertIn(openai.RateLimitError, retryable)
+    model = s3.LedgerLanguageModel(
+        'gpt-6.1-sol',
+        ledger=ledger,
+        sdk_ledger=sdk,
+        run_id='R1',
+        inner=provider,
+    )
+    try:
+      self.assertEqual(
+          model.sample_text('prompt', max_tokens=2000), 'fixed adapter text'
+      )
+      index, choice, _ = model.sample_choice('choose', ['a', 'b'])
+      self.assertEqual((index, choice), (0, 'a'))
+    finally:
+      model.close()
+    # 双层计数：Concordia=2、SDK=3（choice 内部重问只加 SDK create）。
+    self.assertEqual(ledger.counts['global'], 2)
+    self.assertEqual(sdk.counts['global'], 3)
+    # 实际 SDK kwargs：文本显式 max_tokens=2000 → max_completion_tokens
+    # =2000、reasoning low；判断默认 max_completion_tokens=5000、
+    # reasoning medium；共同 temperature=1.0、timeout=60、verbosity=low；
+    # 不发送 max_tokens/top_p/top_k。
+    text_kwargs, *choice_kwargs = creates
+    self.assertEqual(text_kwargs['max_completion_tokens'], 2000)
+    self.assertEqual(text_kwargs['reasoning_effort'], 'low')
+    for kwargs in choice_kwargs:
+      self.assertEqual(kwargs['max_completion_tokens'], 5000)
+      self.assertEqual(kwargs['reasoning_effort'], 'medium')
+    for kwargs in creates:
+      self.assertEqual(kwargs['model'], 'gpt-6.1-sol')
+      self.assertEqual(kwargs['temperature'], 1.0)
+      self.assertEqual(kwargs['timeout'], 60)
+      self.assertEqual(kwargs['verbosity'], 'low')
+      self.assertNotIn('max_tokens', kwargs)
+      self.assertNotIn('top_p', kwargs)
+      self.assertNotIn('top_k', kwargs)
+    # SDK attempt_id 关联正确、无 pending、原始响应归档、
+    # provider_model 留证（finished.boundary）。
+    sdk_events = rl.load_events(path / 'sdk_ledger' / 'requests.jsonl')
+    sdk_started = [e for e in sdk_events if e['event'] == 'started']
+    self.assertEqual(
+        [e['attempt_id'] for e in sdk_started],
+        ['R1__a000001', 'R1__a000002', 'R1__a000002'],
+    )
+    sdk_rebuilt = rl.rebuild_counts(sdk_events)
+    self.assertEqual(
+        set(sdk_rebuilt['started_slots']), set(sdk_rebuilt['finished_slots'])
+    )
+    self.assertTrue(
+        (path / 'sdk_ledger' / 'raw' / 'R1__sdk000001.response.txt').exists()
+    )
+    finished = [
+        e
+        for e in rl.load_events(path / 'requests.jsonl')
+        if e['event'] == 'finished'
+    ]
+    self.assertEqual(
+        [e['boundary']['provider_model'] for e in finished],
+        ['gpt-6.1-solx', 'gpt-6.1-solx'],
+    )
+
+
+class SummarizeStageTest(MirrorRepoTestCase):
   """Summarize stage: offline cross-check, disclosure, no pass gate."""
 
   def _prepared_batch(self) -> pathlib.Path:
     """A frozen batch whose two runs executed offline to completion."""
-    path = pathlib.Path(self.enterContext(_tmp_dir())) / 'batch'
-    s3.freeze_stage(path)
+    path = self._frozen_batch()
     s3.run_stage(path, offline=True)
     return path
 
@@ -1242,8 +1881,171 @@ class SummarizeStageTest(unittest.TestCase):
     )
 
 
-class DryRunStageTest(unittest.TestCase):
+class DryRunStageTest(MirrorRepoTestCase):
   """Dry run: the full freeze → run → summarize pipeline, zero network."""
+
+  @staticmethod
+  def _recount_mark(dry_run_dir: pathlib.Path, run_id: str, mark: str) -> int:
+    """Recounts a prompt mark for one run straight from the artifacts."""
+    count = 0
+    for event in rl.load_events(dry_run_dir / 'requests.jsonl'):
+      if event['event'] != 'started' or event.get('group') != run_id:
+        continue
+      prompt = (
+          dry_run_dir / 'raw' / f"{event['slot_id']}.prompt.txt"
+      ).read_text(encoding='utf-8')
+      if mark in prompt:
+        count += 1
+    return count
+
+  def test_dry_run_evidences_bc_wiring_and_artifacts(self):
+    path = pathlib.Path(self.enterContext(_tmp_dir()))
+    s3.dry_run_stage(path)
+    report = json.loads(
+        (path / 'dry_run_report.json').read_text(encoding='utf-8')
+    )
+    self.assertTrue(report['ok'])
+    # 逐运行 B/C 计数：报告保存的计数必须与从 prompt 原文重算的一致。
+    for run_id in ('R1', 'R2'):
+      self.assertGreaterEqual(
+          report['bc_wiring'][run_id]['b_guidance_prompts'], 1, run_id
+      )
+      self.assertGreaterEqual(
+          report['bc_wiring'][run_id]['c_contribution_prompts'], 1, run_id
+      )
+      self.assertEqual(
+          report['bc_wiring'][run_id]['b_guidance_prompts'],
+          self._recount_mark(path, run_id, s3._B_GUIDANCE_MARK),  # pylint: disable=protected-access
+      )
+      self.assertEqual(
+          report['bc_wiring'][run_id]['c_contribution_prompts'],
+          self._recount_mark(path, run_id, s3._C_CONTRIBUTION_MARK),  # pylint: disable=protected-access
+      )
+    # 两运行六类产物留存（留存检查，不冒称剧本质量通过）。
+    for run_id in ('R1', 'R2'):
+      for name in s3._RUN_ARTIFACT_NAMES:  # pylint: disable=protected-access
+        self.assertTrue((path / run_id / name).exists(), f'{run_id}/{name}')
+    # 脚手架披露 + 只证明接线。
+    self.assertIn(
+        'action_intents',
+        report['offline_stub_scaffolding']['model_config']['prompt_stub'],
+    )
+    self.assertIn('只证明接线', report['conclusion'])
+    passed = {entry['check']: entry['passed'] for entry in report['invariants']}
+    for check in (
+        'b_result_fidelity_guidance_prompt_present',
+        'c_contribution_zone_prompt_present',
+        'run_artifacts_retained',
+    ):
+      self.assertTrue(passed[check], check)
+
+  def test_dry_run_fails_when_r2_lacks_b_guidance(self):
+    # 定向反例：仅 R2 退回无动作意图的默认 stub（测试薄包装内临时
+    # 替换，不修改 checkout 生产文件）；完整 dry-run 必须因 R2 的 B
+    # 指引计数为 0 失败，不能因 R1 的 B>0 仍判 ok。
+    path = pathlib.Path(self.enterContext(_tmp_dir()))
+    original = s3._execute_run  # pylint: disable=protected-access
+
+    def execute(run_id, *args, **kwargs):
+      if run_id == 'R2':
+        with mock.patch.object(
+            s3, '_OFFLINE_STUB_MODEL_CONFIG', {'api_type': 'stub'}  # pylint: disable=protected-access
+        ):
+          return original(run_id, *args, **kwargs)
+      return original(run_id, *args, **kwargs)
+
+    with mock.patch.object(s3, '_execute_run', side_effect=execute):  # pylint: disable=protected-access
+      with self.assertRaises(SystemExit):
+        s3.dry_run_stage(path)
+    report = json.loads(
+        (path / 'dry_run_report.json').read_text(encoding='utf-8')
+    )
+    self.assertFalse(report['ok'])
+    self.assertEqual(report['bc_wiring']['R2']['b_guidance_prompts'], 0)
+    self.assertGreaterEqual(report['bc_wiring']['R1']['b_guidance_prompts'], 1)
+    passed = {entry['check']: entry['passed'] for entry in report['invariants']}
+    self.assertFalse(passed['b_result_fidelity_guidance_prompt_present'])
+
+  def test_per_run_c_check_detects_stripped_contribution_zone(self):
+    # 逐运行 C 反例：从临时 dry-run 的 R2 提示中移除 C 指纹后，
+    # 逐运行计数必须把 R2 判 0（检查对单运行缺失敏感）。
+    path = pathlib.Path(self.enterContext(_tmp_dir()))
+    s3.dry_run_stage(path)
+    events = [
+        e
+        for e in rl.load_events(path / 'requests.jsonl')
+        if e['event'] == 'started'
+    ]
+    for event in events:
+      if event.get('group') != 'R2':
+        continue
+      prompt_path = path / 'raw' / f"{event['slot_id']}.prompt.txt"
+      prompt_path.write_text(
+          prompt_path.read_text(encoding='utf-8').replace(
+              s3._C_CONTRIBUTION_MARK, '## Removed by test'  # pylint: disable=protected-access
+          ),
+          encoding='utf-8',
+      )
+    wiring = s3._bc_wiring_evidence(path, events)  # pylint: disable=protected-access
+    self.assertEqual(wiring['R2']['c_contribution_prompts'], 0)
+    self.assertGreaterEqual(wiring['R1']['c_contribution_prompts'], 1)
+
+  def test_offline_stub_scaffolding_never_reaches_real_config(self):
+    # 真实调用边界断言：经 _execute_run / run_stage 捕获实际进入
+    # provider 工厂的配置。offline=True：两运行实际收到带
+    # action_intents 的 stub 配置；offline=False：无 prompt_stub 的
+    # openai/Sol 配置。真实分支的 provider 和 embedder 用假值替换，
+    # 但不跳过 _execute_run，不只检查 _live_model_config 的返回值。
+    stub_embedder = lambda _text: np.ones(  # pylint: disable=unnecessary-lambda-assignment
+        run_lib._STUB_EMBEDDER_DIM,  # pylint: disable=protected-access
+        dtype=np.float32,
+    )
+    seen: list[tuple[dict[str, Any], bool]] = []
+
+    def factory(model_config, *, disable_language_model=False):
+      seen.append((dict(model_config or {}), disable_language_model))
+      return testing_stubs.PromptStubModel(), (testing_stubs.TransientAPIError,)
+
+    def fake_settings(*args: Any, **kwargs: Any):
+      return (
+          'k-scaffold-test',
+          'https://offline.invalid/v1',
+          [
+              'k-scaffold-test',
+          ],
+      )
+
+    batch = self._frozen_batch()
+    with mock.patch.object(run_lib, 'make_language_model', side_effect=factory):
+      s3.run_stage(batch, offline=True)
+    self.assertEqual(len(seen), 2)
+    for config, disable in seen:
+      self.assertEqual(config.get('api_type'), 'stub')
+      self.assertIn('action_intents', config.get('prompt_stub', {}))
+      self.assertTrue(disable)
+
+    seen.clear()
+    batch = self._frozen_batch()
+    with mock.patch.object(
+        run_lib, 'make_language_model', side_effect=factory
+    ), mock.patch.object(
+        run_lib, '_make_embedder', return_value=stub_embedder
+    ), mock.patch.object(
+        s3, '_load_settings', side_effect=fake_settings
+    ):
+      s3.run_stage(batch, offline=False)
+    self.assertEqual(len(seen), 2)
+    for config, disable in seen:
+      self.assertEqual(
+          config,
+          {
+              'api_type': 'openai',
+              'model_name': 'gpt-6.1-sol',
+              'api_key': 'k-scaffold-test',
+          },
+      )
+      self.assertNotIn('prompt_stub', config)
+      self.assertFalse(disable)
 
   def test_dry_run_end_to_end_with_zero_network(self):
     path = pathlib.Path(self.enterContext(_tmp_dir()))
@@ -1265,7 +2067,7 @@ class DryRunStageTest(unittest.TestCase):
       self.assertTrue(
           (path / 'raw' / f"{event['slot_id']}.prompt.txt").exists()
       )
-    # 冻结 §3 表实际生效：两运行的 checkpoint artifact 中
+    # 新协议 §2 冻结表实际生效：两运行的 checkpoint artifact 中
     # director_params 逐键等于冻结表（显式 run_config，非默认值）。
     for run_id in ('R1', 'R2'):
       envelope = json.loads(

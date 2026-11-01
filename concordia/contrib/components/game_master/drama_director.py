@@ -33,8 +33,9 @@ committed state by `update`, so exactly one commit happens per story turn.
 
 Stage 1 covered the lifecycle, story-turn bookkeeping and beat
 advancement. Stage 2 adds tension evaluation (spec section 4.4, step 3):
-every `eval_interval` story turns the model rates the dramatic tension of
-the most recent `scoring_window` resolved events on an anchored 1-10
+every `eval_interval` story turns the model rates the dramatic tension
+of the most recent `scoring_window` events of the committed public
+sequence (design 6.2) on an anchored 1-10
 scale, the score is compared in program code against the target range of
 the beat that was current when the player acted, and the deviation is
 recorded. Stage 2 also adds director directives (spec sections 4.4 step 4
@@ -129,6 +130,37 @@ _DEFAULT_COOLDOWN_TURNS = 3
 # Reasons an intervention candidate may be recorded with (spec section
 # 7.2); at most one candidate may be recorded per story turn.
 _INTERVENTION_REASONS = ('tension', 'repetition')
+
+# Version of the two-view audience-delivery contract (design 6.1/7.1):
+# the director's validated-approval data, story turns and checkpoints
+# carry both the full and the public resolution of each turn.
+AUDIENCE_DELIVERY_VERSION = 1
+
+# The public event sequence keeps at most this many events, matching
+# the DisplayEvents default retrieval count (design 6.2).
+_PUBLIC_EVENT_WINDOW = 100
+
+# Unified label of the GM's complete committed event record where it
+# conditions an in-prompt event list (design 6.2): the record is the
+# GM's full committed window — the basis of continuity, adjudication
+# and private progress judgments — and is explicitly not common
+# knowledge. Shared with `director_note` and `repetition_push`, which
+# import it, so the label cannot drift between consumers.
+GM_COMPLETE_RECORD_LABEL = (
+    '## GM complete committed record (not common knowledge)'
+)
+
+# Keys of the two-view delivery data exposed by
+# `get_validated_delivery_data`: the contract version, the bound actor
+# and both canonical views with their narrator tracks.
+_DELIVERY_DATA_KEYS = (
+    'audience_delivery_version',
+    'actor',
+    'resolved_event',
+    'stage_directions',
+    'public_resolved_event',
+    'public_stage_directions',
+)
 
 
 def _parse_tension_score(answer: str) -> int | None:
@@ -315,8 +347,9 @@ class DramaDirector(
         context.
       eval_interval: The story is scored every `eval_interval`-th story
         turn; other turns keep `tension` unset. Zero disables scoring.
-      scoring_window: Number of most recent resolved events conditioning
-        the scoring question.
+      scoring_window: Number of most recent public events conditioning
+        the scoring question (the tail of the committed public
+        sequence, design 6.2).
       tolerance: Slack around a beat's target tension range; scores
         within `lower - tolerance` and `upper + tolerance` (inclusive)
         do not deviate.
@@ -381,9 +414,11 @@ class DramaDirector(
     self._character_constraints = dict(character_constraints or {})
     self._world_constraints = tuple(world_constraints)
     self._action_mode = action_mode
-    # One stored window serves both the completion question (up to
-    # `_COMPLETION_QUERY_EVENTS` events) and the scoring question (the
-    # last `scoring_window` events), so it keeps the larger need.
+    # The stored full window serves the completion question (up to
+    # `_COMPLETION_QUERY_EVENTS` events) and the GM complete history
+    # inputs; the scoring question rates the tail of the public
+    # sequence instead (design 6.2), so the full window keeps at least
+    # the completion need.
     self._window_size = max(scoring_window, _COMPLETION_QUERY_EVENTS)
 
     # Committed state, restored by set_state.
@@ -391,6 +426,7 @@ class DramaDirector(
     self._turns_in_beat = 0
     self._story_turn = 0
     self._recent_events: list[str] = []
+    self._public_events: list[str] = []
     self._beat_timeout = False
     self._budget_stopped = False
     self._last_story_turn: dict[str, Any] | None = None
@@ -433,6 +469,10 @@ class DramaDirector(
       observation: str,
   ) -> str:
     if observation.startswith(_PUTATIVE_EVENT_PREFIX):
+      # A new putative event starts a fresh turn: an uncommitted
+      # validation of an earlier attempt must never leak into it
+      # (design 6.1: the delivery getter cannot read a stale approval).
+      self._validated = None
       self._rollback_uncommitted_integration()
       self._turn_context = None
       actor = self._get_active_player()
@@ -473,6 +513,8 @@ class DramaDirector(
           **self._turn_context,
           'resolved_event': self._validated['resolved_event'],
           'stage_directions': self._validated['stage_directions'],
+          'public_resolved_event': self._validated['public_resolved_event'],
+          'public_stage_directions': self._validated['public_stage_directions'],
       }
       self._awaiting_event = False
     return ''
@@ -504,10 +546,24 @@ class DramaDirector(
     beat_timeout = self._beat_timeout
     budget_stopped = self._budget_stopped
     turn_id = self._story_turn + 1
+    # The full committed window keeps the complete record (design 6.2):
+    # it conditions the beat-completion question and remains the GM's
+    # continuity and adjudication basis.
     recent_events = [
         *self._recent_events,
         snapshot['resolved_event'],
     ][-self._window_size :]
+    # The bounded public event sequence (design 6.2): only this turn's
+    # public canonical event joins it, and only through the pending
+    # commit; an empty public event (a purely private turn) adds
+    # nothing, and no visible action may be fabricated to fill it. Its
+    # tail is the tension-scoring window, and the whole sequence feeds
+    # the directive prompt's public events section.
+    public_event = snapshot['public_resolved_event']
+    public_events = [
+        *self._public_events,
+        *([public_event] if public_event else []),
+    ][-_PUBLIC_EVENT_WINDOW:]
 
     completed = False
     # The completion question runs only after the beat's minimum turn
@@ -534,7 +590,8 @@ class DramaDirector(
 
     # Pipeline step 3: tension evaluation (spec section 4.4). Scheduled
     # every eval_interval-th story turn and skipped entirely once the
-    # budget is spent. The score is compared in program code against the
+    # budget is spent. The score rates the tail of the committed public
+    # sequence (design 6.2) and is compared in program code against the
     # target range of the beat that was current when the player acted;
     # the scoring prompt never sees the target range. Deviations are
     # only recorded here; acting on them is a later pipeline step.
@@ -549,7 +606,7 @@ class DramaDirector(
     ):
       tension_eval_count += 1
       try:
-        tension = self._score_tension(recent_events)
+        tension = self._score_tension(public_events)
       except budget_wrapper.BudgetExhaustedError:
         # Budget path B at the scoring position (spec 11.3-2): the
         # score stays unset, no further model calls happen this step,
@@ -647,7 +704,7 @@ class DramaDirector(
             score=tension,
             beat_id=snapshot['beat_id_at_action'],
             turn_id=turn_id,
-            recent_events=recent_events,
+            public_events=public_events,
         )
       except budget_wrapper.BudgetExhaustedError:
         # Budget path B at the directive-generation position (spec
@@ -659,7 +716,7 @@ class DramaDirector(
         'turn_id': turn_id,
         'actor': snapshot['actor'],
         'speech': snapshot['original_speech'],
-        'schema_version': 2,
+        'schema_version': 3,
         'raw_action': snapshot['raw_action'],
         'action_intent': snapshot['action_intent'],
         'beat_id_at_action': snapshot['beat_id_at_action'],
@@ -670,6 +727,8 @@ class DramaDirector(
         ),
         'resolved_event': snapshot['resolved_event'],
         'stage_directions': snapshot['stage_directions'],
+        'public_resolved_event': snapshot['public_resolved_event'],
+        'public_stage_directions': snapshot['public_stage_directions'],
         'tension': tension,
         'budget_stopped': budget_stopped,
         # Private diagnostics stay in the collector/checkpoint, never in
@@ -698,6 +757,7 @@ class DramaDirector(
         'beat_index': beat_index,
         'turns_in_beat': turns_in_beat,
         'recent_events': recent_events,
+        'public_events': public_events,
         'beat_timeout': beat_timeout,
         'budget_stopped': budget_stopped,
         'story_turn': story_turn,
@@ -720,6 +780,7 @@ class DramaDirector(
       self._turns_in_beat = commit['turns_in_beat']
       self._story_turn = story_turn['turn_id']
       self._recent_events = commit['recent_events']
+      self._public_events = commit['public_events']
       self._beat_timeout = commit['beat_timeout']
       self._budget_stopped = commit['budget_stopped']
       self._last_story_turn = story_turn
@@ -757,8 +818,10 @@ class DramaDirector(
       self,
       resolved_event: str,
       stage_directions: str,
+      public_resolved_event: str,
+      public_stage_directions: str,
   ) -> None:
-    """Supplies the validated resolution of the current turn.
+    """Supplies the validated two-view resolution of the current turn.
 
     This stores the turn's approved state only: the final review has
     passed, so the interventions the resolution carries (a fused
@@ -770,9 +833,23 @@ class DramaDirector(
     between this call and the commit leaves every intervention
     unconsumed (spec sections 4.5 and 7.2).
 
+    The stored approval binds the turn's actor (from the turn context;
+    None on the tolerated repeated-RESOLVE path outside a turn) and
+    the audience-delivery contract version, so the delivery adapter
+    can verify both before forwarding any view (design 6.1). Both
+    views are required arguments: a caller must never silently fall
+    back to an empty public view, which would drop the turn's public
+    delivery (an empty public event is never enqueued, so a purely
+    private turn passes the empty string explicitly).
+
     Args:
-      resolved_event: The resolved event to publish for the current turn.
-      stage_directions: Stage directions accompanying the event.
+      resolved_event: The full resolved event to publish for the
+        current turn.
+      stage_directions: Stage directions accompanying the full event.
+      public_resolved_event: The public canonical event delivered to
+        the other participants of the scene.
+      public_stage_directions: Stage directions accompanying the
+        public event.
     """
     integrating = (
         self._directive is not None
@@ -789,8 +866,16 @@ class DramaDirector(
         else None
     )
     self._validated = {
+        'audience_delivery_version': AUDIENCE_DELIVERY_VERSION,
+        'actor': (
+            self._turn_context['actor']
+            if self._turn_context is not None
+            else None
+        ),
         'resolved_event': resolved_event,
         'stage_directions': stage_directions,
+        'public_resolved_event': public_resolved_event,
+        'public_stage_directions': public_stage_directions,
         'directive_integrating': integrating,
         # Consumed only when the directive was fused into THIS turn's
         # resolution: a leftover integrating directive from an earlier
@@ -805,6 +890,26 @@ class DramaDirector(
             and bool(repetition.get('proposed_change'))
         ),
         'directive_at_validation': copy.deepcopy(self._directive),
+    }
+
+  def get_validated_delivery_data(self) -> dict[str, Any] | None:
+    """Returns the turn's approved two-view delivery data, or None.
+
+    A deep copy of the delivery fields (`audience_delivery_version`,
+    `actor`, both canonical events and both narrator tracks) while the
+    approval of the current turn is live, or None when nothing is
+    validated (outside a turn, before the final review passed, or
+    after a new putative event cleared an uncommitted approval), so a
+    caller can never read a previous turn's approved data. Mutating
+    the returned dictionary never touches the internal state.
+
+    Returns:
+      The delivery data dictionary, or None.
+    """
+    if self._validated is None:
+      return None
+    return {
+        key: copy.deepcopy(self._validated[key]) for key in _DELIVERY_DATA_KEYS
     }
 
   def get_pending_directive(self) -> dict[str, Any] | None:
@@ -922,8 +1027,37 @@ class DramaDirector(
     return copy.deepcopy(self._last_story_turn)
 
   def get_committed_events(self) -> tuple[str, ...]:
-    """Returns the recent committed public events, excluding candidates."""
+    """Returns the GM's full committed event window, not common knowledge.
+
+    The window holds the complete committed record used for GM-side
+    continuity and adjudication; the publicly known history of the
+    scene is the bounded public event sequence of `get_public_events`
+    (design 6.2), never this window.
+    """
     return tuple(self._recent_events)
+
+  def get_public_events(self) -> tuple[str, ...]:
+    """Returns the committed public event sequence, oldest first.
+
+    Only promoted `public_resolved_event` values, in commit order, are
+    returned: empty public events never enter the sequence, and the
+    sequence keeps at most `_PUBLIC_EVENT_WINDOW` entries. It is the
+    sole data source of the public history (design 6.2); initial
+    public background still comes from the configured `public_facts`.
+    """
+    return tuple(self._public_events)
+
+  def get_public_history(self) -> str:
+    """Returns the public event sequence in DisplayEvents' numbered form.
+
+    Each event is presented as ``{i}). {event}`` counting from zero,
+    joined by newlines — the same presentation the DisplayEvents
+    component uses, so downstream prompts read the public history and
+    the display window in one format.
+    """
+    return '\n'.join(
+        f'{i}). {event}' for i, event in enumerate(self._public_events)
+    )
 
   def get_current_original_speech(self) -> str | None:
     """Returns the original speech of the turn in progress, if any."""
@@ -1242,6 +1376,8 @@ class DramaDirector(
         'turns_in_beat': self._turns_in_beat,
         'story_turn': self._story_turn,
         'recent_events': list(self._recent_events),
+        'public_events': list(self._public_events),
+        'audience_delivery_version': AUDIENCE_DELIVERY_VERSION,
         'beat_timeout': self._beat_timeout,
         'budget_stopped': self._budget_stopped,
         'last_story_turn': (
@@ -1279,6 +1415,14 @@ class DramaDirector(
     self._story_turn = state['story_turn']  # pyrefly: ignore[bad-assignment]
     self._recent_events = list(  # pyrefly: ignore[bad-assignment]
         state['recent_events']  # pyrefly: ignore[bad-argument-type]
+    )
+    # The audience-delivery fields postdate the schema-2 state: the
+    # public sequence cannot be rebuilt from the full events, so
+    # states written before the contract resume with an empty public
+    # history (design 6.2, 7.2). The `audience_delivery_version` field
+    # is saved for provenance; it names the constant this build writes.
+    self._public_events = list(  # pyrefly: ignore[bad-assignment]
+        state.get('public_events', ())  # pyrefly: ignore[bad-argument-type]
     )
     self._beat_timeout = state['beat_timeout']  # pyrefly: ignore[bad-assignment]
     self._budget_stopped = state['budget_stopped']  # pyrefly: ignore[bad-assignment]
@@ -1353,7 +1497,13 @@ class DramaDirector(
     The prompt is the P1 template (plan appendix B): the current beat
     and its completion question head it, the event window follows, and
     the criteria block closes it, anchoring the judgment to events that
-    actually happened rather than intentions or plans.
+    actually happened rather than intentions or plans. The window is
+    the GM's complete committed record — the continuity basis — and is
+    labeled as such (not common knowledge, design 6.2); the criteria
+    add that a privately resolved outcome may be an established fact,
+    yet a condition requiring public disclosure or the involved party's
+    consent cannot be judged satisfied merely by its content appearing
+    in that complete record.
 
     Args:
       beat: The beat to evaluate.
@@ -1374,7 +1524,7 @@ class DramaDirector(
     # example's prompt stub routes completion answers by.
     prompt.statement(f'Current beat "{beat.id}": {beat.description}\n')
     prompt.statement(f'Completion question: {beat.done_question}\n')
-    prompt.statement('## Recent events (oldest first)')
+    prompt.statement(GM_COMPLETE_RECORD_LABEL)
     for event in recent_events:
       prompt.statement(f'- {event}')
     prompt.statement('## Completion criteria')
@@ -1387,7 +1537,11 @@ class DramaDirector(
         ' other player characters, or count GM-imposed voluntary choices as'
         ' evidence of completion. Every required part of an allowed ending'
         ' must already be established by the public events; if evidence is'
-        " missing, answer No. Is the beat's completion question satisfied?"
+        ' missing, answer No. A privately resolved outcome may be an'
+        ' established fact that actually happened, but a condition requiring'
+        " public disclosure or the involved party's consent cannot be judged"
+        ' satisfied merely because its content appears in this complete'
+        " record. Is the beat's completion question satisfied?"
     )
     try:
       return prompt.yes_no_question(question=beat.done_question)
@@ -1413,17 +1567,19 @@ class DramaDirector(
         return beat.tension_range
     return None
 
-  def _score_tension(self, recent_events: Sequence[str]) -> int | None:
+  def _score_tension(self, public_events: Sequence[str]) -> int | None:
     """Asks the model to rate the story's dramatic tension on 1-10.
 
     The prompt carries only the anchored scale and the most recent
-    `scoring_window` resolved events of the director's own window; the
+    `scoring_window` events of the committed public sequence (design
+    6.2): tension is a property of what the scene has publicly
+    established, so the GM's complete record does not condition it. The
     target range of the beat is deliberately absent, because the
     deviation judgment is made in program code. An unparseable answer is
     retried exactly once (spec section 11.1).
 
     Args:
-      recent_events: The step's updated event window; the last
+      public_events: The step's updated public event sequence; the last
         `scoring_window` events condition the question.
 
     Returns:
@@ -1434,7 +1590,7 @@ class DramaDirector(
         propagated to the caller for budget path B handling. Any other
         model error propagates uncaught.
     """
-    window = list(recent_events[-self._scoring_window :])
+    window = list(public_events[-self._scoring_window :])
     document = interactive_document.InteractiveDocument(self._model)
     document.statement(f'{_TENSION_QUESTION}\n')
     document.statement('## Scale anchors')
@@ -1485,7 +1641,7 @@ class DramaDirector(
       score: int,
       beat_id: str,
       turn_id: int,
-      recent_events: Sequence[str],
+      public_events: Sequence[str],
   ) -> dict[str, Any]:
     """Asks the model for a directive moving the tension toward range.
 
@@ -1495,14 +1651,17 @@ class DramaDirector(
     facts must hold, so directives can never decide player characters'
     voluntary actions. A4 (design section 7.2) adds that instructions
     target a concrete unresolved problem of the recent public events
-    rather than novelty stacking.
+    rather than novelty stacking. The public events section lists the
+    committed public sequence (design 6.2), never the GM's complete
+    record.
 
     Args:
       score: This step's valid, deviating tension score.
       beat_id: The beat the directive binds to, the one current when
         the player acted.
       turn_id: The story turn generating the directive.
-      recent_events: Public resolved events through the current turn.
+      public_events: The committed public event sequence through the
+        current turn.
 
     Returns:
       The new directive dictionary. An empty model answer is recorded
@@ -1551,7 +1710,7 @@ class DramaDirector(
     for constraint in self._world_constraints:
       document.statement(f'- {constraint}')
     document.statement('## Recent public events (oldest first)')
-    for event in recent_events:
+    for event in public_events:
       document.statement(f'- {event}')
     content = document.open_question(
         'Write one short director instruction (one sentence) describing '

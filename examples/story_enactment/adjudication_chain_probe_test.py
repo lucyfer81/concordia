@@ -48,14 +48,22 @@ _REJECTION = json.dumps(
     ensure_ascii=False,
 )
 _GENERATION = json.dumps(
-    {'stage_directions': '旁白占位：裁决结果被如实叙述。'}, ensure_ascii=False
+    {
+        'stage_directions': '旁白占位：裁决结果被如实叙述。',
+        'public_stage_directions': '旁白占位：裁决结果被如实叙述。',
+    },
+    ensure_ascii=False,
 )
 _GENERATION_WITH_SELFTALK = json.dumps(
     {
         'stage_directions': (
             '周律师当众展示遗嘱文本并念出落款日期。'
             'seal remains intact? We can provide.'
-        )
+        ),
+        'public_stage_directions': (
+            '周律师当众展示遗嘱文本并念出落款日期。'
+            'seal remains intact? We can provide.'
+        ),
     },
     ensure_ascii=False,
 )

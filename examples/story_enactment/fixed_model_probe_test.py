@@ -267,7 +267,7 @@ class ReviewAttemptTest(unittest.TestCase):
           out_dir=out_dir,
           secrets=['fake-key'],
       )
-    expected = story_resolution._assemble_canonical_event(  # pylint: disable=protected-access
+    expected = story_resolution.assemble_canonical_event(
         active_player_name=case.player,
         original_speech=case.speech,
         stage_directions=case.stage_directions,

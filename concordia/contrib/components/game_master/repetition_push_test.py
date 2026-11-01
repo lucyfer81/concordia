@@ -29,6 +29,7 @@ question with a single suggestion line (keeping the core's
 quoting the actual numbered candidate plus a suffix.
 """
 
+import json
 import re
 from typing import Any
 import unittest
@@ -39,6 +40,7 @@ from concordia.components.game_master import event_resolution as event_resolutio
 from concordia.components.game_master import next_acting as next_acting_lib
 from concordia.contrib.components.game_master import drama_director
 from concordia.contrib.components.game_master import repetition_push
+from concordia.contrib.components.game_master import story_action
 from concordia.contrib.language_models import budget_wrapper
 from concordia.document import interactive_document
 from concordia.testing import mock_model
@@ -72,7 +74,7 @@ _CHOICE_LINE = re.compile(r'^  \(([^)]+)\) (.+)$', re.M)
 _LAST_BLOCK_OPENER = re.compile(r'^(?:Question|Exercise): ', re.M)
 
 # Context fingerprints of the step's independent document.
-_HISTORY_MARK = '## Committed public events (oldest first)'
+_HISTORY_MARK = '## GM complete committed record (not common knowledge)'
 _CANDIDATE_MARK = '## Current candidate (not yet committed)'
 _ACTION_RESULT_MARK = "## Current turn's adjudicated action result"
 _BOUNDARIES_MARK = 'GM-only facts and information boundaries'
@@ -91,6 +93,74 @@ _DIRECTOR_PARAMS = dict(
     character_constraints={'Alice': 'Never confess touching the will.'},
     world_constraints=('Bob secretly holds a recording.',),
 )
+
+_CONTRIBUTION_MARK = '## Current player contribution (not yet committed, data)'
+
+# Frozen shape of the S3 batch R2 t9 input gap (design 2.2): the turn's
+# real dialogue asked the direct questions; only the yielding action
+# reached the detector (raw/R2__a000070.prompt.txt).
+_SPEECH_TURN3 = (
+    '王婶，你说说看：“昨夜后院烧没烧纸？”\n还有，遗嘱对老宅往后还有别的交代？'
+)
+_INTENT_TURN3 = '王婶退开半步，让出桌边空间。'
+# An action-only candidate carrying NO speech: proves the step passes
+# the caller's candidate to the core verbatim and sources the speech
+# from the director, never by reorganizing the candidate.
+_ACTION_ONLY_CANDIDATE = (
+    '王婶退开半步，让出桌边空间。 Because of that, 退让成功，桌边'
+    '空出一些位置，其他人的位置未因此改变。'
+)
+
+
+def _read_contribution_section(text: str) -> dict[str, Any]:
+  """Decodes the JSON player-contribution data section of one prompt."""
+  start = text.index(_CONTRIBUTION_MARK) + len(_CONTRIBUTION_MARK)
+  payload, _ = json.JSONDecoder().raw_decode(text[text.index('{', start) :])
+  return payload
+
+
+def _encoded_action(speech: str, intent: str) -> str:
+  payload = json.dumps(
+      {'speech': speech, 'action_intent': intent}, ensure_ascii=False
+  )
+  story_action.decode_action(payload)
+  return payload
+
+
+def _commit_encoded_turn(gm, speech: str, intent: str) -> None:
+  gm.observe('[putative_event] Alice: ' + _encoded_action(speech, intent))
+  result = gm.act(_RESOLVE_SPEC)
+  gm.observe(f'[event] {result}')
+
+
+def _captured_step(model, director, candidate, player='Alice'):
+  """Runs the real step and captures the core helper's actual inputs.
+
+  The real step discards the caller's chain document and builds its own
+  InteractiveDocument; wrapping (never replacing) the core helper keeps
+  its behavior while `call_args` records the internal document, the
+  candidate and the player name it actually received.
+
+  Args:
+    model: the routing model of the step and document.
+    director: the real director holding the current turn.
+    candidate: the candidate event passed to the step.
+    player: the active player name passed to the step.
+
+  Returns:
+    A (args, returned) pair: `args` is the core helper's positional
+    argument tuple (document, candidate, player), `returned` is the
+    step's true return value.
+  """
+  real_core = event_resolution_lib.maybe_inject_narrative_push
+  core = mock.Mock(wraps=real_core)
+  document = interactive_document.InteractiveDocument(model)
+  step = repetition_push.make_repetition_push_step(director, model)
+  with mock.patch.object(
+      event_resolution_lib, 'maybe_inject_narrative_push', core
+  ):
+    returned = step(document, candidate, player)
+  return core.call_args.args, returned
 
 
 def _last_question_block(prompt: str) -> str:
@@ -191,7 +261,9 @@ class _CommittingAct(entity_component.ActingComponent):
       return 'No'
     speech = self._director.get_current_original_speech()
     event = f'Alice: {speech}'
-    self._director.set_validated_resolution(event, '')
+    # The scripted turn is fully public speech: the public view mirrors
+    # the full event and its (empty) narrator track.
+    self._director.set_validated_resolution(event, '', event, '')
     return f'Event: {event}\n'
 
   def get_state(self):
@@ -362,6 +434,33 @@ class RepetitionPushStepTest(unittest.TestCase):
     # 旧边界保留：候选是提案、未来计划/GM-only 不是已发生进展。
     self.assertIn('not an event that already occurred', rules)
     self.assertIn('not established progress', rules)
+
+  def test_history_section_labeled_gm_complete_record(self):
+    # 设计 6.2：重复检查文档的完整事件段标签改为 GM 完整已提交记录
+    # （非共同知识），内容不变；_JUDGMENT_RULES 首句与数据源对齐，指
+    # 向 GM 完整已提交记录而非 "committed public events"。
+    model = _RepetitionModel(repetition_answer='No')
+    director, gm = _make_director(model)
+    _open_third_turn(gm)
+    args, _ = _captured_step(model, director, 'Alice: three')
+    text = args[0].view().text()
+    self.assertIn(
+        '## GM complete committed record (not common knowledge)', text
+    )
+    self.assertNotIn('## Committed public events', text)
+    # 内容不变：完整提交事件仍按原顺序列于该段下。
+    self.assertIn(f'{_HISTORY_MARK}\n- Alice: one\n- Alice: two', text)
+    rules = repetition_push._JUDGMENT_RULES  # pylint: disable=protected-access
+    self.assertIn(
+        'Judge repetition only against the GM complete committed record'
+        ' above (GM-only, not common knowledge).',
+        rules,
+    )
+    self.assertNotIn('committed public events', rules)
+    self.assertNotIn(
+        'committed public history',  # pylint: disable=protected-access
+        repetition_push._SUGGESTION_RULES,
+    )
 
   def test_unchanged_result_records_check_only(self):
     model = _RepetitionModel(repetition_answer='No')
@@ -551,6 +650,119 @@ class RepetitionPushStepTest(unittest.TestCase):
         director.get_current_resolution_evidence()['intervention']
     )
     self.assertTrue(director.should_attempt_repetition_push())
+
+
+class CurrentPlayerContributionTest(unittest.TestCase):
+  """The turn's pending player contribution reaches the core (design C)."""
+
+  def test_contribution_section_carries_current_turn_speech(self):
+    # Real director in speech_and_action mode; the section equals this
+    # turn's decoded contribution and precedes the candidate section,
+    # read from the internal document the core actually received.
+    model = _RepetitionModel()
+    director, gm = _make_director(model, action_mode='speech_and_action')
+    _commit_encoded_turn(gm, 'one', '')
+    _commit_encoded_turn(gm, 'two', '')
+    gm.observe(
+        '[putative_event] Alice: '
+        + _encoded_action(_SPEECH_TURN3, _INTENT_TURN3)
+    )
+    gm.get_component('__drama_director__').record_action_result(_ACTION_RESULT)
+    args, returned = _captured_step(model, director, _ACTION_ONLY_CANDIDATE)
+    internal_doc, core_candidate, core_player = args
+    # The helper's inputs are unchanged: verbatim candidate and player.
+    self.assertEqual(core_candidate, _ACTION_ONLY_CANDIDATE)
+    self.assertEqual(core_player, 'Alice')
+    # The section is stated on the internal document before the
+    # candidate and carries the director-sourced speech, which the
+    # action-only candidate does not contain.
+    text = internal_doc.view().text()
+    self.assertNotIn('烧没烧纸', core_candidate)
+    self.assertEqual(
+        _read_contribution_section(text),
+        {
+            'active_player_name': 'Alice',
+            'original_speech': _SPEECH_TURN3,
+            'action_intent': _INTENT_TURN3,
+        },
+    )
+    self.assertLess(text.index(_CONTRIBUTION_MARK), text.index(_CANDIDATE_MARK))
+    self.assertIn('not committed history', text)
+    self.assertIn('not automatically progress', text)
+    # Yes path: judgment, suggestion and fusion prompts (what the model
+    # actually received) all carry the same data section via copy().
+    judgment = model.choice_prompts[0]
+    self.assertEqual(
+        _read_contribution_section(judgment)['original_speech'],
+        _SPEECH_TURN3,
+    )
+    for mark in (_SUGGEST_MARK, _MERGE_MARK):
+      prompt = next(
+          p for p in model.text_prompts if mark in _last_question_block(p)
+      )
+      self.assertEqual(
+          _read_contribution_section(prompt)['original_speech'],
+          _SPEECH_TURN3,
+      )
+    # The helper's true merged return keeps the candidate first.
+    self.assertTrue(returned.startswith('1. '))
+    self.assertIn(
+        _ACTION_ONLY_CANDIDATE.split(' Because of that, ')[0], returned
+    )
+
+  def test_getters_read_once_and_real_empty_speech_survives(self):
+    # Pure action turn (empty speech): getters read exactly once, real
+    # empty string (never '(none)' or stale text); No path makes
+    # exactly one judgment call and no suggestion/fusion prompts. The
+    # None-to-'' normalization is not reachable through the step (an
+    # open turn's getters return real strings) and is covered by code
+    # review only, so this name claims no None branch.
+    model = _RepetitionModel(repetition_answer='No')
+    director, gm = _make_director(model, action_mode='speech_and_action')
+    _commit_encoded_turn(gm, 'one', '')
+    _commit_encoded_turn(gm, 'two', '')
+    gm.observe('[putative_event] Alice: ' + _encoded_action('', '取钥匙。'))
+    with mock.patch.object(
+        director,
+        'get_current_original_speech',
+        wraps=director.get_current_original_speech,
+    ) as speech_spy, mock.patch.object(
+        director,
+        'get_current_action_intent',
+        wraps=director.get_current_action_intent,
+    ) as intent_spy:
+      args, _ = _captured_step(model, director, 'Alice: 取钥匙。')
+    self.assertEqual(speech_spy.call_count, 1)
+    self.assertEqual(intent_spy.call_count, 1)
+    self.assertEqual(
+        _read_contribution_section(args[0].view().text()),
+        {
+            'active_player_name': 'Alice',
+            'original_speech': '',
+            'action_intent': '取钥匙。',
+        },
+    )
+    self.assertEqual(len(model.choice_prompts), 1)
+    self.assertIn(_CONTRIBUTION_MARK, model.choice_prompts[0])
+    self.assertEqual(model.text_prompts, [])
+
+  def test_speech_only_turn_has_empty_intent(self):
+    # speech_only mode: plain putative text, intent is a real empty
+    # string, not the previous turn's content.
+    model = _RepetitionModel(repetition_answer='No')
+    director, gm = _make_director(model)
+    _commit_encoded_turn(gm, 'one', '')
+    _commit_encoded_turn(gm, 'two', '')
+    gm.observe('[putative_event] Alice: three')
+    args, _ = _captured_step(model, director, 'Alice: three')
+    self.assertEqual(
+        _read_contribution_section(args[0].view().text()),
+        {
+            'active_player_name': 'Alice',
+            'original_speech': 'three',
+            'action_intent': '',
+        },
+    )
 
 
 if __name__ == '__main__':

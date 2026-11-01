@@ -1,0 +1,170 @@
+{
+  "schema": "fixed-probe-c2r-manifest-v1",
+  "design_sha256": "203cd3b3977d5e46ce5372b13d43e30f2afd55f9079f5d3f3dca14a005b3d995",
+  "batch_root": "run_results/story_enactment/s3_diagnostic_story/20261024T063748Z",
+  "seeds": {
+    "C-2R|rep1": {
+      "py_seed": 2861679309,
+      "np_seed": 387462443
+    },
+    "C-2R|rep2": {
+      "py_seed": 989255436,
+      "np_seed": 24265648
+    },
+    "C-2R|rep3": {
+      "py_seed": 2909855470,
+      "np_seed": 3528696666
+    }
+  },
+  "budget": {
+    "concordia_attempts": {
+      "global_cap": 27,
+      "note": "Nominal upper bound (3 arms x 3 reps x 3 stages when every judgment is Yes); outer production retries each count one attempt and spend this cap; truncation is disclosed truthfully, never compensated."
+    },
+    "sdk_create": {
+      "global_cap": 81,
+      "note": "Guard value (27x3); judgment option re-asks count only at this layer, never as new Concordia attempts."
+    },
+    "http_upper_bound_disclosure": 243,
+    "ledger_group_key": "unit-condition",
+    "logical_stage_keys": 27,
+    "logical_stage_keys_note": "3 arms x 3 repetitions x 3 stages (judgment/suggestion/fusion); logical records are keyed separately from actual requests; No-path suggestion/fusion keys are recorded not-applicable with zero requests."
+  },
+  "order": {
+    "rotation": "by repetition round r=1..3, fixed within-round sequence BASE -> DISC -> WAIT",
+    "rounds": [
+      1,
+      2,
+      3
+    ],
+    "round_sequence": [
+      [
+        "C-2R",
+        "before-base"
+      ],
+      [
+        "C-2R",
+        "after-disclosure"
+      ],
+      [
+        "C-2R",
+        "after-waiting"
+      ]
+    ]
+  },
+  "model_params": {
+    "model": {
+      "env_key": "AI_MODEL_4",
+      "tag": "m4",
+      "name": "gpt-6.1-sol"
+    },
+    "C-judgment": {
+      "max_tokens": 5000,
+      "terminators": "adapter default (ignored, not sent)",
+      "reasoning_effort": "medium"
+    },
+    "C-suggestion-fusion": {
+      "max_tokens": 1500,
+      "terminators": [],
+      "reasoning_effort": "low"
+    },
+    "common": {
+      "temperature": 1.0,
+      "verbosity": "low",
+      "timeout_seconds": 60,
+      "sdk_max_tokens_field": "max_completion_tokens",
+      "not_sent": [
+        "terminators",
+        "top_p",
+        "top_k"
+      ]
+    },
+    "extra_calls": "none: no reason, generation or semantic-review calls beyond the judgment/suggestion/fusion chain"
+  },
+  "code_states": {
+    "before": {
+      "sha256": "7a396b2af4f913929ecba455e8c6f901bc7b1ff40d56ce8b43b2eb555ee73863",
+      "sources": {
+        "concordia/contrib/components/game_master/repetition_push.py": "# Copyright 2026 DeepMind Technologies Limited.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     https://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Repetition-push thought step reusing the core narrative-push helper.\n\nWhen the drama director's committed repetition state allows a check on\nthe current turn (feedback and the repetition switch enabled, story\nrunning, check interval reached, shared cooldown over, no tension\ndirective in flight; spec section 7.2), this step builds one\nindependent ``InteractiveDocument`` on the same budget- and\nretry-wrapped model the surrounding chain uses, states the evidence the\nrepetition judgment may rely on, and calls the core\n``maybe_inject_narrative_push`` helper of\n``concordia.components.game_master.event_resolution`` unchanged. The\nhelper is imported and called, never reimplemented: no second\nrepetition detector, no alternative suggestion generation and no\nre-draw loop exist here.\n\nThe document explicitly separates the ordered committed public history\nfrom the current turn's candidate (marked as not yet committed), the\nadjudicated action result of the current turn, the whitelisted\nenvironmental means, the immutable facts, the player list and the\nGM-only boundaries. Future beats, allowed endings and hidden truths are\nnever stated as established progress; recent conflict alone is not\nrepetition when new facts, action results or effective responses\noccurred.\n\nThe judgment rules distinguish effective progress from ineffective\nrepetition (design section 7.1): a first discovery of a concrete\nblockage, new sourced information, an adjudicated action result, a\nresponse resolving a previously unanswered question, or an autonomous\nacceptance, refusal or change of strategy each counts as progress,\nwhile restating the same blockage, repeated preparation or rewording\nthe same request does not; new conflict, absence of physical change and\nblocked actions are not stagnation. A ``## Suggestion and fusion\nconstraints`` statement (design section 7.2) is added to the document\nbefore the helper call, so the core's internal ``copy()`` carries it\ninto the suggestion and fusion prompts with no new parameters and no\nnew model calls: both focus any complication on an already-committed,\nconcrete unresolved blockage instead of stacking new chores. No extra\n\"is it stagnating\" call is added, the core's yes/no judgment is never\noverridden, and no turn-count-based forced intervention exists.\n\nThe helper's true return value is returned to the chain unchanged and\nrecorded on the director via ``record_repetition_result``: whether the\nhelper actually attempted an intervention (judged the story repetitive\nand ran its suggestion-and-fusion path) is observed on the outer\ndocument's model responses and recorded separately from the candidate\nchange — an unchanged candidate still records the attempt but means a\ncheck only, never a proposal, while a changed one is a proposed\nintervention candidate that still faces the single-field\nstage-directions final generation and the independent review. The\nhelper may generate several suggestions on an internal copy of the\ndocument and pick one at\nrandom; only the actually selected and merged result (the before/after\nthe caller can observe) and the outer document's trace are archived,\nand the core is never modified or intercepted to expose the\ninaccessible internal candidates. API and budget errors — and equally\ncatchable interruptions such as ``KeyboardInterrupt`` raised inside the\ncore calls — propagate uncaught after the partial trace is archived in\nthe transient resolution diagnostics (plan section 11.3, path A): a\nfailed check is never recorded as a successful or unchanged return.\n\"\"\"\n\nfrom collections.abc import Callable\n\nfrom concordia.components.game_master import event_resolution as event_resolution_lib\nfrom concordia.contrib.components.game_master import drama_director\nfrom concordia.document import interactive_document\nfrom concordia.language_model import language_model\n\n_JUDGMENT_RULES = (\n    'Judge repetition only against the committed public events above. A'\n    ' recent quarrel or repeated disagreement alone is NOT repetition'\n    ' when new facts, adjudicated action results or effective responses'\n    ' to each other occurred. Judge effective progress, not novelty: a'\n    ' first discovery of a concrete blockage, new sourced information,'\n    ' an adjudicated action result, a response that resolves a'\n    ' previously unanswered question, and an autonomous acceptance,'\n    ' refusal or change of strategy can each be progress.'\n    ' Restating the same blockage, repeated preparation, endlessly'\n    ' demanding the same registration, or rewording the same request is'\n    ' not new progress; distinguish a first meaningful procedural'\n    ' request from unfounded repeated escalation. Movement, lighting or'\n    ' registration can be necessary progress when it moves a current'\n    ' question toward a definite outcome. New conflict is not'\n    ' stagnation, absence of physical change is not stagnation, and a'\n    ' blocked action is still an outcome a character may act on.'\n    ' One-time events that already happened cannot happen again. The'\n    ' current candidate is a proposal for this turn, not an event that'\n    ' already occurred; future plans, possible endings and any GM-only'\n    ' knowledge are not established progress.'\n)\n\n_SUGGESTION_RULES = (\n    ' For every suggested complication and its fusion, prefer a legal'\n    ' change tied to a concrete unresolved blockage or unanswered'\n    ' question in the committed public history. Do not stack another'\n    ' interruption, verification or registration chore onto unresolved'\n    ' ones merely for novelty. Never instruct a player to change their'\n    ' goal, confess, cooperate, or pick a specific ending. Remain within'\n    ' the allowed means and information boundaries; these preferences'\n    ' never authorize an otherwise illegal event.'\n)\n\n\ndef make_repetition_push_step(\n    director: drama_director.DramaDirector,\n    model: language_model.LanguageModel,\n) -> Callable[[interactive_document.InteractiveDocument, str, str], str]:\n  \"\"\"Creates the repetition-push step of an event-resolution chain.\n\n  Args:\n    director: the drama director holding the committed repetition state\n      (the gate), the public history and the GM-only boundaries, which\n      receives the helper's actual result.\n    model: the language model of the surrounding chain — the same\n      budget- and retry-wrapped model — used for the independent\n      repetition document.\n\n  Returns:\n    A thought step with the EventResolution step signature\n    ``(document, premise, active_player_name) -> str``. On an ineligible\n    turn it returns the candidate unchanged with zero model calls; on an\n    eligible turn it calls the core ``maybe_inject_narrative_push``\n    helper once on its own document, records the actual result on the\n    director, and returns the helper's true return value unchanged.\n  \"\"\"\n\n  def step(\n      chain_of_thought: interactive_document.InteractiveDocument,\n      candidate_event: str,\n      active_player_name: str,\n  ) -> str:\n    \"\"\"Maybe pushes the current candidate past a repetitive stretch.\"\"\"\n    del chain_of_thought\n    if not director.should_attempt_repetition_push():\n      return candidate_event\n    document = interactive_document.InteractiveDocument(model)\n    _state_repetition_context(\n        document=document,\n        director=director,\n        candidate_event=candidate_event,\n        active_player_name=active_player_name,\n    )\n    responses_before = _count_model_responses(document)\n    try:\n      pushed = event_resolution_lib.maybe_inject_narrative_push(\n          document,\n          candidate_event,\n          active_player_name,\n      )\n    except BaseException as error:\n      # Path A: archive the partial trace visible before the failure,\n      # then propagate the original error untouched. The failed check\n      # records no result, so an uncommitted retry may check again.\n      # BaseException keeps catchable interruptions (KeyboardInterrupt,\n      # SimulatedInterruption) covered too: the trace already holds\n      # whatever the core prompt showed before the interrupt — e.g. the\n      # merge question quoting the selected event — and losing it would\n      # leave an interrupted turn without evidence. Recording here is\n      # diagnostics only: no check success, no attempt, no execution.\n      director.record_resolution_diagnostics(\n          stage='repetition_push',\n          trace=document.view().text(),\n          error=f'{type(error).__name__}: {error}',\n      )\n      raise\n    # An attempt is observable on the outer document without touching\n    # the core: a judgment of \"not repetitive\" adds exactly one model\n    # response (the yes/no choice) and returns, while an attempt adds a\n    # second one (the fusion question; the suggestion list is generated\n    # on the helper's internal copy and never reaches this document).\n    attempted = _count_model_responses(document) - responses_before >= 2\n    director.record_repetition_result(\n        candidate_before=candidate_event,\n        candidate_after=pushed,\n        attempted=attempted,\n        trace=document.view().text(),\n    )\n    return pushed\n\n  return step\n\n\ndef _count_model_responses(\n    document: interactive_document.InteractiveDocument,\n) -> int:\n  \"\"\"Counts the model-generated response entries of the document.\n\n  Args:\n    document: the independent repetition document shared with the core\n      helper.\n\n  Returns:\n    The number of contents the document tags as model responses.\n  \"\"\"\n  return len(\n      document.view(include_tags=(interactive_document.MODEL_TAG,)).contents()\n  )\n\n\ndef _state_repetition_context(\n    *,\n    document: interactive_document.InteractiveDocument,\n    director: drama_director.DramaDirector,\n    candidate_event: str,\n    active_player_name: str,\n) -> None:\n  \"\"\"States the evidence the core repetition judgment conditions on.\n\n  Args:\n    document: the independent repetition document shared with the core\n      helper.\n    director: the director supplying the committed history, the current\n      turn's adjudicated action result and the GM-only boundaries.\n    candidate_event: the current turn's candidate, not yet committed.\n    active_player_name: name of the player whose turn it currently is.\n  \"\"\"\n  del active_player_name  # The core helper receives it unchanged too.\n  document.statement('# Repetition check (current turn candidate)')\n  document.statement('## Committed public events (oldest first)')\n  events = director.get_committed_events()\n  for event in events:\n    document.statement(f'- {event}')\n  if not events:\n    document.statement('(none)')\n  document.statement(\n      f'## Current candidate (not yet committed)\\n{candidate_event}'\n  )\n  evidence = director.get_current_resolution_evidence()\n  action_result = evidence.get('action_result')\n  document.statement(\"## Current turn's adjudicated action result\")\n  document.statement(action_result if action_result else '(none)')\n  document.statement(\n      '## Judgment rules\\n'\n      f'{_JUDGMENT_RULES}\\n'\n      'Allowed means for any new event: '\n      f\"{'; '.join(director.allowed_environment_events) or '(none)'}\\n\"\n      'Immutable facts: '\n      f\"{'; '.join(director.immutable_facts) or '(none)'}\\n\"\n      'Player characters whose voluntary actions only they can choose: '\n      f\"{', '.join(director.player_names) or '(none)'}\"\n  )\n  document.statement(\n      '## GM-only facts and information boundaries (never disclose these)'\n  )\n  for name, rule in director.character_constraints.items():\n    document.statement(f'- {name}: {rule}')\n  for constraint in director.world_constraints:\n    document.statement(f'- {constraint}')\n  # Stated before the helper call so the core's internal copy() carries\n  # it into the suggestion and fusion prompts (design section 7.2).\n  document.statement(\n      '## Suggestion and fusion constraints\\n' + _SUGGESTION_RULES\n  )\n"
+      },
+      "files": {
+        "concordia/contrib/components/game_master/repetition_push.py": "7a396b2af4f913929ecba455e8c6f901bc7b1ff40d56ce8b43b2eb555ee73863"
+      }
+    },
+    "after": "current working tree"
+  },
+  "batch_sources": {
+    "R2_turns": {
+      "path": "R2/story_turns.jsonl",
+      "sha256": "025f4bc3977964c680894e0dfa4a41c5a878aa6143488c7971f00988082d0ef1"
+    }
+  },
+  "fixtures": {
+    "C-2R": {
+      "history": {
+        "kind": "jsonl_field_list",
+        "source": "R2_turns",
+        "turn_ids": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "field": "resolved_event",
+        "value": [
+          "林雪: 照看老人两年，问一句遗嘱是什么时候立的，就不配了吗？周律师，这份遗嘱的订立日期是哪一天，封印启封前是否核验过？这些还请您说清楚。\n林雪压下喉间的哽咽，稳住情绪，将目光从陈默身上移向周律师。",
+          "陈默: 行了！周律师，您就把订立日期、启封前封印有没有核验说清楚，省得争个没完。我们陈家的事总得有个准话——这份遗嘱有没有效，老宅什么时候能办过户？\n陈默转向周律师，抬手向下压了压，作出制止争执的手势；这一动作并未确保争执平息，也未使任何人必须回应。遗嘱的订立日期、封印核验情况、效力及老宅过户时间均未因此获得新的公开确认。",
+          "周律师: 于程序而言，订立日期应以原件记载为准，请容我先查看日期及落款。启封前封印是否经过核验、由谁核验，我目前不能提供已经核实的说明，不能把密封保管等同于核验无误。陈默，当众宣读并不等于已经确认遗嘱有效；在形式要件及相关争议尚未查清之前，我不能对效力下结论，也不能承诺老宅的过户时间。林女士提出的这两项问题，应当得到如实回应。\n周律师将面前已启封的遗嘱原件移近，查看到落款日期为“二〇一九年三月十二日”，落款处有陈望山的签名与手印，未见见证人署名。此次查看所得仅限于周律师，不代表其他在场者已看清相关内容，也未确认签名、手印的真实性或遗嘱效力；启封前封印是否经过核验，亦未因这一动作得到核实。",
+          "王婶: 周律师，您这话说得实在，没查清就不能打包票。您正看着原件，劳烦把上头的日期、落款念给大家听听，签名手印这些该怎么核实，也请说个明白。陈默，心急吃不了热豆腐，先别催着过户卖房！林雪照应老人两年，问个明白不算坏了规矩。人还在守头七，老先生到底留了什么交代，总得弄清楚。\n王婶挪近桌边，探身查看已启封遗嘱原件的日期与落款，看清日期为“二〇一九年三月十二日”，落款处有陈望山的签名与手印，未见见证人署名。此次查看所得仅限于王婶，不代表其他在场者也已看清，亦不能据此确认签名、手印的真实性或遗嘱效力。周律师是否朗读或进一步说明，仍由其自行决定。",
+          "陈母: 王婶，三十年的交情，你知道我只盼着这家别散。默儿方才话重，我不护他这句，可他父亲才走，也别把他催问手续就说成急着卖房。周律师，劳烦您把原件上的日期、落款念清楚，该核实的照规矩核实；只是事情没查明前，也别先让孩子背上什么名声。老人头七，总得留几分体面。\n陈母抬起手帕轻按眼角，缓缓挪到桌边，从近处看清了已启封遗嘱原件的日期与落款：日期为“二〇一九年三月十二日”，落款处有陈望山的签名与手印，未见见证人署名。此次查看所得仅限于陈母本人，不代表其他在场者也已看清，亦不能据此确认签名、手印的真实性或遗嘱效力。周律师是否朗读、进一步核实，仍由其自行决定；启封前封印的核验情况未因此获得确认。"
+        ]
+      },
+      "speech_disclosure": {
+        "kind": "jsonl_field",
+        "source": "R2_turns",
+        "turn_id": 6,
+        "field": "speech",
+        "value": "体面要留，实情也不能含糊。周律师，启封后的封皮还在吗？昨夜我起夜，亲眼看见陈太太蹲在后院烧纸，纸灰里还残着半枚火漆印。我不知道烧的是什么，更不能说那就是这份遗嘱的封印。但既然启封前有没有核验还没说清，这件事，我不能瞒着。"
+      },
+      "speech_control": {
+        "kind": "inline",
+        "value": "周律师，还是请您把原件上的日期、落款念给大家听听，大家都等着呢。我先退开些。"
+      },
+      "action_intent": {
+        "kind": "inline",
+        "value": "林雪向旁边退开半步。"
+      },
+      "candidate": {
+        "kind": "inline",
+        "value": "林雪向旁边退开半步。 Because of that, 退让成功，林雪的位置略有变化，其他人的位置未因此改变。周律师仍持有原件，原已能够查看原件的状态未变。此次动作未触碰或移动遗嘱，未产生新的查阅结果，也未使周律师开始宣读。"
+      },
+      "gate": {
+        "kind": "jsonl_field",
+        "source": "R2_turns",
+        "turn_id": 6,
+        "field": "director_diagnostics.repetition",
+        "value": {
+          "reason": "repetition",
+          "checked": true,
+          "attempted": false,
+          "proposed_change": false,
+          "executed": false
+        }
+      },
+      "active_player": "林雪",
+      "fingerprints": {
+        "speech": "2fafe49a13768a1f40d499a43b5c542b8845679bbb23aa94f27a55518f96f1b1",
+        "speech_control": "3dd53e0723095787a73d3a8852e825c9a070631e7e2392922420d2d7dc608b22",
+        "action_intent": "810666dc159e5f14e27b6cf1e23bb7e47708c92fcd3e4e271c0d5b08325b0f79",
+        "result": "56b98b6a5e2c2fc03558bff0f182a716902d3c62ecb0337bc346380ecbdc6408",
+        "candidate": "65ef47a0a19b2dc69061e850a9bd117de61fd99a9bdb508cf183387a10ad679b"
+      },
+      "arms": [
+        "before-base",
+        "after-disclosure",
+        "after-waiting"
+      ]
+    }
+  }
+}

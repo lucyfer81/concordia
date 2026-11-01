@@ -978,8 +978,16 @@ class _FinalOutputProbeModel(language_model.LanguageModel):
         and _REVIEW_MARK not in prompt
     ):
       self.generation_calls += 1
+      # The current two-field output contract: the synthetic generation
+      # answers with the frozen full narration plus its public mirror
+      # (the probes' fixtures are fully public scenes, so the public
+      # track repeats the full narration verbatim).
       response = json.dumps(
-          {'stage_directions': self._stage_directions}, ensure_ascii=False
+          {
+              'stage_directions': self._stage_directions,
+              'public_stage_directions': self._stage_directions,
+          },
+          ensure_ascii=False,
       )
       self.captured.append({
           'slot': 'generation_synthetic',

@@ -119,7 +119,7 @@ class StoryConfigTest(unittest.TestCase):
         generation = [
             p
             for p in stub.text_prompts
-            if 'Output a JSON object with exactly one string field' in p
+            if 'Output a JSON object with exactly two string fields' in p
         ]
         review = [
             p
@@ -148,6 +148,91 @@ class StoryConfigTest(unittest.TestCase):
       self.assertEqual(
           rebuilt.scene_type.action_spec, scene.scene_type.action_spec
       )
+
+
+# 2026-10-24 事件准入设计：默认白名单删去的两条完整事件。当前管线
+# 无法为其提供合法的远端生成渠道（来电对端、邮差本人），导演不再
+# 主动引入；提及、请求与既有历史事件不在封禁之列。
+_REMOVED_EVENTS = (
+    '周律师的手机响起，来电显示是遗产登记处',
+    '邮差冒雨敲门，送来一封老人生前寄出的旧信',
+)
+
+
+class DefaultEventWhitelistTest(unittest.TestCase):
+  """设计 §2：默认故事事件白名单恰为保留五项（原顺序、原文字）。"""
+
+  def test_default_events_are_exactly_the_five_retained(self):
+    config = story_config.make_example_config()
+    self.assertEqual(
+        config.allowed_environment_events,
+        (
+            '雷雨骤紧，老宅骤然断电，堂内只剩烛光',
+            '供桌旁的青瓷花瓶被袖口带倒，应声碎裂',
+            '隔壁邻居被争执声惊动，前来敲门探问',
+            '堂屋的旧收音机自己响了起来，播报暴雨红色预警',
+            '一阵穿堂风扫过，吹灭了供桌上的两支白烛',
+        ),
+    )
+    for removed in _REMOVED_EVENTS:
+      self.assertNotIn(removed, config.allowed_environment_events)
+
+  def test_neighbor_rule_count_unchanged(self):
+    rules = story_config.make_example_config().npc_response_rules
+    self.assertEqual(len(rules), 1)
+    self.assertIn('隔壁邻居', rules[0])
+
+  def test_default_roundtrip_keeps_five_events(self):
+    config = story_config.make_example_config()
+    d = config.to_dict()
+    self.assertEqual(len(d['allowed_environment_events']), 5)
+    rebuilt = story_config.StoryConfig.from_dict(d)
+    self.assertEqual(
+        rebuilt.allowed_environment_events, config.allowed_environment_events
+    )
+
+  def _legacy_config(self):
+    # 测试常量显式构造带旧两项的自定义配置：默认缩减不得隐式迁移或
+    # 全局禁用自定义名单（设计 §4）。
+    config = story_config.make_example_config()
+    five = config.allowed_environment_events
+    return dataclasses.replace(
+        config,
+        allowed_environment_events=(
+            five[0],
+            *_REMOVED_EVENTS,
+            *five[1:],
+        ),
+    )
+
+  def test_legacy_custom_config_roundtrips_unchanged(self):
+    legacy = self._legacy_config()
+    self.assertEqual(story_config.validate(legacy), [])
+    rebuilt = story_config.StoryConfig.from_dict(legacy.to_dict())
+    self.assertEqual(
+        rebuilt.allowed_environment_events, legacy.allowed_environment_events
+    )
+
+  def test_run_config_and_resume_read_keep_legacy_events(self):
+    legacy = self._legacy_config()
+    config = run_lib.make_run_config(legacy, mode='director')
+    self.assertEqual(
+        config['story']['allowed_environment_events'],
+        list(legacy.allowed_environment_events),
+    )
+    self.assertEqual(
+        config['gm_params']['allowed_environment_events'],
+        list(legacy.allowed_environment_events),
+    )
+    self.assertEqual(
+        config['director_params']['allowed_environment_events'],
+        list(legacy.allowed_environment_events),
+    )
+    # 恢复路径读取：从持久化 story 字典重建仍保留旧两项。
+    restored = story_config.StoryConfig.from_dict(config['story'])
+    self.assertEqual(
+        restored.allowed_environment_events, legacy.allowed_environment_events
+    )
 
 
 class NpcResponseRulesConfigTest(unittest.TestCase):

@@ -11,20 +11,41 @@ player's speech is preserved verbatim in the canonical event, while
 everything the narrator adds lives on a separate stage-directions track.
 
 In the final generation step the model writes narration only: a strict
-single-field JSON response with `stage_directions`. The canonical event is
-assembled by code from the acting player's original speech and that
-narration before any review, so the review judges exactly the event that
-will be published. Each resolution receives one such independent semantic
-review before it can enter memory, player observations, or a checkpoint.
+two-field JSON response — `stage_directions`, the complete record of the
+turn's result, and `public_stage_directions`, the publicly observable part
+of the same event for everyone else in the scene. Both canonical events
+are assembled by code from the same acting player's original speech and
+each narration track before any review, so the review judges exactly the
+events that will be published. Each resolution receives one such
+independent semantic review — one generation and one review cover both
+views — before either view can enter memory, player observations, or a
+checkpoint. The acting character receives the full resolved event; every
+other scene participant receives the public one, delivered by the
+deterministic `AudienceDelivery` adapter with no broadcast fallback
+(audience-delivery design 4.1/6.1).
+
 The review checks player agency, character constraints, private
 information, established facts, and environmental permissions. A rejected
 or malformed review stops the run with `error`; it does not rewrite the
-story or retry generation, and after approval the reviewed event is
+story or retry generation, and after approval the reviewed pair is
 committed verbatim — nothing is rewritten past the review. This adds one
 budgeted model request per resolved turn. Review is a fallible model
 judgment and still requires live human acceptance. The screenplay exports
-consume the same `stage_directions` the canonical event was assembled
-from, giving both consumers the same narrator facts.
+consume the same full `stage_directions` the canonical event was assembled
+from — never the public track — giving both consumers the same narrator
+facts. When the turn's
+evidence carries a non-empty adjudicated `action_result`, the
+generation prompt additionally carries a generation-only
+result-fidelity guidance block before the output requirements
+(preserve the result's concrete values, negative findings, scope and
+uncertainty boundaries; never upgrade, downgrade or whitewash), while
+the review prompt and the semantic rules stay unchanged. This guidance
+is input completion: the offline tests prove only that it reaches the
+existing generation call with the boundaries unregressed, and any
+claim that it reduces result omission requires a separate
+fixed-sample protocol with authorized real model calls — its real
+semantic effect is unproven
+([docs/superpowers/notes/2026-10-24-story-enactment-fidelity-and-repetition-context.md](../../docs/superpowers/notes/2026-10-24-story-enactment-fidelity-and-repetition-context.md)).
 
 The example implements the design in
 [docs/superpowers/specs/2026-10-13-story-enactment-phase1-design.md](../../docs/superpowers/specs/2026-10-13-story-enactment-phase1-design.md).
@@ -66,7 +87,7 @@ stage reuses the same example story and review checklist:
 
 | Mode | Stage | What it adds |
 |------|-------|--------------|
-| `beats_only` | 1. 契约先行 (contract first) | Fixed cast and information allocation, beat advancement, story-turn output with single-field stage directions, screenplay export, resume. Scoring disabled. |
+| `beats_only` | 1. 契约先行 (contract first) | Fixed cast and information allocation, beat advancement, story-turn output with two-field stage directions, screenplay export, resume. Scoring disabled. |
 | `tension_observe` | 2. 张力观察 (tension observation) | Tension is scored every `eval_interval` turns and recorded only; no feedback. Compare scores with human judgment before enabling the director. |
 | `director` | 2. 张力观察 (tension observation) | Scoring plus feedback: a deviating score generates a directive that is fused into the next resolution through the story's whitelisted environment events (with a cooldown). Also enables the repetition intervention: every `repetition_check_interval`-th turn the core narrative-push helper may add a whitelisted environmental event when the committed history repeats; a check that changes nothing records a check only. |
 | `character_depth` | 3. 角色深度 (character depth) | The director setup plus per-character emotion (`EmotionalStance`) and cached relationship perception (`RelationshipsToOthers`); the acting character's emotion is collected per turn. |
@@ -83,6 +104,18 @@ including schema-2 director checkpoints — resume with the repetition
 intervention off regardless of the mode. The repetition helper normally adds
 one choice call per check turn, plus a suggestion and a merge call when it
 judges the story repetitive; all are billed as real model attempts.
+The repetition judgment document also carries a JSON data section with
+the current turn's pending player contribution (speaker, original
+dialogue, action intent): speech claims keep their attribution and
+never automatically become objective evidence by themselves, and the
+core helper call and the judgment rules are unchanged. Like the generation-side
+guidance above, this contribution section is input completion whose
+real semantic effect is unproven — the offline tests prove only that
+the contribution reaches the existing judgment document with the
+helper and rules unregressed, and any claim of improved repetition
+judgment requires a separate fixed-sample protocol with authorized
+real model calls
+([docs/superpowers/notes/2026-10-24-story-enactment-fidelity-and-repetition-context.md](../../docs/superpowers/notes/2026-10-24-story-enactment-fidelity-and-repetition-context.md)).
 
 ## Resuming
 
@@ -109,12 +142,17 @@ be reconstructed from the checkpoint; legacy manifest entries that predate
 invocation ids are kept as-is and never backfilled. Old committed events
 are retained as saved; the new review does not retroactively certify them.
 
-Checkpoints and committed history written by the earlier dual-field output
-contract are read unchanged. The new generation path rejects the legacy
-two-field model responses outright, so a resume from an old checkpoint
-continues with the single-field `stage_directions` contract: a
-cross-version resume (canonical-review design spec section 7.3), never an
-exact replay of the old version.
+The audience-delivery contract (2026-10-31) tightens this boundary: every
+run config records the marker `audience_delivery_version = 1`, and a config
+or checkpoint without it — including every schema-1/2 checkpoint — predates
+the two-view delivery contract and is rejected on both entry points before
+any model is constructed, with guidance to start a fresh run; there is no
+cross-version resume into the two-field contract, and the new generation
+path rejects legacy single-field model responses outright
+(audience-delivery design spec section 7.2). Committed story turns already
+on disk are not rewritten: schema-1/2 turns keep their original shape (no
+public view is ever retrofitted), and the offline read-only export of
+existing records is unaffected.
 
 Schema-2 run configs require an explicit top-level `action_mode` matching
 the game master's effective mode. If `gm_params.action_mode` is omitted,
@@ -175,18 +213,33 @@ that NPC's public response to the current interaction; the rule need
 not prescribe its exact words. Empty rules, no applicable rule, or an
 unmet trigger authorize no new NPC response through the action channel.
 
-Known limitation: this pipeline has no per-recipient content. All
-resolved events are public to every scene participant, so a private
-phone call or whisper cannot receive its far-side reply here (design
-section 5.3 and the section-11 gate). Private NPC conversations need a
-separate audience-design before they can count as supported; the
-public-neighbor acceptance below must not be reported as closing that
-gap.
+Known limitation: audience delivery still has only two views, not
+arbitrary per-recipient content. Each resolved turn reaches the acting
+character in full and every other scene participant through the public
+view, so a private phone call or whisper still cannot receive its
+far-side reply here (design section 5.3 and the section-11 gate).
+Private NPC conversations need a further audience-design before they can
+count as supported; the two-view delivery above must not be reported as
+closing that gap.
 
 Unsupported private interaction is an engineering limitation, not an
 in-story fact that the other side is silent, refuses, disconnects, or
 fails identity verification. Do not invent those outcomes or force a
 player to hang up or enable speakerphone to bypass the limitation.
+
+Default-story admission fix (2026-10-24): the default estate story's
+`allowed_environment_events` no longer includes the phone call from the
+registry office or the courier delivering the old letter. The current
+pipeline has no legal channel to generate their far side (a private
+caller's reply, the courier's own responses), so the director no longer
+introduces them by default; characters mentioning phones or letters in
+dialogue, and events already established in a resumed history, are not
+banned by this change. Custom `StoryConfig`s and old checkpoints keep
+whatever event list they carry — nothing is migrated or globally
+forbidden. This fixes event admission only; it does not claim the
+stagnation observed in the S3 batch is solved, and private-call or
+courier interactions remain unsupported capabilities rather than
+in-story facts about anyone's silence or refusal.
 
 ## Budgets
 
@@ -353,8 +406,11 @@ Each line of `story_turns.jsonl` holds one committed story turn:
 | `scene_id` | Scene type name of the enacting scene. |
 | `actor` | Name of the acting player character. |
 | `speech` | The actor's authored dialogue, verbatim. |
-| `resolved_event` | Canonical event assembled by code from the speech and the stage directions (field name kept for comparability with older runs). |
-| `stage_directions` | Narrator track authored by the model: environment changes, NPC behavior, outcomes. |
+| `schema_version` | Record schema version (current: 3, the audience-delivery contract); absent in older records. |
+| `resolved_event` | Full canonical event assembled by code from the speech and the stage directions (field name kept for comparability with older runs). |
+| `stage_directions` | Full narrator track authored by the model: environment changes, NPC behavior, outcomes. |
+| `public_resolved_event` | Public canonical event for everyone else in the scene, assembled by code from the same speech and the public track. Schema 3 only; required, and validated — together with `public_stage_directions` — as the exact same-assembly pair before any write. |
+| `public_stage_directions` | Publicly observable narrator track of the same event. Schema 3 only; may be empty for a purely private turn (an empty public event is never delivered to the others). |
 | `emotion` | The actor's emotion label (`character_depth` only, else `null`). |
 | `beat_id_at_action` | Beat current when the actor acted. |
 | `beat_id_after_event` | Beat current after resolution (`null` once all beats completed). |
@@ -621,14 +677,23 @@ python -m examples.story_enactment.world_response_rev_probe --stage=summarize --
 
 ## S3 Diagnostic Story Runner
 
-`s3_diagnostic_story.py` executes the frozen S3 diagnostic story
-protocol
-([docs/superpowers/plans/2026-10-23-sol-s3-diagnostic-story-protocol.md](../../docs/superpowers/plans/2026-10-23-sol-s3-diagnostic-story-protocol.md),
-user-confirmed 2026-10-23): two independent full runs (R1/R2) of the
-production enactment pipeline over Sol only (`AI_MODEL_4` /
-gpt-6.1-sol), each with 24 story turns and a 400 model-attempt budget
-under a global ledger cap of 800. Production `run.py` stays
-byte-identical: the `LedgerLanguageModel` is injected by
+`s3_diagnostic_story.py` executes the frozen 2026-10-30 post-C-2R
+full-story diagnostic protocol
+([docs/superpowers/plans/2026-10-30-story-enactment-post-c2r-full-story-diagnostic-protocol.md](../../docs/superpowers/plans/2026-10-30-story-enactment-post-c2r-full-story-diagnostic-protocol.md),
+designed 2026-10-30; real execution still pending separate user
+authorization — no confirmation date is claimed): two independent full
+runs (R1/R2) of the production enactment pipeline over Sol only
+(`AI_MODEL_4` / gpt-6.1-sol), each with 24 story turns and a 400
+model-attempt budget under a global ledger cap of 800. The batch is the
+current-version full-story diagnostic of the two production repairs —
+B (adjudicated-result delivery fidelity) and C (repetition judgment
+considering the turn's actual contribution) — and locates the next
+narrative obstacle; it is not a strict before/after A/B experiment and
+attributes nothing to a single prompt repair (非严格 A/B，不归因单变量).
+The main historical reference is the original S3 batch
+`20261024T063748Z` (raw trajectory plus `turn_evaluation_reviewed.md`);
+the old retracted conclusions are not carried over. Production `run.py`
+stays byte-identical: the `LedgerLanguageModel` is injected by
 module-attribute replacement with try/finally restore, and every
 forwarded Concordia model attempt occupies one request-ledger slot. The
 ledger pre-debits budget at `started` — API errors, timeouts and
@@ -636,10 +701,24 @@ no-result calls spend budget — and interrupted evidence is never
 resent, refunded, skipped or re-generated: an interrupted run (bare
 checkpoint without a summary, or started-without-finish ledger slots)
 is marked `interrupted` and the batch pauses for user review; there
-is no auto-resume — per protocol §5 the runner implements no
-mid-process recovery.
+is no auto-resume — per the 2026-10-30 protocol §4, the runner
+implements no mid-process recovery.
 
-Budget enforcement is two-layered (protocol §4): besides the
+The real entry (`--stage=run` without the offline path) is guarded by a
+one-time marker whose order is fixed: read-only frozen verification →
+run-trace absence → the atomically created `run_started.json` marker →
+only then the `.env` credentials are read. A batch directory that was
+executed or interrupted is never run again (an interrupted batch is not
+auto-resumed and R2 is never silently started for it), and directories
+or reports carrying any existing run state — run entries, a recorded
+stop, or used counts — are refused before credentials with zero
+writes. The real entry also accepts only the complete `R1→R2` order:
+subsets, reordering and repeats are refused. The offline test path
+keeps its subset and idempotent-reentry behavior and never occupies
+the marker.
+
+Budget enforcement is two-layered (2026-10-30 protocol §2, inheriting
+the original protocol §4): besides the
 Concordia attempts ledger, every SDK `chat.completions.create` is
 pre-debited against a per-run hard cap of 400 before the provider is
 contacted; the two ledgers are rebuilt separately from their own
@@ -649,14 +728,18 @@ Concurrent calls keep their own thread-local observation state. Both
 ledgers share a short bookkeeping lock for numbering, pre-debit and
 archival; the lock is released while waiting for the provider. Frozen
 source/protocol hashes and both ledgers are re-audited before each run
-and each model/SDK forwarding boundary. A provider, archival or script
-fault remains a batch stop even when production returns it as
-`reason=error`; only an explicit semantic review rejection permits the
-next run after an error. Archival failures are never silently ignored.
-On production exit, the wrapper closes admission and drains already
-admitted calls, including component work left by the fail-fast executor,
-before the batch records its final result. Late calls cannot write new
-ledger entries or reach the provider after closure.
+and each model/SDK forwarding boundary. The freeze report additionally
+records the freeze-time environment versions (Python, platform, NumPy,
+OpenAI SDK) in its `environment` block — a record only: it does not
+claim a full closure over arbitrary third-party dependencies. A
+provider, archival or script fault remains a batch stop even when
+production returns it as `reason=error`; only an explicit semantic
+review rejection permits the next run after an error. Archival failures
+are never silently ignored. On production exit, the wrapper closes
+admission and drains already admitted calls, including component work
+left by the fail-fast executor, before the batch records its final
+result. Late calls cannot write new ledger entries or reach the
+provider after closure.
 
 Stages `dry_run`, `freeze`, `run`, `summarize` follow the
 frozen-protocol discipline. The offline `dry_run` freezes a batch into
@@ -664,13 +747,27 @@ the dry-run directory, executes both runs through the deterministic
 stub (`--disable_language_model` path of the production runner: zero
 network, no `.env` read), summarizes, and records each batch invariant
 (terminal reasons, ledger/production attempt equality, archived
-prompts, caps, stub-only request stages) in `dry_run_report.json`.
-Real `freeze`/`run` execution requires separate user authorization per
-protocol §8, under a new batch directory (真实 `freeze`/`run` 需按协议
-§8 另获授权); the protocol never initiates calls by itself. The batch
-is a diagnostic, not an acceptance gate: the summary answers "where is
-the obstacle" and declares no MVP quality verdict (诊断无验收门).
-Tests in `s3_diagnostic_story_test.py` run fully offline.
+prompts, caps, stub-only request stages, checkpointed director params
+matching the frozen table, and the effective event whitelist equaling
+the admission fix's five entries) in `dry_run_report.json`. The dry run
+also verifies the B/C wiring per run: with an offline-only stub
+scaffolding (one injected action intent) each of R1 and R2 must show at
+least one B result-fidelity guidance prompt and at least one C
+current-contribution zone prompt in its archived prompts, and both runs
+must retain their six artifact types (`story_turns.jsonl`,
+`checkpoint.json`, `summary.json`, `script.fdx`, `script.fountain`,
+`script.txt`). The scaffolding is disclosed in the report
+(`offline_stub_scaffolding`) and never reaches the real path — the
+config-forwarding assertion observes the actual provider-factory
+boundary, not a helper's return value — and retention is not a script
+quality verdict. Real `freeze`/`run` execution requires separate user
+authorization per the protocol's stop boundary
+(真实 `freeze`/`run` 需按 2026-10-30 协议 §4 停止边界另获授权); the
+protocol never initiates calls by itself. The batch is a diagnostic,
+not an acceptance gate: the summary answers "where is the obstacle" and
+declares no MVP quality verdict (诊断无验收门；dry run 只证明接线).
+Tests in `s3_diagnostic_story_test.py` run fully offline and never read
+the checkout's `docs/` or `run_results/` history.
 
 ```
 python -m examples.story_enactment.s3_diagnostic_story --stage=dry_run \
@@ -694,8 +791,150 @@ examples/story_enactment/
 ├── testing_stubs.py   # Deterministic PromptStubModel
 ├── fixed_model_probe.py  # Frozen-protocol live-model validation probe
 ├── three_model_review_probe.py  # Three-model R-only review comparison probe
+├── adjudication_chain_probe.py  # Two-model chain-fidelity probe (A/FINAL/E)
 ├── request_ledger.py  # Append-only request ledger (started = pre-debit)
 ├── world_response_probe_closeout.py  # Offline read-only batch errata (S1)
 ├── world_response_rev_probe.py  # Sol-only REV re-validation probe (S2)
+├── s3_diagnostic_story.py  # Frozen full-story diagnostic protocol (S3)
+├── fixed_probe.py / fixed_probe_runner.py  # Fixed-sample harness (B/C)
+├── fixed_probe_c2r.py / fixed_probe_c2r_runner.py  # C-2R replacement probe
 └── *_test.py          # CI tests (no API keys needed)
 ```
+
+## Fixed-sample probe harness (offline)
+
+`fixed_probe.py` implements the 2026-10-24 fixed-sample verification
+protocol (result fidelity B / full-turn context C) as an offline
+harness: it loads the frozen fixtures from
+`fixed_probe_manifest.json` (the data authority, hash-bound to the
+reviewed fixture manifest and the frozen S3 batch), runs both code
+states through the real production steps under paired seeds with an
+execution-time RNG proof, books every call through the two-layer
+request ledger keyed by unit-condition, audits that the controlled
+first prompts differ only by the intended section, and writes the
+four-state stage bookkeeping plus the preregistered evaluation-table
+skeleton. It makes **zero real model calls and reads no credentials**;
+its tests run in CI on in-process stubs with temporary directories.
+Real execution (freezing the batch directory and swapping in the live
+model) is a separate step that requires explicit user authorization
+under protocol §9.
+
+The B-1 replay retains the archived request's complete input document,
+public-history formatting and actual composed action result; its before
+prompt is checked byte-for-byte against the original request. B/C group
+caps are checked before every model forwarding. Interrupted stages are
+rebuilt from durable request events, and an unavailable judgment remains
+unavailable in the evaluation table rather than being reported as No.
+
+**Historical replay after the audience-delivery contract change
+(2026-10-31).** The current production tree no longer speaks the
+original single-field output contract this protocol drove, so the
+harness never treats current production as the "after" condition any
+more. Historical units replay original-contract fixtures
+(`fixed_probe_original_contract.json`, schema
+`fixed-probe-original-contract-v1`): the frozen before state executes
+inside a byte-pinned original-contract dependency closure (closure
+sha256 pins cross-checked against the executed batches' frozen
+dependency hashes; drifted modules load from embedded frozen sources
+and can never resolve through `sys.modules` to new-tree components
+with old signatures), and each after condition's controlled prompt is
+the archived recording of the executed batch, reconstructed from the
+executed before prompt plus the audited controlled section and
+verified against the archive's sha256 pin. Loading a source that
+speaks the new audience contract is a loud batch-level error
+(`NewContractSourceError`) naming the incompatibility; no audit
+whitelist is ever widened for it. Current-production compatibility is
+verified by independent tests (`test_current_source_*` in
+`fixed_probe_test.py`), never as old B/C baseline comparisons.
+
+`fixed_probe_runner.py` is the real-execution driver for this harness
+(three absl stages: `freeze | verify | run`). `freeze` and `verify` are
+offline: the freeze stage copies the manifest and a byte-exact plan
+snapshot into the batch directory, pins the 16 reviewed deliverables
+(`_FROZEN_SOURCES`, the v5 hash list) and the execution-dependency
+closure, and verify re-checks all of it plus byte-exact fixture
+re-extraction from the frozen S3 batch. `run` is the only stage that
+reads credentials (`--env_path`, default `.env`, requiring
+`AI_MODEL_4=gpt-6.1-sol` — Sol only) and is bounded by the two-layer
+hard caps (75 attempts / 225 SDK creates, with group caps B 21 / C 54),
+the one-time execution guard (an atomic `run_started.json` marker; an
+already-run or interrupted directory is refused with zero writes), and
+the per-attempt/per-create frozen-integrity check over the dependency
+closure, pinned deliverables and in-batch frozen inputs. Implementation
+and tests make **zero real model calls and read no credentials** (the
+real adapter is exercised only through a fake `openai.OpenAI` factory);
+the real run requires separate user authorization under protocol §9.
+
+## C-2R replacement probe (three arms over a shared baseline)
+
+`fixed_probe_c2r.py` + `fixed_probe_c2r_runner.py` implement the
+C-2R replacement verification (the legal first-hand eyewitness
+disclosure by 林雪 that replaces the discredited old C-2 fixture,
+whose public debt admission violated its speaker's bottom line). The
+purpose is the same scientific question with a valid positive example:
+when the pending player contribution is completed with a sourced
+first-time disclosure, does the repetition judgment track the turn's
+actual contribution better? Three arms run per repetition over the
+R2 t1–t5 committed prefix: `before-base` (the pre-change code, whose
+judgment prompt carries no player-contribution zone), `after-
+disclosure` (current code plus the zone carrying the R2 t6 speech
+verbatim) and `after-waiting` (current code plus the same zone
+carrying a third restatement of the standing read-aloud request).
+Each repetition runs one before baseline shared by both comparisons
+(seeds `derive_seeds("C-2R", rep)`; the before prompt is provably
+speech-independent), so the baseline is never counted as two
+independent observations — `paired_comparisons.json` references the
+same base slot from both B→D and B→W, and a baseline without a final
+legal label marks its round unpairable instead of fabricating one.
+
+The probe is a **thin adapter over the fixed-sample harness**: it
+reuses `fixed_probe.run_unit`/`run_batch`/`load_code_states`/
+`write_rubric_report` by direct calls through a compatibility view
+(three single-condition virtual units, so the engine's built-in
+before/after pair audit never fires), reuses the runner's retry
+wrapper, integrity monitor pieces and settings loader, and copies
+none of the ledger/retry/recovery machinery. Its manifest
+(`fixed_probe_c2r_manifest.json`, schema `fixed-probe-c2r-manifest-v1`)
+is self-contained: the before `repetition_push.py` is embedded and
+hash-pinned, the R2 turns file is pinned by hash and copied into the
+batch at freeze, and CI tests never read `run_results` (batch
+re-extraction runs against batch-local copies, with a synthetic
+replica batch in tests). Like the fixed-sample harness, the after
+arms replay original-contract recordings (the archived DISC/WAIT
+judgment prompts of the executed C-2R batch, reconstructed from the
+executed BASE prompt plus the contribution zone and verified against
+the archive's sha256 pins), never current production.
+
+The runner adds a fourth stage, `preflight` (offline, zero network):
+it runs four rep-1 stub executions off the batch's own manifest copy
+and writes `preflight/` with the four captured judgment prompts and
+`preflight-facts.json` (gate-opened witness, the five design-§8
+fingerprints, the three byte-relation assertions, the before
+dual-speech byte identity and the 27-logical-stage-key derivation).
+All stub-run traces stay in a temporary directory — the batch root
+never receives any run-trace file and the first real run's one-time
+guard stays unoccupied. During `run`, the engine is composed as a
+three-arm audit interposer **above** the production retry wrapper
+**above** the probe's two ledger layers: each round's BASE/DISC/WAIT
+judgment prompts are audited before the WAIT judgment is forwarded,
+so any controlled-difference drift blocks that request and every
+later call with zero billing (a batch integrity fault). The run is
+bounded by the C-2R caps (27 Concordia attempts / 81 SDK creates /
+243 HTTP disclosure bound, 27 logical stage keys recorded separately
+from requests) and watched by `C2RIntegrityMonitor` — the inherited
+three frozen groups plus the batch-local file group (the materialized
+before source and the R2 turns copy).
+
+C-2R is mutually exclusive with the old batch: it reuses no old
+authorization, budget or remaining quota, never reruns the B group or
+the old C-1/C-3, and any B/D/W judgment combination is preregistered
+data (interpreted per the plan's eight-combo table) — only independent
+integrity failures stop the batch. The run contracts (one-time guard
+before credentials, per-attempt/per-create integrity, full-artifact
+redaction, response-identity archiving, no-rerun fault reporting,
+last-attempt classification) come from the C-2R implementation plan
+(`docs/superpowers/plans/
+2026-10-29-story-enactment-c2r-supplementary-verification-plan.md`),
+which is also snapshotted into the batch at freeze. Implementation and
+tests make **zero real model calls and read no credentials**; the real
+run requires separate user authorization under that plan's §7.

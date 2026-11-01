@@ -705,7 +705,7 @@ class _DualForwardModel(language_model.LanguageModel):
 class _OfflineFinalStub(language_model.LanguageModel):
   """Offline two-slot stub for dry runs and unit tests.
 
-  Answers the generation slot with a canned valid single-field JSON
+  Answers the generation slot with a canned valid two-field JSON
   object and the review slot with a canned valid verdict, so the full
   production final-output step runs to completion offline. Responses
   are configurable per slot for exception-classification rehearsals.
@@ -720,7 +720,10 @@ class _OfflineFinalStub(language_model.LanguageModel):
       review_error: Exception | None = None,
   ):
     self._generation_response = generation_response or json.dumps(
-        {'stage_directions': '干跑占位旁白：仅用于离线路由验证。'},
+        {
+            'stage_directions': '干跑占位旁白：仅用于离线路由验证。',
+            'public_stage_directions': '干跑占位旁白：仅用于离线路由验证。',
+        },
         ensure_ascii=False,
     )
     self._review_response = review_response or json.dumps(
@@ -997,9 +1000,13 @@ def _run_final_stage_attempt(
       review_response_file.write_text(review_response, encoding='utf-8')
   if resolved_event is not None and generation_response is not None:
     try:
-      stage_directions = story_resolution._parse_stage_directions(  # pylint: disable=protected-access
+      # Current two-field contract: the parser returns the full and
+      # public narrator tracks; the record keeps the full one.
+      stage_directions = story_resolution._parse_final_output(  # pylint: disable=protected-access
           generation_response
-      )
+      )[
+          0
+      ]
     except story_resolution.StoryOutputError:
       stage_directions = None
 

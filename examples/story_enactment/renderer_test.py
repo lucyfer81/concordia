@@ -623,6 +623,129 @@ class ActionOnlyRenderingTest(unittest.TestCase):
     )
 
 
+class OldAndNewRecordExportTest(unittest.TestCase):
+  """Audience-delivery design 7.3: the export stays the full record.
+
+  Schema-2 records (no public fields) and schema-3 records (full
+  narration carrying a legally private finding) both render: the
+  screenplay keeps the full ``stage_directions`` and the verbatim
+  speech, the public view never replaces the full narration, and no
+  diagnostics travel into any export. The renderer itself is unchanged
+  by the audience-delivery work; this test pins that boundary.
+  """
+
+  _PRIVATE_DATE = '二〇一九年三月十二日'
+  _NEW_SPEECH = '这份底档我亲自看过了。'
+  _NEW_FULL_STAGE = (
+      '周律师翻开底档，看清落款日期是二〇一九年三月十二日，'
+      '与公示文本不一致；此次仅由他本人获知。'
+  )
+  _NEW_PUBLIC_STAGE = '周律师独自在档案桌前翻看了片刻底档。'
+  _NEW_INTENT = '周律师借口复核，独自抽出遗嘱底档查看落款日期。'
+
+  @staticmethod
+  def _paragraphs(text: str) -> list[tuple[str, str]]:
+    """Parses FDX into (Paragraph Type, XML-decoded Text) pairs."""
+    root = ET.fromstring(text.encode('utf-8'))
+    paragraphs = []
+    for paragraph in root.findall('./Content/Paragraph'):
+      element_type = paragraph.get('Type')
+      assert element_type is not None
+      paragraphs.append((element_type, ''.join(paragraph.itertext())))
+    return paragraphs
+
+  def _records(self) -> list[dict]:
+    """Builds one schema-2 and one schema-3 record of the same scene."""
+    # A schema-2 record as the collector archived it before the
+    # audience contract: no public fields anywhere.
+    old_record = {
+        'turn_id': 1,
+        'scene_id': '故事主线',
+        'schema_version': 2,
+        'actor': '陈默',
+        'speech': '旧记录的对白原样保留。',
+        'raw_action': json.dumps(
+            {'speech': '旧记录的对白原样保留。', 'action_intent': ''},
+            ensure_ascii=False,
+        ),
+        'action_intent': '',
+        'resolved_event': (
+            '陈默: 旧记录的对白原样保留。\n旧记录的舞台指示原样保留。'
+        ),
+        'stage_directions': '旧记录的舞台指示原样保留。',
+        'emotion': None,
+        'beat_id_at_action': 'b1',
+        'beat_id_after_event': 'b1',
+        'tension': None,
+    }
+    # A schema-3 record: the full narration carries the private date,
+    # the public view does not, and private diagnostics sit beside them.
+    new_record = {
+        'turn_id': 2,
+        'scene_id': '故事主线',
+        'schema_version': 3,
+        'actor': '周律师',
+        'speech': self._NEW_SPEECH,
+        'raw_action': json.dumps(
+            {'speech': self._NEW_SPEECH, 'action_intent': self._NEW_INTENT},
+            ensure_ascii=False,
+        ),
+        'action_intent': self._NEW_INTENT,
+        'resolved_event': f'周律师: {self._NEW_SPEECH}\n{self._NEW_FULL_STAGE}',
+        'stage_directions': self._NEW_FULL_STAGE,
+        'public_resolved_event': (
+            f'周律师: {self._NEW_SPEECH}\n{self._NEW_PUBLIC_STAGE}'
+        ),
+        'public_stage_directions': self._NEW_PUBLIC_STAGE,
+        'director_diagnostics': {'trace': 'DIAGNOSTIC_SENTINEL_42'},
+        'emotion': None,
+        'beat_id_at_action': 'b1',
+        'beat_id_after_event': 'b1',
+        'tension': None,
+    }
+    return [old_record, new_record]
+
+  def test_renderer_exports_old_and_new_records(self):
+    records = self._records()
+    for render in (
+        renderer.render_fdx,
+        renderer.render_fountain,
+        renderer.render_plain_text,
+    ):
+      with self.subTest(render=render.__name__):
+        text = render(records, _SCENE_DISPLAY)
+        # Both record generations export: the schema-2 record without
+        # public fields renders exactly like before, and the schema-3
+        # record renders beside it.
+        self.assertIn('旧记录的对白原样保留。', text)
+        self.assertIn('旧记录的舞台指示原样保留。', text)
+        # The screenplay uses the full stage directions and the
+        # verbatim speech: the reader sees the private date the other
+        # characters have not been told (design 7.3).
+        self.assertIn(self._PRIVATE_DATE, text)
+        self.assertIn(self._NEW_SPEECH, text)
+        # The public view never replaces the full narration, and no
+        # diagnostics or raw action JSON mix into any export.
+        self.assertNotIn(self._NEW_PUBLIC_STAGE, text)
+        self.assertNotIn('DIAGNOSTIC_SENTINEL_42', text)
+        self.assertNotIn(self._NEW_INTENT, text)
+        self.assertNotIn(records[1]['raw_action'], text)
+    # FDX pins the exact elements: the full narration is the Action
+    # paragraph verbatim and the speech is the Dialogue paragraph.
+    self.assertEqual(
+        self._paragraphs(renderer.render_fdx(records, _SCENE_DISPLAY)),
+        [
+            ('Scene Heading', 'INT. 老宅客厅 - 夜'),
+            ('Character', '陈默'),
+            ('Dialogue', '旧记录的对白原样保留。'),
+            ('Action', '旧记录的舞台指示原样保留。'),
+            ('Character', '周律师'),
+            ('Dialogue', self._NEW_SPEECH),
+            ('Action', self._NEW_FULL_STAGE),
+        ],
+    )
+
+
 class DeterminismTest(unittest.TestCase):
 
   def test_repeated_rendering_is_byte_identical(self):
@@ -733,7 +856,10 @@ class AcceptanceScenarioTest(unittest.TestCase):
       with self.subTest(factory=factory.__name__):
         config = factory()
         self.assertGreaterEqual(len(config.gm_only_facts), 1)
-        self.assertGreaterEqual(len(config.allowed_environment_events), 6)
+        # 场景一随 2026-10-24 事件准入修复降为五项；场景二、三的
+        # 验收下限保持六项，不因默认修复而放宽。
+        floor = 5 if factory is acceptance.make_scenario_one_config else 6
+        self.assertGreaterEqual(len(config.allowed_environment_events), floor)
         self.assertGreaterEqual(len(config.characters), 4)
         self.assertLessEqual(len(config.characters), 5)
         players = [c for c in config.characters if '玩家角色' in c.identity]

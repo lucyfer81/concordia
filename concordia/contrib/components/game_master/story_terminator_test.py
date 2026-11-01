@@ -119,7 +119,9 @@ class _StoryAct(entity_component.ActingComponent):
     ):
       speech = self._director.get_current_original_speech() or 'acts'
       event = f'Alice: {speech}'
-      self._director.set_validated_resolution(event, '')
+      # The scripted turn is fully public speech: the public view
+      # mirrors the full event and its (empty) narrator track.
+      self._director.set_validated_resolution(event, '', event, '')
       return f'Event: {event}\n'
     return 'No'
 

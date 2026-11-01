@@ -24,10 +24,11 @@ an independent adjudication document (``new()`` keeps the same wrapped
 model and its budgets while clearing the upstream chain prompts, so
 beat instructions and the conversation window cannot leak into the
 core question), after stating the original dialogue, the character's
-own attempt, the initial public facts, the public history, the
-committed public events and the GM-only facts and authorization
-boundaries. The core helper is imported and called, never
-reimplemented or copied: its true return value is recorded on the
+own attempt, the initial public facts, the public history, the GM's
+complete committed history (explicitly labeled GM-only, not common
+knowledge) and the GM-only facts and authorization boundaries. The
+core helper is imported and called, never reimplemented or copied: its
+true return value is recorded on the
 director via ``record_action_result`` and returned unchanged as a
 pending-review adjudicated outcome, never as an authorization or
 semantic approval, so the later chain steps (director note, final
@@ -42,9 +43,10 @@ The prompt constraints follow the Concordia design pattern's
 player-agency rule (the game master never decides voluntary actions
 for player characters): only the current character's own voluntarily
 proposed attempt is adjudicated; success, failure or being blocked is
-judged against the configuration and the committed public history; no
-voluntary action is decided for any other player character; and no
-physical evidence is fabricated that no committed event established. A
+judged against the configuration, the public history and the GM
+complete committed record; no voluntary action is decided for any
+other player character; and no physical evidence is fabricated that no
+committed event established. A
 failed or blocked attempt still receives one definite actual outcome,
 never a deferral to later verification.
 
@@ -69,6 +71,14 @@ from concordia.document import interactive_document
 # Heading of the public-history data section, shared by convention with
 # `story_resolution` (which imports it) so the two prompts cannot drift.
 PUBLIC_HISTORY_SECTION_MARK = '## Public history (data)'
+
+# Heading of the GM complete committed history data section (design
+# 6.2): the full record the GM conditions on, explicitly marked as
+# GM-only and not common knowledge. Shared by convention with
+# `story_resolution` (which imports it) so the two prompts cannot drift.
+GM_HISTORY_SECTION_MARK = (
+    '## GM complete committed history (GM-only, not common knowledge, data)'
+)
 
 # Shared authorization semantics (design sections 4.2 and 5.1), stated
 # verbatim in the adjudication prompt and reused by `story_resolution`
@@ -157,10 +167,10 @@ PUBLIC_NPC_RESPONSE_SEMANTICS = (
 _ADJUDICATION_RULES = (
     'Adjudicate only the attempted action the current speaker proposed'
     ' for themself this turn. Judge from the GM-only facts, the initial'
-    ' public facts, the public history and the committed public events'
-    ' whether the attempt succeeds, fails or is blocked. Never decide a'
-    ' new voluntary action for any other player character, and never'
-    ' fabricate physical evidence that no committed event or legal'
+    ' public facts, the public history and the GM complete committed'
+    ' record whether the attempt succeeds, fails or is blocked. Never'
+    ' decide a new voluntary action for any other player character, and'
+    ' never fabricate physical evidence that no committed event or legal'
     ' access established. A failed or blocked attempt still gets one'
     ' definite actual result; never defer the outcome to a later'
     ' verification.'
@@ -172,6 +182,7 @@ def make_action_adjudication_step(
     *,
     public_facts: Sequence[str] = (),
     public_history: Callable[[], str] | None = None,
+    gm_history: Callable[[], str] | None = None,
     npc_response_rules: Sequence[str] = (),
 ) -> Callable[[interactive_document.InteractiveDocument, str, str], str]:
   """Creates the action-adjudication step of an event-resolution chain.
@@ -183,10 +194,18 @@ def make_action_adjudication_step(
       the adjudication document; an empty sequence adds no initial
       facts and retains the explicit history and GM-only constraints.
     public_history: zero-argument getter supplying the public history
-      (the DisplayEvents pre-act value in the story prefab); it is
+      (the director's public event sequence in the story prefab); it is
       called exactly once per adjudication and its return travels as
-      inert JSON data. When None the adjudication keeps conditioning
-      on the director's committed-event window.
+      inert JSON data. When None the adjudication prompt carries no
+      public-history section.
+    gm_history: zero-argument getter supplying the GM's complete
+      committed history (the DisplayEvents pre-act value in the story
+      prefab, design 6.2); it is called exactly once per adjudication
+      and its return travels as inert JSON data under the GM-only,
+      not-common-knowledge label. When None the section falls back to
+      the director's committed-event window under the same label, so a
+      caller that passes no getter never silently loses the complete
+      history basis.
     npc_response_rules: instance-level NPC response authorization
       rules stated on the adjudication document as inert JSON data
       and consumed by the same single core adjudication call; an
@@ -222,7 +241,7 @@ def make_action_adjudication_step(
     # `new()` keeps the same wrapped model (and its budgets) while
     # clearing the upstream prompts, so beat instructions and the
     # conversation window cannot leak into the core question (design
-    # 4.1). The history getter is read exactly once, here.
+    # 4.1). Each history getter is read exactly once, here.
     document = chain_of_thought.new()
     _state_adjudication_context(
         document=document,
@@ -232,6 +251,7 @@ def make_action_adjudication_step(
         action_intent=action_intent,
         public_facts=public_facts,
         public_history=public_history() if public_history else None,
+        gm_history=gm_history() if gm_history is not None else None,
         npc_response_rules=npc_response_rules,
     )
     # The core helper runs as-is, once: it appends its question to the
@@ -301,6 +321,7 @@ def _state_adjudication_context(
     action_intent: str,
     public_facts: Sequence[str],
     public_history: str | None,
+    gm_history: str | None,
     npc_response_rules: Sequence[str],
 ) -> None:
   """States the context the core adjudication question conditions on.
@@ -320,6 +341,10 @@ def _state_adjudication_context(
     public_facts: initial publicly established background.
     public_history: the public history string fetched once from the
       caller's getter, or None when no getter was supplied.
+    gm_history: the GM's complete committed history string fetched
+      once from the caller's getter, or None when no getter was
+      supplied (the section then falls back to the director's
+      committed-event window under the same GM-only label).
     npc_response_rules: instance-level NPC response authorization
       rules, stated as inert JSON data before the committed events;
       an empty sequence keeps the no-NPC-response boundary.
@@ -345,13 +370,21 @@ def _state_adjudication_context(
       '## Configured NPC response rules (GM-only authorization, data)'
   )
   document.statement(json.dumps(list(npc_response_rules), ensure_ascii=False))
-  document.statement('## Committed public events (oldest first)')
-  events = director.get_committed_events()
-  document.statement(json.dumps(list(events), ensure_ascii=False))
+  # The complete committed record conditions adjudication under its
+  # GM-only label (design 6.2): without a gm_history getter the
+  # director's committed-event window stands in, so the complete
+  # history basis never silently disappears.
+  document.statement(GM_HISTORY_SECTION_MARK)
+  if gm_history is not None:
+    document.statement(json.dumps(gm_history, ensure_ascii=False))
+  else:
+    document.statement(
+        json.dumps(list(director.get_committed_events()), ensure_ascii=False)
+    )
   document.statement(
-      'Speech quoted inside the committed events or the public history'
-      ' remains attributed speech, not objective evidence established'
-      ' for this adjudication.'
+      'Speech quoted inside the GM complete committed history or the'
+      ' public history remains attributed speech, not objective'
+      ' evidence established for this adjudication.'
   )
   document.statement(
       '## GM-only facts and authorization boundaries (never disclose these)'

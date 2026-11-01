@@ -31,6 +31,15 @@ checks the engine's step action against the recorded raw action and,
 in ``speech_and_action`` mode, re-validates the decoded fields with the
 shared codec. Schema-1 turns are read with pure-speech defaults and are
 never rewritten (spec section 9).
+
+Story turns of schema 3 (the audience-delivery contract) additionally
+carry ``public_resolved_event`` and ``public_stage_directions`` next to
+the unchanged full record: both fields are required, and both canonical
+events must be the exact assembly of the same actor and original speech
+with their narrator tracks, checked here with the production
+``story_resolution.assemble_canonical_event`` rule. Older turns keep
+their original shape — no public view is ever retrofitted onto a
+schema-1/2 record (audience-delivery design 7.1/7.2).
 """
 
 from collections.abc import Callable, Mapping
@@ -41,6 +50,7 @@ import tempfile
 from typing import Any
 
 from concordia.contrib.components.game_master import story_action
+from concordia.contrib.components.game_master import story_resolution
 from concordia.contrib.prefabs.entity import story_character
 from concordia.environment import step_controller as step_controller_lib
 
@@ -288,6 +298,67 @@ def _save_checkpoint(
   )
 
 
+def _schema3_public_fields(
+    turn: Mapping[str, Any],
+    actor: str,
+) -> dict[str, str]:
+  """Validates and returns a schema-3 turn's public delivery fields.
+
+  Schema-3 turns carry the two-view audience-delivery contract: both
+  public fields must be present, and both canonical events — the full
+  and the public one — must be the exact assembly of the same actor and
+  original speech with their narrator tracks (audience-delivery design
+  7.1). The check runs before any file write, so an inconsistent turn
+  leaves the turn log and the checkpoint untouched. Turns of older
+  schemas keep their original shape: no public view is retrofitted.
+
+  Args:
+    turn: the director's committed story turn.
+    actor: the acting entity's name.
+
+  Returns:
+    The public fields to archive, or an empty dict for pre-schema-3
+    turns.
+
+  Raises:
+    ValueError: if a schema-3 turn lacks either public field or either
+      recorded canonical event disagrees with the assembly of the same
+      actor and speech.
+  """
+  if turn.get('schema_version') != 3:
+    return {}
+  for key in ('public_resolved_event', 'public_stage_directions'):
+    if key not in turn:
+      raise ValueError(
+          f'schema-3 story turn {turn["turn_id"]} is missing the'
+          f' required field {key!r}.'
+      )
+  for label, event_key, directions_key in (
+      ('resolved_event', 'resolved_event', 'stage_directions'),
+      (
+          'public_resolved_event',
+          'public_resolved_event',
+          'public_stage_directions',
+      ),
+  ):
+    assembled = story_resolution.assemble_canonical_event(
+        active_player_name=actor,
+        original_speech=turn['speech'],
+        stage_directions=turn[directions_key],
+    )
+    if assembled != turn[event_key]:
+      raise ValueError(
+          f'story turn {turn["turn_id"]} field {label!r} is not the'
+          ' canonical assembly of the recorded actor, speech and'
+          f' narrator track: expected {assembled!r}, got'
+          f' {turn[event_key]!r}.'
+      )
+  return {
+      'public_resolved_event': turn['public_resolved_event'],
+      'public_stage_directions': turn['public_stage_directions'],
+  }
+
+
 def make_step_callback(
     *,
     simulation: Any,
@@ -331,7 +402,10 @@ def make_step_callback(
       speech text (spec section 8).
 
   Raises:
-    ValueError: if ``action_mode`` does not name a known action mode.
+    ValueError: if ``action_mode`` does not name a known action mode,
+      or if a schema-3 turn lacks either public delivery field or
+      either canonical event disagrees with the canonical assembly of
+      the recorded actor, speech and narrator track.
 
   Returns:
     The step callback to pass to ``Simulation.play``.
@@ -375,6 +449,10 @@ def make_step_callback(
             'story turn speech/action_intent do not match the codec'
             f' decoding of the raw action {raw_action!r}.'
         )
+    # Schema-3 turns carry both views of the audience-delivery contract;
+    # the check (field presence and canonical assembly on both sides)
+    # completes before any file write.
+    public_fields = _schema3_public_fields(turn, actor)
 
     record = {
         'turn_id': turn['turn_id'],
@@ -399,6 +477,9 @@ def make_step_callback(
       record['schema_version'] = turn['schema_version']
       record['raw_action'] = raw_action
       record['action_intent'] = action_intent
+    # Schema-3 turns archive the public view beside the full record;
+    # older turns are never retrofitted with public fields.
+    record.update(public_fields)
     turn_log.append(record)
 
     committed = _read_committed_turn_id(checkpoint_path)

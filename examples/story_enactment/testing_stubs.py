@@ -19,9 +19,10 @@ one fixed string and always the first choice, this stub routes by
 prompt semantics: the shared speech call to action returns a
 per-character dialogue line, the speech-and-action contract call
 returns strict JSON preserving the authored speech verbatim, the
-final narrator-track request returns a single-field
-stage-directions JSON derived from the resolution evidence carried
-by the current prompt, and the basic entity's perception questions
+final narrator-track request returns a two-field
+stage-directions JSON (the full track and its public mirror) derived
+from the resolution evidence carried by the current prompt, and the
+basic entity's perception questions
 receive short fixed answers. Text
 routing keys on the LAST `Question:`/`Exercise:` block of the prompt,
 so earlier question blocks embedded in a component's context (e.g. the
@@ -56,9 +57,9 @@ _SPEECH_CALL_MARK = '现在说什么'
 _SPEECH_ACTION_CALL_MARK = '现在说什么、做什么'
 _SPEAKER_IN_CALL = re.compile(r'根据你已知的信息，(.+?) 现在说什么')
 
-# Fingerprint of the final narrator-track output instruction built by
-# `concordia.contrib.components.game_master.story_resolution`.
-_FINAL_OUTPUT_MARK = 'Output a JSON object with exactly one string field'
+# Fingerprint of the final two-field narrator-track output instruction
+# built by `concordia.contrib.components.game_master.story_resolution`.
+_FINAL_OUTPUT_MARK = 'Output a JSON object with exactly two string fields'
 _REVIEW_MARK = (
     'Evaluate all rules above. Output only a JSON object with exactly'
 )
@@ -202,6 +203,7 @@ class PromptStubModel(language_model.LanguageModel):
       dialogue_lines: Mapping[str, str] | None = None,
       default_line: str = '这宅子的事，急不得。',
       stage_directions: str = '窗外的雷声滚过，烛火摇曳。',
+      public_stage_directions: str | None = None,
       choice_answer: str = 'No',
       completion_answers: Mapping[str, str] | None = None,
       fail_choice_calls_from: int | None = None,
@@ -223,6 +225,10 @@ class PromptStubModel(language_model.LanguageModel):
       stage_directions: fixed background narration appended after the
         evidence-derived facts in the stage-directions track; the
         propagation tests set it to ''.
+      public_stage_directions: the value emitted verbatim as the
+        public narrator track of the final output; None (the default)
+        mirrors the full track, modeling a fully public event whose two
+        views are identical.
       choice_answer: option text chosen for choice prompts without a
         configured beat-completion answer.
       completion_answers: mapping from beat id to the yes/no option
@@ -267,6 +273,7 @@ class PromptStubModel(language_model.LanguageModel):
     self._dialogue_lines = dict(dialogue_lines or {})
     self._default_line = default_line
     self._stage_directions = stage_directions
+    self._public_stage_directions = public_stage_directions
     self._choice_answer = choice_answer
     self._completion_answers = dict(completion_answers or {})
     self._fail_choice_calls_from = fail_choice_calls_from
@@ -425,7 +432,7 @@ class PromptStubModel(language_model.LanguageModel):
     return given.group(1)
 
   def _stage_directions_output(self, prompt: str) -> str:
-    """Builds the single-field stage-directions JSON of one final turn.
+    """Builds the two-field stage-directions JSON of one final turn.
 
     The narration carries only NEW facts the current prompt's marked
     evidence section actually holds — the core-adjudicated action
@@ -437,15 +444,20 @@ class PromptStubModel(language_model.LanguageModel):
     output as a faithful record of the evidence passed in. The stub
     never emits dialogue, a speaker line or a `resolved_event`, and
     never re-narrates the candidate's original event: the canonical
-    event is assembled by the production step, and duplicating the
-    speech into the narrator track would violate the no-repetition
+    events are assembled by the production step, and duplicating the
+    speech into a narrator track would violate the no-repetition
     rule a scripted-approving reviewer cannot catch.
+
+    The public track mirrors the full track unless
+    `public_stage_directions` is configured: the stub's scripted
+    turns are fully public by default, so both views are identical;
+    a configured value is emitted verbatim.
 
     Args:
       prompt: the last question block of the final-generation prompt.
 
     Returns:
-      The single-field JSON object as a string.
+      The two-field JSON object as a string.
     """
     evidence = read_evidence_section(prompt)
     parts: list[str] = []
@@ -464,7 +476,16 @@ class PromptStubModel(language_model.LanguageModel):
           parts.append(fact)
     if self._stage_directions:
       parts.append(self._stage_directions)
+    full = '\n'.join(parts)
+    public = (
+        self._public_stage_directions
+        if self._public_stage_directions is not None
+        else full
+    )
     return json.dumps(
-        {'stage_directions': '\n'.join(parts)},
+        {
+            'stage_directions': full,
+            'public_stage_directions': public,
+        },
         ensure_ascii=False,
     )

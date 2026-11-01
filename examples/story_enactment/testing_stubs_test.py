@@ -98,8 +98,9 @@ def _final_prompt(
       '{}\n'
       '\n'
       '## Output\n'
-      'Output a JSON object with exactly one string field:\n'
+      'Output a JSON object with exactly two string fields:\n'
       '- "stage_directions": visible outcomes only.\n'
+      '- "public_stage_directions": the publicly observable part.\n'
       'Output only the JSON object, no other text.\n'
       'Answer: '
   )
@@ -201,7 +202,9 @@ class PromptStubActionTest(unittest.TestCase):
     failed = json.loads(
         stub.sample_text(_final_prompt(speech, action_result=_FAILED_RESULT))
     )
-    self.assertEqual(set(succeeded), {'stage_directions'})
+    self.assertEqual(
+        set(succeeded), {'stage_directions', 'public_stage_directions'}
+    )
     self.assertNotEqual(
         succeeded['stage_directions'], failed['stage_directions']
     )
@@ -296,6 +299,45 @@ class PromptStubActionTest(unittest.TestCase):
         self.assertEqual(stage, expected)
         self.assertNotIn(speech, stage)
         self.assertNotIn('林雪: ', stage)
+
+  def test_final_output_emits_two_fields_with_public_mirror(self):
+    # 双字段发射（设计 4.1）：未配置 public_stage_directions 时，
+    # 公开视图镜像完整旁白轨——纯公开事件两视图相同。
+    speech = '遗嘱的封印从未核验。'
+    stub = testing_stubs.PromptStubModel(stage_directions='')
+    payload = json.loads(
+        stub.sample_text(_final_prompt(speech, action_result=_SUCCEEDED_RESULT))
+    )
+    self.assertEqual(
+        set(payload), {'stage_directions', 'public_stage_directions'}
+    )
+    self.assertEqual(
+        payload['public_stage_directions'], payload['stage_directions']
+    )
+    self.assertIn(_SUCCEEDED_RESULT, payload['public_stage_directions'])
+
+  def test_configured_public_stage_directions_used_verbatim(self):
+    # 配置非 None 时逐字使用该值，不与完整轨混排。
+    speech = '遗嘱的封印从未核验。'
+    public = '公开旁白：律师翻看了原件，未报出日期。'
+    stub = testing_stubs.PromptStubModel(
+        stage_directions='背景雷声滚过。', public_stage_directions=public
+    )
+    payload = json.loads(
+        stub.sample_text(_final_prompt(speech, action_result=_SUCCEEDED_RESULT))
+    )
+    self.assertEqual(
+        payload['stage_directions'], f'{_SUCCEEDED_RESULT}\n背景雷声滚过。'
+    )
+    self.assertEqual(payload['public_stage_directions'], public)
+
+  def test_final_output_fingerprint_matches_two_field_instruction(self):
+    # 指纹随生产指令更新为两字段文本；routing 由其余用例经真实
+    # 生产提示联测覆盖。
+    self.assertEqual(
+        testing_stubs._FINAL_OUTPUT_MARK,  # pylint: disable=protected-access
+        'Output a JSON object with exactly two string fields',
+    )
 
 
 class PromptStubRoutingTest(unittest.TestCase):
@@ -435,8 +477,9 @@ class PromptStubRoutingTest(unittest.TestCase):
         'intervention': None,
     }
     prompt = (
-        'Exercise: Output a JSON object with exactly one string field:\n'
+        'Exercise: Output a JSON object with exactly two string fields:\n'
         '- "stage_directions": visible outcomes only.\n'
+        '- "public_stage_directions": the publicly observable part.\n'
         f'{testing_stubs.EVIDENCE_SECTION_MARK}\n'
         f'{json.dumps(evidence, ensure_ascii=False)}\n'
         'Output only the JSON object, no other text.'
@@ -511,7 +554,7 @@ class RealFinalPromptJointTest(unittest.TestCase):
       self.assertIn('# Story resolution semantic review', review)
       self.assertIn('林雪', review)
     director.set_validated_resolution.assert_called_once_with(
-        succeeded, _SUCCEEDED_RESULT
+        succeeded, _SUCCEEDED_RESULT, succeeded, _SUCCEEDED_RESULT
     )
 
   def test_historical_scoring_and_completion_do_not_hijack(self):
